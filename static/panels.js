@@ -3837,6 +3837,7 @@ async function previewExternalNote(source, id) {
 }
 
 async function openMemorySection(section, el) {
+  if (section === 'external_notes' && _memoryData && !_memoryData.external_notes_enabled) return;
   _currentMemorySection = section;
   document.querySelectorAll('#memoryPanel .side-menu-item').forEach(e => e.classList.remove('active'));
   if (el) el.classList.add('active');
@@ -5228,12 +5229,16 @@ async function loadMemory(force) {
   try {
     const data = await api('/api/memory');
     _memoryData = data;
+    if (_currentMemorySection === 'external_notes' && !data.external_notes_enabled) {
+      _currentMemorySection = null;
+    }
     if (_currentMemorySection === 'external_notes') {
       await loadNotesSources(!!force);
     }
     if (panel) {
       panel.innerHTML = '';
       for (const s of MEMORY_SECTIONS) {
+        if (s.key === 'external_notes' && !_memoryData.external_notes_enabled) continue;
         const el = document.createElement('button');
         el.type = 'button';
         el.className = 'side-menu-item';

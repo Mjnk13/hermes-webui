@@ -60,6 +60,26 @@ def test_notes_sources_shows_configured_note_servers_without_tool_inventory():
     assert sources[0]["status"] == "configured"
 
 
+def test_external_notes_sources_drawer_is_default_off(monkeypatch):
+    from api import routes
+
+    monkeypatch.delenv("HERMES_WEBUI_EXTERNAL_NOTES_SOURCES", raising=False)
+
+    assert routes._external_notes_sources_enabled({}) is False
+    assert routes._external_notes_sources_enabled({"webui_external_notes_sources": False}) is False
+
+
+def test_external_notes_sources_drawer_can_be_enabled_by_config_or_env(monkeypatch):
+    from api import routes
+
+    monkeypatch.delenv("HERMES_WEBUI_EXTERNAL_NOTES_SOURCES", raising=False)
+    assert routes._external_notes_sources_enabled({"webui_external_notes_sources": True}) is True
+    assert routes._external_notes_sources_enabled({"external_notes_sources": "yes"}) is True
+
+    monkeypatch.setenv("HERMES_WEBUI_EXTERNAL_NOTES_SOURCES", "1")
+    assert routes._external_notes_sources_enabled({}) is True
+
+
 def test_joplin_search_notes_returns_safe_snippets(monkeypatch):
     from api import routes
 
@@ -160,6 +180,14 @@ def test_external_notes_ui_uses_minimal_lucide_icons_for_ai_recent_notes():
     assert "Recently used by AI" not in notes_block  # i18n key, not hard-coded UI copy
     assert "🤖" not in notes_block
     assert "📚" not in notes_block
+
+
+def test_external_notes_menu_item_is_default_off_from_memory_payload():
+    from pathlib import Path
+
+    panels = Path("static/panels.js").read_text(encoding="utf-8")
+    assert "external_notes_enabled" in panels
+    assert "if (s.key === 'external_notes' && !_memoryData.external_notes_enabled) continue;" in panels
 
 
 def test_external_notes_search_button_matches_minimal_dark_controls():

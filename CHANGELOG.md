@@ -5,7 +5,7 @@
 
 ### Added
 
-- Add a read-only Third-party notes drawer to the Memory panel that lists configured note/knowledge MCP sources such as Joplin, Obsidian, Notion, and llm-wiki, while explicitly leaving automatic session recall unchanged.
+- Add a default-off, read-only Third-party notes drawer to the Memory panel that lists configured note/knowledge MCP sources such as Joplin, Obsidian, Notion, and llm-wiki when explicitly enabled with `webui_external_notes_sources` or `HERMES_WEBUI_EXTERNAL_NOTES_SOURCES=1`, while leaving automatic session recall unchanged.
 
 ## [v0.51.115] — 2026-05-22 — Release CM (stage-pr2731 — 1-PR — clarify prompt collapse/expand with chevron-icon polish)
 

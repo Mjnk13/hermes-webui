@@ -7878,6 +7878,7 @@ def _handle_memory_read(handler):
             "memory_mtime": mem_file.stat().st_mtime if mem_file.exists() else None,
             "user_mtime": user_file.stat().st_mtime if user_file.exists() else None,
             "soul_mtime": soul_file.stat().st_mtime if soul_file.exists() else None,
+            "external_notes_enabled": _external_notes_sources_enabled(),
         },
     )
 
@@ -11558,6 +11559,29 @@ def _handle_mcp_tools_list(handler):
     })
 
 
+def _webui_truthy(value) -> bool:
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _external_notes_sources_enabled(config_data: dict | None = None) -> bool:
+    """Return whether the third-party notes drawer is explicitly enabled.
+
+    The Memory panel is a primary surface, so this power-user drawer stays
+    default-off unless a deployment opts in through config or environment.
+    """
+    env_value = os.getenv("HERMES_WEBUI_EXTERNAL_NOTES_SOURCES", "")
+    if env_value:
+        return _webui_truthy(env_value)
+    cfg = config_data if isinstance(config_data, dict) else get_config()
+    if not isinstance(cfg, dict):
+        return False
+    return _webui_truthy(
+        cfg.get("webui_external_notes_sources")
+        or cfg.get("external_notes_sources")
+        or cfg.get("notes_sources_drawer")
+    )
+
+
 _NOTES_SOURCE_SERVER_HINTS = {
     "joplin", "obsidian", "notion", "llm-wiki", "llmwiki", "wiki",
     "notes", "note", "knowledge", "kb", "readwise", "logseq",
@@ -11707,6 +11731,16 @@ def _notes_sources_from_mcp_inventory(server_summaries: dict, tools: list[dict])
 def _handle_notes_sources_list(handler):
     """List note/knowledge MCP sources for the WebUI Notes drawer."""
     cfg = get_config()
+    if not _external_notes_sources_enabled(cfg):
+        return j(handler, {
+            "enabled": False,
+            "sources": [],
+            "source": "disabled",
+            "inventory_scope": "disabled_by_default",
+            "attach_supported": False,
+            "automatic_recall_unchanged": True,
+            "recent_ai_notes": [],
+        })
     servers = cfg.get("mcp_servers", {})
     if not isinstance(servers, dict):
         servers = {}
@@ -11721,6 +11755,7 @@ def _handle_notes_sources_list(handler):
         tools = _mcp_tools_from_registry(server_summaries)
         source = "tool_registry" if tools else "none"
     return j(handler, {
+        "enabled": True,
         "sources": _notes_sources_from_mcp_inventory(server_summaries, tools),
         "source": source,
         "inventory_scope": "already_known_runtime_only",
@@ -11936,6 +11971,8 @@ def _joplin_recent_ai_notes(*, limit: int = 6) -> list[dict]:
 
 
 def _handle_notes_search(handler, parsed):
+    if not _external_notes_sources_enabled():
+        return j(handler, {"source": "disabled", "results": [], "error": "External notes sources are disabled."}, status=404)
     query = parse_qs(parsed.query or "")
     source = str(query.get("source", ["joplin"])[0] or "joplin").strip().lower()
     q = str(query.get("q", [""])[0] or "").strip()
@@ -11952,6 +11989,8 @@ def _handle_notes_search(handler, parsed):
 
 
 def _handle_notes_item(handler, parsed):
+    if not _external_notes_sources_enabled():
+        return j(handler, {"source": "disabled", "error": "External notes sources are disabled."}, status=404)
     query = parse_qs(parsed.query or "")
     source = str(query.get("source", ["joplin"])[0] or "joplin").strip().lower()
     note_id = str(query.get("id", [""])[0] or "").strip()
