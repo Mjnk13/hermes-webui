@@ -3,6 +3,12 @@
 
 ## [Unreleased]
 
+## [v0.51.111] — 2026-05-22 — Release CI (stage-404 — 1-PR — keep state.db replays out of sidecar tail)
+
+### Fixed
+
+- **PR #2746** by @ai-ag2026 — Prevent replayed state.db rows from being appended after an already-correct sidecar transcript tail. `merge_session_messages_append_only()` previously tried to skip state.db rows replaying the sidecar, but two edge cases leaked through: (1) the final row of a replayed sidecar prefix was not skipped because the replay index had reached the sidecar sequence length, and (2) a replayed middle segment was not considered prefix replay, so old state.db rows could be appended after the saved assistant tail. That made `/api/session` appear to end on an old user prompt even when the saved sidecar already ended on the real assistant answer. The fix tracks per-(role, content) visible-occurrence counts in the sidecar and uses that as a replay budget when comparing state.db rows; legitimate repeated messages from state.db are still preserved. `_has_visible_duplicate()` is kept as a thin wrapper around the new `_matching_visible_duplicate()` for backwards compatibility. Regression test covers both full-replay and middle-segment replay shapes.
+
 ## [v0.51.110] — 2026-05-22 — Release CH (stage-403 — 2-PR batch — default personality from config + sort configured providers to top)
 
 ### Added
