@@ -3,6 +3,20 @@
 
 ## [Unreleased]
 
+## [v0.51.124] — 2026-05-24 — Release CV (stage-batch6 — 3-PR Windows-only stack — agent paths / docs / port hardening)
+
+### Added
+
+- **PR #2805** by @Koraji95-coder — `start.ps1`: expand hermes-agent candidate paths for Windows installers. The launcher now searches `$env:USERPROFILE\.hermes\hermes-agent`, the dev-checkout sibling, and the Windows installer roots (`$env:LOCALAPPDATA\hermes\hermes-agent`, `${env:ProgramW6432}\hermes\hermes-agent`, `${env:ProgramFiles}\hermes\hermes-agent`, `${env:ProgramFiles(x86)}\hermes\hermes-agent`) with `Select-Object -Unique` to collapse WOW64 ProgramFiles redirection collisions on 32-bit PowerShell processes. Adds `-PathType Container` to the `HERMES_WEBUI_AGENT_DIR` guard so a file named `hermes_cli` doesn't false-positive. Null-guards `${env:ProgramFiles(x86)}` for constrained environments where it's missing. Zero impact on Linux/macOS — file is `start.ps1`, never loaded by `start.sh` or `bootstrap.py`.
+
+### Documentation
+
+- **PR #2806** by @Koraji95-coder — Native Windows venv path corrected in `start.ps1` doc-comment and `README.md`. The previous text suggested "run bootstrap.py inside WSL2 once to create the venv, then this script can use that venv" — but a WSL2-created venv is `venv/bin/python` (ELF) and cannot be invoked by native Windows Python. The corrected guidance is to create a Windows venv natively (`python -m venv venv` from PowerShell), then `start.ps1` auto-discovers `venv\Scripts\python.exe`. WSL2 remains useful as a parallel install for the full `bootstrap.py` + Linux runtime path.
+
+### Hardened
+
+- **PR #2807** by @Koraji95-coder — `start.ps1`: `HERMES_WEBUI_PORT` env-var parsing uses `[int]::TryParse` + range guard (1-65535) instead of a bare `[int]` cast that threw `InvalidCastException` with no context on typos or accidental shell expansion. Server-process exit code is captured into `$script:serverExitCode` and emitted via `exit` AFTER the `try/finally` cleanup, so `Pop-Location` always runs (avoids leaving the caller stuck at `$RepoRoot` in interactive or dot-sourced sessions). Also drops a non-functional `@args` splat that PowerShell doesn't populate under `[CmdletBinding()]` — the launcher's existing use case is env-var-driven, no pass-through args needed.
+
 ## [v0.51.123] — 2026-05-24 — Release CU (stage-batch5 — 2-PR low-risk batch — gzip+ETag static caching / Open in VS Code)
 
 ### Performance
