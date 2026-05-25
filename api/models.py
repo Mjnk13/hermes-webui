@@ -51,6 +51,8 @@ _STALE_TMP_AGE_SECONDS = 3600  # 1 hour
 # Serializes index writers so concurrent Session.save() calls cannot race on
 # stale baselines while still allowing LOCK to be released before disk I/O.
 _INDEX_WRITE_LOCK = threading.RLock()
+_SESSION_INDEX_REBUILD_LOCK = threading.Lock()
+_SESSION_INDEX_REBUILD_THREAD = None
 
 
 def _cleanup_stale_tmp_files() -> None:
@@ -72,6 +74,32 @@ def _cleanup_stale_tmp_files() -> None:
                 pass  # best-effort
     except Exception:
         pass  # SESSION_DIR may not exist yet; that's fine
+
+
+def _rebuild_session_index_background() -> None:
+    try:
+        _write_session_index(updates=None)
+    except Exception:
+        logger.debug("Background session-index rebuild failed", exc_info=True)
+
+
+def _start_session_index_rebuild_thread() -> None:
+    """Start one background full-index rebuild if the index is missing."""
+    global _SESSION_INDEX_REBUILD_THREAD
+    with _SESSION_INDEX_REBUILD_LOCK:
+        if SESSION_INDEX_FILE.exists():
+            return
+        if (
+            _SESSION_INDEX_REBUILD_THREAD is not None
+            and _SESSION_INDEX_REBUILD_THREAD.is_alive()
+        ):
+            return
+        _SESSION_INDEX_REBUILD_THREAD = threading.Thread(
+            target=_rebuild_session_index_background,
+            name="session-index-rebuild",
+            daemon=True,
+        )
+        _SESSION_INDEX_REBUILD_THREAD.start()
 
 
 def _index_entry_exists(session_id: str, in_memory_ids=None) -> bool:
@@ -2236,6 +2264,9 @@ def all_sessions(diag=None):
     active_stream_ids = _active_stream_ids()
     # Phase C: try index first for O(1) read; fall back to full scan
     _diag_stage(diag, "all_sessions.index_exists")
+    if not SESSION_INDEX_FILE.exists():
+        _diag_stage(diag, "all_sessions.start_index_rebuild")
+        _start_session_index_rebuild_thread()
     if SESSION_INDEX_FILE.exists():
         try:
             _diag_stage(diag, "all_sessions.read_index")
