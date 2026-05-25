@@ -190,6 +190,40 @@ def test_external_notes_menu_item_is_default_off_from_memory_payload():
     assert "if (s.key === 'external_notes' && !_memoryData.external_notes_enabled) continue;" in panels
 
 
+def test_external_notes_drawer_copy_is_localized_outside_english():
+    from pathlib import Path
+
+    i18n = Path("static/i18n.js").read_text(encoding="utf-8")
+
+    assert i18n.count("external_notes_sources: 'Third-party notes'") == 1
+    assert i18n.count("external_notes_recent_ai: 'Recently used by AI'") == 1
+    assert i18n.count("external_notes_recent_ai_reason: 'Automatic recall'") == 1
+    assert i18n.count("external_notes_search_placeholder: 'Search notes…'") == 1
+
+    locale_sources = [
+        ("  en: {", "  it: {", "external_notes_sources: 'Third-party notes'"),
+        ("  it: {", "  ja: {", "external_notes_sources: 'Note di terze parti'"),
+        ("  ja: {", "  ru: {", "external_notes_sources: 'サードパーティのノート'"),
+        ("  ru: {", "  es: {", "external_notes_sources: 'Сторонние заметки'"),
+        ("  es: {", "  de: {", "external_notes_sources: 'Notas de terceros'"),
+        ("  de: {", "  zh: {", "external_notes_sources: 'Notizen von Drittanbietern'"),
+        ("  zh: {", "  'zh-Hant': {", "external_notes_sources: '第三方笔记'"),
+        ("  'zh-Hant': {", "  pt: {", "external_notes_sources: '第三方筆記'"),
+        ("  pt: {", "  ko: {", "external_notes_sources: 'Notas de terceiros'"),
+        ("  ko: {", "  fr: {", "external_notes_sources: '타사 노트'"),
+        ("  fr: {", "  tr: {", "external_notes_sources: 'Notes tierces'"),
+    ]
+    for start_marker, end_marker, expected in locale_sources:
+        start = i18n.index(start_marker)
+        end = i18n.index(end_marker, start)
+        assert expected in i18n[start:end]
+
+    tr_start = i18n.index("  tr: {")
+    tr_block = i18n[tr_start:]
+    assert "external_notes_sources: 'Üçüncü taraf notlar'" in tr_block
+    assert "external_notes_sources: 'Third-party notes'" not in tr_block
+
+
 def test_external_notes_search_button_matches_minimal_dark_controls():
     from pathlib import Path
 

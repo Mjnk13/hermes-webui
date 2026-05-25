@@ -3,6 +3,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Third-party notes drawer copy now uses localized strings in the supported non-English locale bundles instead of reusing the English defaults.
+
 ## [v0.51.132] — 2026-05-24 — Release DD (stage-batch14 — 4-PR replayed-context + interrupted-response + shutdown affordance + passkey opt-in)
 
 ### Added
@@ -27,7 +31,6 @@
   - CHANGELOG entries added for PR #2685 and PR #2824 (both originally missing despite functional code changes)
 - Deferred to follow-up: per-turn cumulative live-tool-prompt token cap (#2685 only added per-call cap; aggregate across many tool calls is a separate refactor).
 - **i18n parity**: 7 new shutdown-affordance keys added across all 11 non-en locales (it, ja, ru, es, de, zh, zh-Hant, pt, ko, fr, tr) so locale parity tests pass on first run.
-
 ## [v0.51.131] — 2026-05-24 — Release DC (stage-batch13 — 6-PR notes-drawer + context-parity + PWA-swipe + locale polish)
 
 ### Added
