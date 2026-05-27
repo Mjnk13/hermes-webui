@@ -2206,25 +2206,55 @@ def _message_summary(messages) -> dict:
 
 
 def _metadata_only_message_summary(sid: str, profile: str | None = None) -> dict:
-    """Return the reconciled message summary used by metadata-only session loads.
+    """Return the cheap message summary used by metadata-only session loads.
 
-    Threads ``profile=`` through to ``get_state_db_session_messages`` so
+    Threads ``profile=`` through to ``get_state_db_session_summary`` so
     background-thread reads land on the correct profile's state.db (per the
     cookie-bound profile selector — fixes the same TLS-vs-thread race the
     #2762 fix addressed for write paths).
+
+    This intentionally does not full-read or merge transcripts.  If state.db has
+    grown beyond the sidecar count, report that growth so active-session polling
+    can refresh.  If state.db only contains restamped replay rows at or below the
+    sidecar count, keep the sidecar metadata so polling does not loop forever on
+    a false "newer transcript" signal.
     """
-    sidecar_session = Session.load(sid)
-    sidecar_messages = []
+    sidecar_session = Session.load_metadata_only(sid)
+    sidecar_count = 0
+    sidecar_last_message_at = 0.0
     if sidecar_session:
-        sidecar_messages = getattr(sidecar_session, "messages", []) or []
-    state_db_messages = get_state_db_session_messages(sid, profile=profile)
-    return _message_summary(
-        merge_session_messages_append_only(
-            sidecar_messages,
-            state_db_messages,
-            truncation_watermark=getattr(sidecar_session, "truncation_watermark", None),
-        )
-    )
+        sidecar_count = _numeric_count(getattr(sidecar_session, "_metadata_message_count", None))
+        if sidecar_count <= 0:
+            sidecar_count = _numeric_count(sidecar_session.compact().get("message_count"))
+        try:
+            sidecar_last_message_at = float(getattr(sidecar_session, "updated_at", 0) or 0)
+        except (TypeError, ValueError):
+            sidecar_last_message_at = 0.0
+        if getattr(sidecar_session, "truncation_watermark", None) is not None:
+            # Intentional: once the user has truncated this sidecar, metadata
+            # polling must keep the sidecar as authoritative.  A full message
+            # load can still apply the watermark-aware merge, but the cheap
+            # metadata path should not treat later state.db rows as external
+            # growth and resurrect turns the user deliberately cut away.
+            return {
+                "message_count": sidecar_count,
+                "last_message_at": sidecar_last_message_at,
+            }
+    state_summary = get_state_db_session_summary(sid, profile=profile)
+    state_count = _numeric_count(state_summary.get("message_count"))
+    try:
+        state_last_message_at = float(state_summary.get("last_message_at") or 0)
+    except (TypeError, ValueError):
+        state_last_message_at = 0.0
+    if state_count > sidecar_count and state_last_message_at > sidecar_last_message_at:
+        return {
+            "message_count": state_count,
+            "last_message_at": state_last_message_at,
+        }
+    return {
+        "message_count": sidecar_count,
+        "last_message_at": sidecar_last_message_at,
+    }
 
 
 def _session_requires_cli_metadata_lookup(session) -> bool:
@@ -2457,6 +2487,7 @@ from api.models import (
     get_cli_sessions,
     get_cli_session_messages,
     get_state_db_session_messages,
+    get_state_db_session_summary,
     merge_session_messages_append_only,
     _session_message_merge_key,
     prune_session_from_index,

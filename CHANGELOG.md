@@ -7,6 +7,12 @@
 
 - Image lightbox now supports prev/next navigation when multiple images are present in the same message. Click `‹` / `›` buttons or use `←` / `→` keyboard arrows to browse; an image counter (`1 / 5`) is shown at the bottom. (#2967)
 
+### Fixed
+
+- Session switching now keeps the initial metadata fetch on `/api/session?messages=0&resolve_model=0` and defers stale model/provider repair until after the new session is assigned, so first paint does not block on cold model catalog hydration.
+- Metadata-only session loads now use a cheap state summary instead of full transcript reconciliation, while still detecting real external state.db growth and ignoring restamped replay rows that would otherwise retrigger refresh polling.
+- Session transcript reconciliation now precomputes visible-duplicate lookup state instead of recomputing loose-content normalization for every state.db row, reducing long-session tail-load latency without changing the append-only merge contract.
+
 ## [v0.51.138] — 2026-05-25 — Release DJ (stage-batch20 — 7-PR ultra-safe batch)
 
 ### Added

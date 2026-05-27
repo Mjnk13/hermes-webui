@@ -579,15 +579,13 @@ async function loadSession(sid){
     const _msgInner = $('msgInner');
     if (_msgInner && currentSid !== sid) _msgInner.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;height:100%;color:var(--text-muted);font-size:14px;padding:40px;text-align:center;">Loading conversation...</div>';
   }
-  // Phase 1: Load metadata only (~1KB) for fast session switching.
-  // Resolve model immediately: old sessions can persist stale provider-shaped
-  // IDs (e.g. openai/gpt-5.4-mini) and assigning those to S.session creates a
-  // short race where the composer can display/send the wrong model before the
-  // deferred resolver catches up.
+  // Phase 1: Load metadata only (~1KB) for fast session switching. Keep model
+  // resolution out of the first-paint path; old provider-shaped model IDs are
+  // repaired by the deferred resolver after S.session is assigned.
   // Guard against network/server failures to prevent a permanently stuck loading state.
   let data;
   try {
-    data = await api(`/api/session?session_id=${encodeURIComponent(sid)}&messages=0&resolve_model=1`);
+    data = await api(`/api/session?session_id=${encodeURIComponent(sid)}&messages=0&resolve_model=0`);
   } catch(e) {
     const _msgInner = $('msgInner');
     if(_msgInner){
@@ -628,6 +626,7 @@ async function loadSession(sid){
     try { window._resetScrollDirectionTracker(); } catch (_) {}
   }
   if(typeof _applyPendingSessionModelForSession==='function') _applyPendingSessionModelForSession(sid);
+  _resolveSessionModelForDisplaySoon(sid);
   // Sync workspace display immediately so the chip label reflects the new session's workspace
   // before any async message-loading begins (mirrors how model is handled).
   if(typeof syncTopbar==='function') syncTopbar();
@@ -828,7 +827,6 @@ async function loadSession(sid){
     _restoreComposerDraft(_draft, sid, {preserveActiveInput:currentSid===sid&&forceReload});
   }
 
-  _resolveSessionModelForDisplaySoon(sid);
   // Clear the in-flight session marker now that this load has completed (#1060).
   if (_loadingSessionId === sid) _loadingSessionId = null;
 
