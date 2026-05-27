@@ -3,6 +3,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Sidebar session rows now preserve the server-reported running state when merging stale optimistic first-turn cache entries, so active background sessions keep their spinner and can later transition to unread correctly.
+
 ## [v0.51.143] — 2026-05-26 — Release DO (stage-batch25 — single-PR workspace:// markdown scheme)
 
 ### Added
