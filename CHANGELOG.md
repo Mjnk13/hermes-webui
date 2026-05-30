@@ -6,6 +6,7 @@
 ### Fixed
 
 - Dev-build cache-busting now includes a short hash of the tracked dirty diff, so local asset URLs change on each edit instead of staying at a constant `-dirty` suffix (#3159).
+- Workspace path autocomplete now preserves `~/` suggestions while browsing under the user's home directory (#3173).
 
 ## [v0.51.171] — 2026-05-30 — Release EQ (stage-batch53 — tool-output card badge + Neon opt-in skin)
 
