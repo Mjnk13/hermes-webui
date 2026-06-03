@@ -105,6 +105,50 @@ def _session_counts_toward_pin_quota(session) -> bool:
     return not _hide_from_default_sidebar(row)
 
 
+def _session_row_lineage_root_id(session, sessions_by_id) -> str:
+    sid = str(_session_field(session, "session_id", "") or "")
+    explicit = _session_field(session, "_lineage_root_id", None)
+    if explicit:
+        return str(explicit)
+    # A branch/fork is an independent, separately-visible session (it carries a
+    # parent_session_id purely for provenance), so it must count as its OWN pin
+    # lineage — only compression/continuation rows should collapse to a shared
+    # root. Without this, two pinned forks of the same parent would collapse to a
+    # single quota lineage and let the user exceed pinned_sessions_limit (#3288).
+    if _session_field(session, "session_source", None) == "fork":
+        return sid
+    current = sid
+    seen = {sid} if sid else set()
+    parent = _session_field(session, "parent_session_id", None)
+    while parent:
+        parent = str(parent)
+        if parent in seen:
+            break
+        current = parent
+        seen.add(parent)
+        parent_row = sessions_by_id.get(parent)
+        if not parent_row:
+            break
+        parent = _session_field(parent_row, "parent_session_id", None)
+    return current or sid
+
+
+def _visible_pinned_lineage_ids(session_rows) -> set[str]:
+    sessions_by_id = {}
+    for row in session_rows:
+        sid = str(_session_field(row, "session_id", "") or "")
+        if sid:
+            sessions_by_id[sid] = row
+    roots: set[str] = set()
+    for row in session_rows:
+        if not _session_counts_toward_pin_quota(row):
+            continue
+        root = _session_row_lineage_root_id(row, sessions_by_id)
+        if root:
+            roots.add(root)
+    return roots
+
+
 # ── Profile-scoped session/project filtering (#1611, #1614) ────────────────
 #
 # Sessions and projects are stored in the WebUI sidecar without per-row
@@ -2820,6 +2864,7 @@ from api.models import (
     _is_empty_partial_activity_message,
     _hide_from_default_sidebar,
     prune_session_from_index,
+    agent_session_row_exists,
     ensure_cron_project,
     is_cron_session,
     is_safe_session_id,
@@ -2829,6 +2874,7 @@ from api.workspace import (
     save_workspaces,
     get_last_workspace,
     set_last_workspace,
+    git_info_for_workspace,
     list_dir,
     dir_signature,
     list_workspace_suggestions,
@@ -3747,6 +3793,322 @@ def _handle_insights(handler, parsed) -> bool:
     })
 
 
+def _project_os_workspace_read(repo_root: Path, rel: str) -> dict | None:
+    try:
+        return read_file_content(repo_root, rel)
+    except Exception:
+        return None
+
+
+def _project_os_workspace_json(repo_root: Path, rel: str) -> dict | None:
+    payload = _project_os_workspace_read(repo_root, rel)
+    if not payload or not isinstance(payload.get("content"), str):
+        return None
+    try:
+        parsed = json.loads(payload.get("content") or "")
+        return parsed if isinstance(parsed, dict) else None
+    except Exception:
+        return None
+
+
+def _project_os_truth_board_slugs(repo_root: Path) -> set[str]:
+    slugs: set[str] = set()
+
+    def add(value) -> None:
+        text = str(value or "").strip()
+        if text:
+            slugs.add(text)
+
+    for rel in (
+        ".ax/handoff/current.json",
+        ".ax/status/active.json",
+        ".ax/status/heartbeat.json",
+    ):
+        truth = _project_os_workspace_json(repo_root, rel)
+        if not isinstance(truth, dict):
+            continue
+        raw_board = truth.get("board")
+        if isinstance(raw_board, dict):
+            add(raw_board.get("slug"))
+            add(raw_board.get("id"))
+            add(raw_board.get("name"))
+            add(raw_board.get("display_name"))
+        else:
+            add(raw_board)
+        for key in (
+            "selected_board_slug",
+            "canonical_backlog_board_id",
+            "current_browser_board_id",
+            "active_proof_board_id",
+            "recover_board_id",
+        ):
+            add(truth.get(key))
+    return slugs
+
+
+def _project_os_repo_matches_board(repo_root: Path, board_slug: str | None) -> bool:
+    slug = str(board_slug or "").strip()
+    return bool(slug and slug in _project_os_truth_board_slugs(repo_root))
+
+
+def _project_os_candidate_repo_roots(workspace_root: Path | None) -> list[Path]:
+    candidates: list[Path] = []
+    seen: set[str] = set()
+
+    def add(path: Path | None) -> None:
+        if path is None:
+            return
+        try:
+            resolved = path.expanduser().resolve()
+        except Exception:
+            return
+        if not resolved.is_dir():
+            return
+        key = str(resolved)
+        if key not in seen:
+            seen.add(key)
+            candidates.append(resolved)
+
+    add(workspace_root)
+
+    scan_root = None
+    if workspace_root is not None:
+        try:
+            scan_root = workspace_root.expanduser().resolve()
+        except Exception:
+            scan_root = None
+    if not scan_root or not scan_root.is_dir():
+        return candidates
+
+    skip_names = {
+        ".git",
+        ".hg",
+        ".svn",
+        ".venv",
+        "__pycache__",
+        "node_modules",
+        "vendor",
+        "dist",
+        "build",
+    }
+    queue_dirs: list[tuple[Path, int]] = [(scan_root, 0)]
+    inspected = 0
+    while queue_dirs and inspected < 300:
+        current, depth = queue_dirs.pop(0)
+        inspected += 1
+        if (current / ".ax").is_dir() or (current / "docs" / "project-os").is_dir():
+            add(current)
+        if depth >= 3:
+            continue
+        try:
+            children = sorted(
+                (child for child in current.iterdir() if child.is_dir()),
+                key=lambda child: child.name,
+            )
+        except Exception:
+            continue
+        for child in children:
+            name = child.name
+            if name in skip_names or (name.startswith(".") and name != ".ax"):
+                continue
+            queue_dirs.append((child, depth + 1))
+    add(Path.cwd())
+    return candidates
+
+
+def _project_os_resolve_repo_root_for_board(repo_root: Path | None, board_slug: str | None) -> Path | None:
+    slug = str(board_slug or "").strip()
+    if not slug:
+        return repo_root if repo_root and repo_root.exists() else None
+    if repo_root and repo_root.exists() and _project_os_repo_matches_board(repo_root, slug):
+        return repo_root
+    for candidate in _project_os_candidate_repo_roots(repo_root):
+        if _project_os_repo_matches_board(candidate, slug):
+            return candidate
+    return repo_root if repo_root and repo_root.exists() else None
+
+
+def _project_os_goal_summary(project_md: dict | None, handoff: dict | None, status_md: dict | None, board_name: str | None = None, board_desc: str | None = None) -> str:
+    project_text = str((project_md or {}).get("content") or "")
+    for line in project_text.splitlines():
+        text = line.strip().lstrip("- ").strip()
+        if not text or text.startswith("#"):
+            continue
+        return text[:220]
+    handoff_summary = str((handoff or {}).get("goal_summary") or "").strip()
+    if handoff_summary:
+        return handoff_summary[:220]
+    desc = str(board_desc or "").strip()
+    if desc:
+        return desc[:220]
+    status_text = str((status_md or {}).get("content") or "")
+    for line in status_text.splitlines():
+        text = line.strip().lstrip("- ").strip()
+        if not text or text.startswith("#"):
+            continue
+        return text[:220]
+    return str(board_name or "Project OS").strip()[:220]
+
+
+def _project_os_onboarding_context(repo_root: Path, project_md: dict | None, plan_md: dict | None, status_md: dict | None) -> dict:
+    project_text = str((project_md or {}).get("content") or "")
+    plan_text = str((plan_md or {}).get("content") or "")
+    status_text = str((status_md or {}).get("content") or "")
+    merged = "\n".join([project_text, plan_text, status_text])
+    is_non_git_workspace = not (repo_root / ".git").exists()
+    has_boundary_hold = "TO_BE_VALIDATED_BY_HERMES" in merged
+    child_repo_blocked = (
+        "auto-promoted" in merged
+        or "auto-adopted" in merged
+        or "auto-adoption | `금지`" in merged
+        or "자동 승격 금지" in merged
+        or "canonical repo continuity로 승격하지 않습니다" in merged
+    )
+    workspace_root_confirmed = str(repo_root) in merged
+    if not (is_non_git_workspace and (project_text or plan_text or status_text)):
+        return {
+            "active": False,
+            "doc_source": "project-os",
+        }
+    status_label = "보류(안전)" if has_boundary_hold else "확인됨"
+    summary = "workspace root onboarding 진행 중 · 저장소 경계는 아직 미확정이며 자동 승격은 금지됩니다."
+    next_safe_action = "workspace-root 기준으로 경계만 좁게 검증"
+    if has_boundary_hold:
+        summary = "workspace root onboarding 진행 중 · 저장소 경계는 아직 미확정이며 TO_BE_VALIDATED_BY_HERMES 상태를 유지합니다."
+    return {
+        "active": True,
+        "doc_source": "root",
+        "status_label": status_label,
+        "summary": summary,
+        "next_safe_action": next_safe_action,
+        "workspace_root_confirmed": workspace_root_confirmed,
+        "repo_boundary_status": "TO_BE_VALIDATED_BY_HERMES" if has_boundary_hold else "confirmed",
+        "child_repo_auto_promotion_blocked": bool(child_repo_blocked),
+        "guardrails": [
+            "workspace root 확인됨" if workspace_root_confirmed else "workspace root 확인 필요",
+            "child repo 자동 승격 금지 유지" if child_repo_blocked else "child repo guardrail 확인 필요",
+            "repo boundary 미확정 유지" if has_boundary_hold else "repo boundary confirmed",
+        ],
+    }
+
+
+def _handle_project_os_dashboard(handler, parsed) -> bool:
+    qs = parse_qs(parsed.query or "")
+    requested_board = str((qs.get("board") or [""])[0] or "").strip()
+    workspace_raw = str(get_last_workspace() or "").strip()
+    repo_root = Path(workspace_raw).expanduser() if workspace_raw else None
+    selected_board_meta = None
+    if requested_board:
+        try:
+            from api.kanban_bridge import _kb, _board_meta_dict
+            kb = _kb()
+            for meta in kb.list_boards(include_archived=True) or []:
+                board = _board_meta_dict(meta)
+                if str(board.get("slug") or "") == requested_board:
+                    selected_board_meta = board
+                    workdir = str(board.get("default_workdir") or "").strip()
+                    if workdir:
+                        candidate = Path(workdir).expanduser()
+                        if candidate.exists():
+                            repo_root = candidate
+                    break
+        except Exception:
+            selected_board_meta = None
+    repo_root = _project_os_resolve_repo_root_for_board(repo_root, requested_board)
+    if not repo_root or not repo_root.exists():
+        j(handler, {
+            "workspace": None,
+            "repo_root": None,
+            "git": None,
+            "docs": {},
+            "handoff": None,
+            "active": None,
+            "heartbeat": None,
+            "goal_summary": "",
+        })
+        return True
+
+    handoff = _project_os_workspace_json(repo_root, ".ax/handoff/current.json")
+    active = _project_os_workspace_json(repo_root, ".ax/status/active.json")
+    heartbeat = _project_os_workspace_json(repo_root, ".ax/status/heartbeat.json")
+    project_md = _project_os_workspace_read(repo_root, "docs/project-os/PROJECT.md")
+    plan_md = _project_os_workspace_read(repo_root, "docs/project-os/PLAN.md")
+    status_md = _project_os_workspace_read(repo_root, "docs/project-os/STATUS.md")
+    blocker_md = _project_os_workspace_read(repo_root, "docs/project-os/BLOCKER-RESOLVER.md")
+    root_project_md = _project_os_workspace_read(repo_root, "PROJECT.md")
+    root_plan_md = _project_os_workspace_read(repo_root, "PLAN.md")
+    root_status_md = _project_os_workspace_read(repo_root, "STATUS.md")
+    onboarding = _project_os_onboarding_context(repo_root, root_project_md, root_plan_md, root_status_md)
+    if onboarding.get("active"):
+        project_md = root_project_md or project_md
+        plan_md = root_plan_md or plan_md
+        status_md = root_status_md or status_md
+
+    if isinstance(active, dict):
+        original_repo_root = repo_root
+        active_repo_root = str(active.get("repo_root") or "").strip()
+        if active_repo_root:
+            candidate = Path(active_repo_root).expanduser()
+            if candidate.exists():
+                try:
+                    repo_root = candidate.resolve()
+                except Exception:
+                    repo_root = candidate
+        if repo_root != original_repo_root:
+            handoff = _project_os_workspace_json(repo_root, ".ax/handoff/current.json")
+            active = _project_os_workspace_json(repo_root, ".ax/status/active.json")
+            heartbeat = _project_os_workspace_json(repo_root, ".ax/status/heartbeat.json")
+            project_md = _project_os_workspace_read(repo_root, "docs/project-os/PROJECT.md")
+            plan_md = _project_os_workspace_read(repo_root, "docs/project-os/PLAN.md")
+            status_md = _project_os_workspace_read(repo_root, "docs/project-os/STATUS.md")
+            blocker_md = _project_os_workspace_read(repo_root, "docs/project-os/BLOCKER-RESOLVER.md")
+            root_project_md = _project_os_workspace_read(repo_root, "PROJECT.md")
+            root_plan_md = _project_os_workspace_read(repo_root, "PLAN.md")
+            root_status_md = _project_os_workspace_read(repo_root, "STATUS.md")
+            onboarding = _project_os_onboarding_context(repo_root, root_project_md, root_plan_md, root_status_md)
+            if onboarding.get("active"):
+                project_md = root_project_md or project_md
+                plan_md = root_plan_md or plan_md
+                status_md = root_status_md or status_md
+
+    try:
+        git = git_info_for_workspace(repo_root)
+    except Exception:
+        git = None
+
+    board_name = None
+    board_desc = None
+    if isinstance(handoff, dict):
+        board_dict: dict = {}
+        raw_board = handoff.get("board")
+        if isinstance(raw_board, dict):
+            board_dict = raw_board
+        board_name = board_dict.get("display_name") or board_dict.get("name") or board_dict.get("slug")
+        board_desc = handoff.get("goal_summary") or board_dict.get("repo_corroboration")
+    if selected_board_meta:
+        board_name = board_name or selected_board_meta.get("name") or selected_board_meta.get("slug")
+        board_desc = board_desc or selected_board_meta.get("description")
+
+    j(handler, {
+        "workspace": str(repo_root),
+        "repo_root": str(repo_root),
+        "selected_board_slug": requested_board or (selected_board_meta or {}).get("slug"),
+        "git": git,
+        "docs": {
+            "project": project_md,
+            "plan": plan_md,
+            "status": status_md,
+            "blocker_resolver": blocker_md,
+        },
+        "handoff": handoff,
+        "active": active,
+        "heartbeat": heartbeat,
+        "onboarding": onboarding,
+        "goal_summary": _project_os_goal_summary(project_md, handoff, status_md, board_name, board_desc),
+    })
+    return True
+
+
 # ── GET routes ────────────────────────────────────────────────────────────────
 
 
@@ -4355,6 +4717,8 @@ def handle_get(handler, parsed) -> bool:
     # ── Insights / knowledge status ──
     if parsed.path == "/api/insights":
         return _handle_insights(handler, parsed)
+    if parsed.path == "/api/project-os/dashboard":
+        return _handle_project_os_dashboard(handler, parsed)
 
     if parsed.path.startswith("/api/kanban/"):
         from api.kanban_bridge import handle_kanban_get
@@ -4868,6 +5232,37 @@ def handle_get(handler, parsed) -> bool:
                 cli = get_cli_sessions()
                 diag.stage("merge_cli_sessions")
                 cli_by_id = {s["session_id"]: s for s in cli}
+                # #3238: reconcile orphaned imported-CLI sidecars. When a CLI
+                # session was clicked in WebUI it gets a WebUI-owned sidecar that
+                # all_sessions() returns independently of state.db. If the user
+                # later deletes the backing CLI session from the command line,
+                # the sidecar is never pruned and the stale row lingers in the
+                # sidebar forever (there is no WebUI delete affordance for it).
+                # Drop rows whose backing agent row is genuinely gone. We probe
+                # state.db directly (agent_session_row_exists) rather than trust
+                # cli_by_id absence, because get_cli_sessions() caps at
+                # CLI_VISIBLE_SESSION_LIMIT (20) — an existing session can fall
+                # out of that window and look deleted. Native WebUI sessions
+                # (source == "webui") that merely have a CLI ancestor are never
+                # pruned.
+                _kept_after_orphan_prune = []
+                for s in webui_sessions:
+                    _sid = s.get("session_id")
+                    if (
+                        _sid
+                        and is_cli_session_row(s)
+                        and not _session_source_is_webui(s)
+                        and _sid not in cli_by_id
+                        and not agent_session_row_exists(_sid, profile=s.get("profile"))
+                    ):
+                        try:
+                            prune_session_from_index(_sid)
+                        except Exception:
+                            logger.debug("Failed to prune orphaned CLI sidecar %s", _sid, exc_info=True)
+                        diag.stage("prune_orphaned_cli_sidecar")
+                        continue
+                    _kept_after_orphan_prune.append(s)
+                webui_sessions = _kept_after_orphan_prune
                 for s in webui_sessions:
                     meta = cli_by_id.get(s.get("session_id"))
                     if not meta:
@@ -6944,23 +7339,34 @@ def handle_post(handler, parsed) -> bool:
         if pin_requested and not getattr(s, "pinned", False):
             # Pre-snapshot from persisted index (acquires LOCK internally,
             # so must run outside our own LOCK acquire below).
-            persisted_pinned_ids = {
-                _session_field(existing, "session_id", None) for existing in all_sessions()
+            persisted_rows = [
+                existing for existing in all_sessions()
                 if _session_counts_toward_pin_quota(existing)
-            }
+            ]
             with LOCK:
-                # Final authoritative count: merge persisted-pinned with the
-                # in-memory SESSIONS snapshot. SESSIONS may have pin mutations
-                # that haven't yet flushed to the index, so the in-memory side
-                # is the truth for in-flight contention.
-                pinned_ids = set(persisted_pinned_ids)
-                pinned_ids.update(
-                    sid for sid, existing in SESSIONS.items()
+                # Final authoritative count: merge persisted pinned rows with the
+                # in-memory SESSIONS snapshot. Count logical sidebar-visible pin
+                # lineages rather than raw session rows so continuation siblings
+                # in the same visible lineage do not consume extra pin quota.
+                candidate_rows = list(persisted_rows)
+                candidate_rows.extend(
+                    existing.compact() for existing in SESSIONS.values()
                     if _session_counts_toward_pin_quota(existing)
                 )
-                pinned_ids.discard(body["session_id"])
+                target_row = s.compact()
+                candidate_rows.append(target_row)
+                pinned_lineage_ids = _visible_pinned_lineage_ids(candidate_rows)
+                target_lineage = _session_row_lineage_root_id(
+                    target_row,
+                    {
+                        str(_session_field(row, "session_id", "") or ""): row
+                        for row in candidate_rows
+                        if _session_field(row, "session_id", None)
+                    },
+                )
+                pinned_lineage_ids.discard(target_lineage)
                 pinned_sessions_limit = int(load_settings().get("pinned_sessions_limit", 3) or 3)
-                if len(pinned_ids) >= pinned_sessions_limit:
+                if len(pinned_lineage_ids) >= pinned_sessions_limit:
                     return bad(handler, f"Up to {pinned_sessions_limit} sessions can be pinned. Unpin one before pinning another.", 400)
                 # Mark in-memory pin state under LOCK so concurrent pin
                 # requests see the increment immediately, even before

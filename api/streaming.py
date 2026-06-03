@@ -1576,24 +1576,109 @@ def _detect_title_language(text: str) -> str:
     return ''
 
 
+def _script_counts(text: str) -> dict:
+    """Return per-script alphabetic character counts for *text*.
+
+    Buckets: ``latin``, ``cjk`` (Han/Hiragana/Katakana/Hangul), ``cyrillic``,
+    ``arabic``, ``hebrew``, ``greek``, ``devanagari``. Non-alphabetic and
+    unclassified characters are ignored.
+    """
+    counts: dict[str, int] = {}
+    for ch in str(text or ''):
+        if not ch.isalpha():
+            continue
+        o = ord(ch)
+        if (0x0041 <= o <= 0x024F) or (0x1E00 <= o <= 0x1EFF):
+            bucket = 'latin'
+        elif (
+            (0x4E00 <= o <= 0x9FFF) or (0x3400 <= o <= 0x4DBF)   # Han
+            or (0x3040 <= o <= 0x30FF)                            # Hiragana/Katakana
+            or (0xAC00 <= o <= 0xD7A3) or (0x1100 <= o <= 0x11FF) # Hangul
+        ):
+            bucket = 'cjk'
+        elif 0x0400 <= o <= 0x04FF:
+            bucket = 'cyrillic'
+        elif (0x0600 <= o <= 0x06FF) or (0x0750 <= o <= 0x077F):
+            bucket = 'arabic'
+        elif 0x0590 <= o <= 0x05FF:
+            bucket = 'hebrew'
+        elif 0x0370 <= o <= 0x03FF:
+            bucket = 'greek'
+        elif 0x0900 <= o <= 0x097F:
+            bucket = 'devanagari'
+        else:
+            continue
+        counts[bucket] = counts.get(bucket, 0) + 1
+    return counts
+
+
+def _dominant_script(text: str) -> str:
+    """Return a coarse writing-script bucket for *text*, or '' when undecidable.
+
+    Script-level (not language-level) classification is cheap and dependency-free.
+    Returns the dominant script only when it holds a clear (≥60%) majority of the
+    alphabetic characters, so mixed/borrowed text doesn't flip the bucket. Used
+    to establish the conversation start's expected script for cross-script title
+    drift detection (#3293).
+    """
+    counts = _script_counts(text)
+    total = sum(counts.values())
+    if total < 2:
+        return ''
+    top, top_n = max(counts.items(), key=lambda kv: kv[1])
+    if top_n / total >= 0.6:
+        return top
+    return ''
+
+
 def _title_prompt_language_rule(user_text: str) -> str:
     return "Match the language of the user question.\n"
 
 
 def _title_language_mismatch(user_text: str, title: str) -> bool:
-    """Reject obvious English titles for German conversation starts."""
-    if _detect_title_language(user_text) != 'de':
-        return False
-    candidate = str(title or '').strip().lower()
+    """Reject titles whose language clearly diverges from the conversation start.
+
+    Two independent signals:
+    1. Cross-script drift (#3293): when the conversation start has a clear
+       dominant writing script (e.g. latin/English) and the generated title
+       introduces a *substantial* amount of a different script (e.g. CJK or
+       Cyrillic), reject. This is language-agnostic and catches the common
+       "English chat -> Chinese/Spanish/Russian title" drift. Because titles are
+       short and frequently embed a borrowed Latin technical term (e.g. a CJK
+       title containing the word "Python"), the title side uses a proportion
+       threshold (>=35% of the title's alphabetic characters in a non-start
+       script, min 2 chars) rather than a strict majority -- so a CJK title with
+       one English word still trips, while an English title with a single
+       foreign place-name does not.
+    2. The legacy German-start → English-title heuristic, preserved verbatim so
+       the original behavior keeps working for same-script (latin) drift that
+       the script check can't see.
+    """
+    candidate = str(title or '').strip()
     if not candidate:
         return False
-    if _detect_title_language(candidate) == 'de':
+
+    # (1) Cross-script mismatch — language-agnostic.
+    user_script = _dominant_script(user_text)
+    if user_script:
+        title_counts = _script_counts(candidate)
+        title_total = sum(title_counts.values())
+        if title_total >= 2:
+            for script, n in title_counts.items():
+                if script != user_script and n >= 2 and (n / title_total) >= 0.35:
+                    return True
+
+    # (2) Legacy same-script German→English heuristic.
+    if _detect_title_language(user_text) != 'de':
+        return False
+    candidate_lower = candidate.lower()
+    if _detect_title_language(candidate_lower) == 'de':
         return False
     english_markers = {
         'old', 'image', 'display', 'issue', 'problem', 'discussion', 'conversation',
         'session', 'title', 'fix', 'bug', 'attachment', 'attachments', 'context',
     }
-    tokens = re.findall(r'[a-z]+', candidate)
+    tokens = re.findall(r'[a-z]+', candidate_lower)
     english_hits = sum(1 for tok in tokens if tok in english_markers)
     return english_hits >= 2
 
