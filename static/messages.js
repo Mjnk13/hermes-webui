@@ -66,6 +66,37 @@ function _deferStreamErrorIfOffline(){
 
 document.addEventListener('visibilitychange', _markActiveSessionViewedOnReturn);
 window.addEventListener('focus', _markActiveSessionViewedOnReturn);
+
+// Delegated click handler for the interim-progress-note collapse toggle (#2403).
+// Delegation (not a per-element listener) is required because the live turn's
+// DOM is snapshotted/restored via outerHTML/innerHTML on session switch
+// (snapshotLiveTurnHtmlForSession / restoreLiveTurnHtmlForSession in ui.js),
+// which strips element listeners. A document-level handler survives the
+// restore so a restored toggle stays interactive and collapsed notes never
+// become permanently unreachable. State lives in the DOM (presence of
+// .interim-collapsed + data-threshold on the toggle), so the handler is
+// stateless and works on freshly-created and restored toggles alike.
+function _interimCollapseDelegatedClick(e){
+  const toggle=e.target&&e.target.closest?e.target.closest('.interim-collapse-toggle'):null;
+  if(!toggle) return;
+  const blocks=toggle.parentElement;
+  if(!blocks) return;
+  const threshold=parseInt(toggle.dataset.threshold,10)||3;
+  const hidden=blocks.querySelectorAll('.interim-collapsed');
+  if(hidden.length){
+    hidden.forEach(el=>el.classList.remove('interim-collapsed'));
+    toggle.dataset.expanded='1';
+    toggle.textContent='Collapse';
+  } else {
+    const all=Array.from(blocks.querySelectorAll('[data-interim="1"]'));
+    const rehide=all.slice(0,all.length-threshold);
+    rehide.forEach(el=>el.classList.add('interim-collapsed'));
+    toggle.dataset.expanded='';
+    toggle.textContent='Show '+rehide.length+' earlier update'+(rehide.length===1?'':'s');
+  }
+}
+document.addEventListener('click', _interimCollapseDelegatedClick);
+
 // TTS: pause speech synthesis when user focuses the composer (#499)
 const _msgEl=document.getElementById('msg');
 if(_msgEl) _msgEl.addEventListener('focus', ()=>{ if('speechSynthesis' in window && speechSynthesis.speaking) speechSynthesis.pause(); });
@@ -1832,8 +1863,8 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
   function _streamFadePauseAfter(text, paragraphBreakIndex){
     if(paragraphBreakIndex>=0) return 90;
     const trimmed=String(text||'').trimEnd();
-    if(/[.!?]["')\]]*$/.test(trimmed)) return 45;
-    if(/[:;]["')\]]*$/.test(trimmed)) return 30;
+    if(/[.!?]["\x27)\]]*$/.test(trimmed)) return 45;
+    if(/[:;]["\x27)\]]*$/.test(trimmed)) return 30;
     return 0;
   }
   function _streamFadeNextText(targetText){
@@ -2292,7 +2323,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     // Throttling to 66ms intervals prevents this pileup without noticeable
     // visual degradation — streaming text updates still feel immediate.
     // performance.now() is monotonic so tab suspend/resume and NTP adjustments
-    // can't produce negative or enormous deltas.
+    // cannot produce negative or enormous deltas.
     const sinceLastMs=performance.now()-_lastRenderMs;
     const _doRender=()=>{
       _pendingRafHandle=null;
@@ -2433,9 +2464,39 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       }
       _completeAutomaticCompressionOnLiveProgress(activeSid);
       ensureAssistantRow(true);
+      if(assistantRow) assistantRow.setAttribute('data-interim','1');
       _flushPendingSegmentRender({force:true});
       if(typeof finalizeThinkingCard==='function') finalizeThinkingCard();
       if(typeof closeCurrentLiveActivityGroup==='function') closeCurrentLiveActivityGroup();
+      // Collapse old interim notes once more than INTERIM_COLLAPSE_THRESHOLD accumulate.
+      const INTERIM_COLLAPSE_THRESHOLD=3;
+      if(visibleInterimSnippets.length>INTERIM_COLLAPSE_THRESHOLD&&assistantRow){
+        const blocks=assistantRow.parentElement;
+        if(blocks){
+          const allInterim=Array.from(blocks.querySelectorAll('[data-interim="1"]'));
+          const toHide=allInterim.slice(0,allInterim.length-INTERIM_COLLAPSE_THRESHOLD);
+          let toggle=blocks.querySelector('.interim-collapse-toggle');
+          if(!toggle){
+            toggle=document.createElement('span');
+            toggle.className='interim-collapse-toggle';
+            // No per-element listener: clicks are handled by a delegated
+            // document-level handler (see _interimCollapseDelegatedClick) so
+            // the toggle keeps working after a live-turn DOM restore
+            // (snapshotLiveTurnHtmlForSession/restoreLiveTurnHtmlForSession
+            // rebuild via innerHTML, which would drop a direct listener and
+            // leave the collapsed notes permanently unreachable). The
+            // threshold rides on the markup so the handler stays stateless.
+            toggle.dataset.threshold=String(INTERIM_COLLAPSE_THRESHOLD);
+            if(toHide.length) toHide[0].before(toggle);
+          }
+          // Skip re-collapse when the user expanded manually; always update the stored count.
+          if(!toggle.dataset.expanded){
+            toHide.forEach(el=>el.classList.add('interim-collapsed'));
+          }
+          const stillHidden=blocks.querySelectorAll('[data-interim="1"].interim-collapsed').length;
+          if(stillHidden) toggle.textContent='Show '+stillHidden+' earlier update'+(stillHidden===1?'':'s');
+        }
+      }
       recordActivityBoundary();
       _resetAssistantSegment();
       _scheduleRender();
