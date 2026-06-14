@@ -15,6 +15,7 @@ from api.gateway_chat import (
     _gateway_http_error_event,
     _gateway_reasoning_delta,
     _gateway_sse_delta,
+    _gateway_sse_reasoning_delta,
     _gateway_stream_usage,
     _gateway_tool_progress_event,
     gateway_chat_config_status,
@@ -155,6 +156,12 @@ def test_gateway_reasoning_delta_keeps_string_deltas_and_ignores_structured_payl
     assert _gateway_reasoning_delta({"text": "   ", "preview": " think"}) == " think"
     assert _gateway_reasoning_delta({"content": {"text": "safe", "debug": {"note": "x"}}}) == ""
     assert _gateway_reasoning_delta({"text": ["safe"], "preview": " more"}) == " more"
+
+
+def test_gateway_sse_reasoning_delta_extracts_reasoning_content_chunks():
+    assert _gateway_sse_reasoning_delta({"choices": [{"delta": {"reasoning_content": "Let me"}}]}) == "Let me"
+    assert _gateway_sse_reasoning_delta({"choices": [{"message": {"reasoning_content": "Done thinking"}}]}) == "Done thinking"
+    assert _gateway_sse_reasoning_delta({"choices": [{"delta": {"reasoning_content": "   "}}]}) == ""
 
 
 def test_gateway_http_401_reports_gateway_auth_not_provider_key():
@@ -425,6 +432,59 @@ def test_gateway_chat_worker_preserves_reasoning_delta_whitespace_and_persists_r
             reasoning_events.append(item[1]["text"])
     assert reasoning_events == ["Let me", " think", " more"]
     assert not any("debug" in text for text in reasoning_events)
+
+
+def test_gateway_chat_worker_reads_reasoning_content_deltas_from_chat_completions(tmp_path, monkeypatch):
+    session_dir = tmp_path / "sessions"
+    session_dir.mkdir()
+    monkeypatch.setattr(models, "SESSION_DIR", session_dir)
+    monkeypatch.setattr(models, "SESSION_INDEX_FILE", session_dir / "_index.json")
+    monkeypatch.setattr(models, "SESSIONS", OrderedDict())
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def __iter__(self):
+            yield b'data: {"choices":[{"delta":{"reasoning_content":"Let me ","content":"hel"}}]}\n\n'
+            yield b'data: {"choices":[{"delta":{"reasoning_content":"think","content":"lo"}}]}\n\n'
+            yield b'data: [DONE]\n\n'
+
+    monkeypatch.setenv("HERMES_WEBUI_GATEWAY_BASE_URL", "http://gateway.local")
+    monkeypatch.setattr(gateway_chat.urllib.request, "urlopen", lambda req, timeout=0: FakeResponse())
+
+    s = new_session()
+    stream_id = "stream-gateway-reasoning-content-test"
+    s.active_stream_id = stream_id
+    s.pending_user_message = "Say hello"
+    s.pending_attachments = []
+    s.pending_started_at = 123
+    s.save()
+    channel = create_stream_channel()
+    subscriber = channel.subscribe()
+    STREAMS[stream_id] = channel
+
+    gateway_chat._run_gateway_chat_streaming(
+        s.session_id,
+        "Say hello",
+        "test-model",
+        str(tmp_path),
+        stream_id,
+        [],
+    )
+
+    saved = models.get_session(s.session_id)
+    assert saved.messages[-1]["content"] == "hello"
+    assert saved.messages[-1]["reasoning"] == "Let me think"
+    reasoning_events = []
+    while not subscriber.empty():
+        item = subscriber.get_nowait()
+        if item[0] == "reasoning":
+            reasoning_events.append(item[1]["text"])
+    assert reasoning_events == ["Let me ", "think"]
 
 
 def test_gateway_chat_worker_normalizes_prefill_slice_before_system_prefix(tmp_path, monkeypatch):

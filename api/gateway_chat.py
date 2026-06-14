@@ -131,6 +131,24 @@ def _gateway_sse_delta(payload: dict) -> str:
         return ""
 
 
+def _gateway_sse_reasoning_delta(payload: dict) -> str:
+    """Extract reasoning text from OpenAI-compatible streaming chunks."""
+    try:
+        choices = payload.get("choices") or []
+        if not choices:
+            return ""
+        choice = choices[0] or {}
+        delta = choice.get("delta") or {}
+        reasoning = delta.get("reasoning_content")
+        if isinstance(reasoning, str) and reasoning.strip():
+            return reasoning
+        message = choice.get("message") or {}
+        reasoning = message.get("reasoning_content")
+        return reasoning if isinstance(reasoning, str) and reasoning.strip() else ""
+    except Exception:
+        return ""
+
+
 def _gateway_stream_usage(payload: dict) -> dict:
     usage = payload.get("usage") if isinstance(payload, dict) else None
     if not isinstance(usage, dict):
@@ -406,6 +424,11 @@ def _run_gateway_chat_streaming(
                     sse_event = "message"
                     continue
                 last_payload = payload
+                reasoning_delta = _gateway_sse_reasoning_delta(payload)
+                if reasoning_delta:
+                    if stream_id in STREAM_REASONING_TEXT:
+                        STREAM_REASONING_TEXT[stream_id] += reasoning_delta
+                    put_gateway_event("reasoning", {"text": reasoning_delta})
                 delta = _gateway_sse_delta(payload)
                 if delta:
                     final_text += delta
