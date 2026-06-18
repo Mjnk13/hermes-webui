@@ -302,6 +302,89 @@ def test_session_reload_preserves_large_persisted_window_when_recompute_hits_256
     )
 
 
+def test_session_reload_accepts_real_256k_when_effective_model_changes(monkeypatch):
+    """#4248 follow-up: the 256k fallback guard must not block a real model switch."""
+    import api.config as config
+    import api.routes as routes
+
+    captured = {}
+
+    def fake_j(_handler, data, status=200):
+        captured["data"] = data
+        captured["status"] = status
+        return True
+
+    rec = {}
+    _install_fake_get_model_context_length(monkeypatch, rec, default_context=256_000)
+    monkeypatch.setattr(
+        config,
+        "get_config",
+        lambda *a, **k: {
+            "model": {
+                "provider": "deepseek",
+                "base_url": "https://runtime-base.invalid/v1",
+                "api_key": "reload-key",
+            }
+        },
+    )
+    monkeypatch.setattr(
+        config,
+        "resolve_model_provider",
+        lambda _model: ("deepseek-v4-256k", "deepseek", "https://runtime-base.invalid/v1"),
+    )
+
+    s = _stub_route_session(model="deepseek-v4-1m")
+    handler = MagicMock()
+    parsed = urlparse("/api/session?session_id=test-4248&messages=1")
+
+    with patch("api.routes.get_session", return_value=s), \
+         patch("api.routes.j", side_effect=fake_j), \
+         patch("api.routes._resolve_effective_session_model_for_display", return_value="deepseek-v4-256k"), \
+         patch("api.routes._resolve_effective_session_model_provider_for_display", return_value="deepseek"), \
+         patch("api.routes._session_visible_to_active_profile", return_value=True), \
+         patch("api.routes._clear_stale_stream_state", return_value=None), \
+         patch("api.routes._session_requires_cli_metadata_lookup", return_value=False), \
+         patch("api.routes._is_messaging_session_record", return_value=False), \
+         patch("api.routes.get_state_db_session_messages", return_value=[]), \
+         patch("api.routes._webui_sidecar_lineage_messages_for_display", return_value=[]), \
+         patch("api.routes.merge_session_messages_append_only", return_value=[]), \
+         patch("api.routes._merged_webui_lineage_messages_for_display", return_value=[]), \
+         patch("api.routes._active_stream_ids", return_value=set()):
+        assert routes.handle_get(handler, parsed) is True
+
+    body = captured["data"]["session"]
+    assert captured["status"] == 200
+    assert rec["model"] == "deepseek-v4-256k"
+    assert body["context_length"] == 256_000, (
+        "a genuine effective-model change to a 256k model must replace the "
+        "old 1M snapshot rather than being treated as an anonymous fallback"
+    )
+    assert body["threshold_tokens"] == 128_000
+
+
+def test_session_context_lookup_keeps_base_url_when_custom_helper_is_missing(monkeypatch):
+    """#4248 follow-up: non-custom base URL resolution must not depend on custom helper imports."""
+    import api.config as config
+    import api.routes as routes
+
+    monkeypatch.setattr(
+        config,
+        "resolve_model_provider",
+        lambda _model: ("deepseek-v4-1m", "deepseek", "https://runtime-base.invalid/v1"),
+    )
+    monkeypatch.delattr(config, "resolve_custom_provider_connection", raising=False)
+
+    model, provider, base_url, api_key = routes._session_context_length_lookup_state(
+        "deepseek-v4-1m",
+        "deepseek",
+    )
+
+    assert model == "deepseek-v4-1m"
+    assert provider == "deepseek"
+    assert base_url == "https://runtime-base.invalid/v1"
+    assert api_key == ""
+
+
 # --- #3263 dual-gate MUST-FIX invariants (Codex regression gate, v0.51.192) ---
 # These pin the two consistency fixes applied after the gate found that the
 # default-only guard dropped the stale cap but didn't (a) recompute a persisted

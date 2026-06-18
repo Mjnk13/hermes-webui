@@ -4127,32 +4127,67 @@ def _session_context_length_lookup_state(
     if not model_for_lookup:
         return "", provider_for_lookup, "", ""
     try:
-        from api.config import resolve_custom_provider_connection, resolve_model_provider
+        from api.config import resolve_model_provider
 
         model_for_resolution = model_with_provider_context(model_for_lookup, provider_for_lookup or None)
         resolved_model, resolved_provider, resolved_base_url = resolve_model_provider(model_for_resolution)
         model_for_lookup = str(resolved_model or model_for_lookup).strip()
         provider_for_lookup = str(resolved_provider or provider_for_lookup or "").strip()
         base_url_for_lookup = str(resolved_base_url or "").strip()
-        if provider_for_lookup.startswith("custom:"):
+    except Exception:
+        logger.debug("session context-length lookup state resolution failed", exc_info=True)
+    if provider_for_lookup.startswith("custom:"):
+        try:
+            from api.config import resolve_custom_provider_connection
+
             custom_key, custom_base = resolve_custom_provider_connection(provider_for_lookup)
             api_key_for_lookup = str(custom_key or "").strip()
             if not base_url_for_lookup:
                 base_url_for_lookup = str(custom_base or "").strip()
-    except Exception:
-        logger.debug("session context-length lookup state resolution failed", exc_info=True)
+        except Exception:
+            logger.debug("custom provider context-length connection resolution failed", exc_info=True)
     return model_for_lookup, provider_for_lookup, base_url_for_lookup, api_key_for_lookup
 
 
-def _should_accept_session_context_length_refresh(persisted: int, resolved: int) -> bool:
+def _session_model_identity_matches(
+    stored_model: str | None,
+    stored_provider: str | None,
+    resolved_model: str | None,
+    resolved_provider: str | None,
+) -> bool:
+    stored = str(stored_model or "").strip()
+    resolved = str(resolved_model or "").strip()
+    if not stored or not resolved:
+        return False
+    stored_bare, stored_explicit_provider = _split_provider_qualified_model(stored)
+    resolved_bare, resolved_explicit_provider = _split_provider_qualified_model(resolved)
+    stored_provider_norm = _canonical_context_provider(stored_explicit_provider or stored_provider)
+    resolved_provider_norm = _canonical_context_provider(resolved_explicit_provider or resolved_provider)
+    if stored == resolved and stored_provider_norm == resolved_provider_norm:
+        return True
+    if stored_bare != resolved_bare:
+        return False
+    if stored_provider_norm and resolved_provider_norm:
+        return stored_provider_norm == resolved_provider_norm
+    return True
+
+
+def _should_accept_session_context_length_refresh(
+    persisted: int,
+    resolved: int,
+    *,
+    model_changed: bool = False,
+) -> bool:
     if not resolved:
         return False
     if not persisted:
         return True
     # #4248: an anonymous reload resolver can still fall through to the agent
     # metadata default fallback. Do not let that lower-confidence 256k value
-    # clobber a larger context window persisted by the streaming path.
-    return not (resolved == 256_000 and persisted > resolved)
+    # clobber a larger context window persisted by the streaming path. If the
+    # effective model changed, though, a 256k result may be the real new model
+    # window and should replace the old snapshot.
+    return model_changed or not (resolved == 256_000 and persisted > resolved)
 
 
 def _rescale_threshold_tokens_for_context_window(
@@ -7581,8 +7616,10 @@ def handle_get(handler, parsed) -> bool:
             _persisted_cl = getattr(s, "context_length", 0) or 0
             _threshold_tokens = getattr(s, "threshold_tokens", 0) or 0
             if (not _persisted_cl) or resolve_model:
+                _stored_model_for_lookup = getattr(s, "model", "") or ""
+                _stored_provider_for_lookup = getattr(s, "model_provider", None) or ""
                 _model_for_lookup = (
-                    effective_model or getattr(s, "model", "") or ""
+                    effective_model or _stored_model_for_lookup
                 ).strip()
                 (
                     _model_for_lookup,
@@ -7599,7 +7636,17 @@ def handle_get(handler, parsed) -> bool:
                     base_url=_base_url_for_lookup,
                     api_key=_api_key_for_lookup,
                 )
-                if _should_accept_session_context_length_refresh(_persisted_cl, _fb_cl):
+                _model_changed_for_context = not _session_model_identity_matches(
+                    _stored_model_for_lookup,
+                    _stored_provider_for_lookup,
+                    _model_for_lookup,
+                    _provider_for_lookup,
+                )
+                if _should_accept_session_context_length_refresh(
+                    _persisted_cl,
+                    _fb_cl,
+                    model_changed=_model_changed_for_context,
+                ):
                     if _persisted_cl and _fb_cl != _persisted_cl:
                         # The old threshold belongs to the old window. Hiding it
                         # is less useful than keeping the same compression ratio
