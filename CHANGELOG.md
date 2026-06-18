@@ -3,6 +3,12 @@
 
 ## [Unreleased]
 
+## [v0.51.485] — 2026-06-18 — Release QU (mobile: bigger hamburger tap target + browser edge-swipe)
+
+### Improved
+
+- **Mobile menu is easier to tap and the edge-swipe-to-open-sidebar gesture now works in the browser, not just the installed PWA (#4394).** The title-bar hamburger button grows from 32×32 to a 44×44 tap target (the iOS minimum) with a slightly larger icon, and the left-edge swipe-to-open-sidebar gesture is widened and now active in a normal mobile browser (previously PWA-standalone only). The gesture stays left-edge-gated, touch-only, requires clear horizontal intent, and ignores interactive elements, so it won't fire on a scroll or a tap. Thanks @kaishi00.
+
 ## [v0.51.484] — 2026-06-18 — Release QT (collapsible paused cron section)
 
 ### Added
