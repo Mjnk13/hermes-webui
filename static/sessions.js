@@ -381,9 +381,16 @@ function _isServerIdleSessionRow(s) {
 
 function _reconcileActiveSessionIdleStateFromList(serverRows) {
   if (!S || !S.session || !S.session.session_id) return false;
-  // #4354: Removed _sendInProgress guard — server is_streaming=false is authoritative.
   if (!Array.isArray(serverRows)) return false;
   const sid=S.session.session_id;
+  // #4354: clear a stuck indicator when the server reports idle — server
+  // is_streaming/active_stream_id is authoritative. BUT skip the ONE session
+  // that is actively mid-send (#2689 start-race): during the /api/chat/start
+  // round-trip the server row is still idle while the client owns the optimistic
+  // turn, so reconciling it here would blank the just-sent bubble + queue a
+  // spurious force-reload. A long-hung session has _sendInProgress===false, so
+  // it still gets unstuck — only the in-flight start window is protected.
+  if (typeof _sendInProgress !== 'undefined' && _sendInProgress && sid === _sendInProgressSid) return false;
   const serverRow=serverRows.find(s=>s&&s.session_id===sid);
   if (!serverRow) return false;
   if (!_isServerIdleSessionRow(serverRow)) return false;
@@ -435,7 +442,13 @@ function _purgeStaleInflightEntries() {
     }
   }
   for (const sid of Object.keys(INFLIGHT)) {
-    // #4354: Removed _sendInProgressSid skip — purge stale INFLIGHT even during hung sends.
+    // #4354: purge stale INFLIGHT even for a hung/idle session, BUT skip the one
+    // session actively mid-send (#2689 start-race) — during /api/chat/start the
+    // server row is briefly idle while the client owns the optimistic INFLIGHT
+    // entry; purging it here would drop the in-flight turn's local state.
+    if (typeof _sendInProgress !== 'undefined' && _sendInProgress && sid === _sendInProgressSid) {
+      continue;
+    }
     if (!sessionsById.has(sid)) {
       // Session is absent from _allSessions — it was deleted / archived /
       // filtered and can never stream again, so drop the entry.
