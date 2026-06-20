@@ -6415,7 +6415,7 @@ def get_available_models(*, prefer_cache: bool = False) -> dict:
         try:
             from api.profiles import (
                 get_active_profile_name as _gapn,
-                profile_env_for_active_request as _prof_env_request,
+                profile_env_for_active_request_readonly as _prof_env_request,
                 profile_scope_for_detached_worker as _prof_scope_worker,
             )
             _active_profile_name = (_gapn() or "").strip()

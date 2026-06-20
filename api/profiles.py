@@ -901,7 +901,7 @@ def profile_env_for_background_worker(
 
 
 @contextmanager
-def profile_env_for_active_request(
+def profile_env_for_active_request_readonly(
     purpose: str = "provider/model read",
     logger_override: Optional[logging.Logger] = None,
 ):
@@ -962,6 +962,27 @@ def profile_env_for_active_request(
             _set_thread_env(**previous_thread_env)
         else:
             _clear_thread_env()
+
+
+@contextmanager
+def profile_env_for_active_request(
+    purpose: str = "active request",
+    logger_override: Optional[logging.Logger] = None,
+):
+    """Apply the active per-request profile through the legacy mirrored path.
+
+    Some request-scoped readers still delegate into Hermes helpers that resolve
+    credentials directly from process env or ``get_hermes_home()``. Those paths
+    stay on the mirrored scope until they are fully audited.
+    """
+    profile = (get_active_profile_name() or "").strip()
+    if not profile or _is_root_profile(profile):
+        yield
+        return
+    with profile_env_for_background_worker(
+        profile, purpose, logger_override=logger_override
+    ):
+        yield
 
 
 @contextmanager

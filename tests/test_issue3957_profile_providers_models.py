@@ -19,7 +19,7 @@ The fix:
   - ``api.config._get_models_cache_path()`` returns a profile-keyed path
     (``models_cache.<profile>.json`` for named profiles; unchanged
     ``models_cache.json`` for the default/root profile).
-  - ``api.profiles.profile_env_for_active_request()`` applies the active
+  - ``api.profiles.profile_env_for_active_request_readonly()`` applies the active
     per-request profile's env around the read; no-op for the default profile.
 """
 
@@ -113,7 +113,7 @@ def test_active_request_env_noop_for_default_profile(monkeypatch):
     monkeypatch.setattr(profiles, "get_active_profile_name", lambda: "default")
     monkeypatch.setattr(profiles, "_is_root_profile", lambda n: n in ("", "default"))
     monkeypatch.delenv("ISSUE_3957_PROBE", raising=False)
-    with profiles.profile_env_for_active_request("test"):
+    with profiles.profile_env_for_active_request_readonly("test"):
         # No env mutation, no HERMES_HOME change for the default profile.
         assert os.environ.get("ISSUE_3957_PROBE") is None
     assert os.environ.get("ISSUE_3957_PROBE") is None
@@ -135,7 +135,7 @@ def test_active_request_env_applies_named_profile_env(monkeypatch, tmp_path):
     try:
         assert profiles.get_active_profile_name() == "work"
         assert config._thread_local_env_value("ISSUE_3957_PROBE") == "from-process-env"
-        with profiles.profile_env_for_active_request("test"):
+        with profiles.profile_env_for_active_request_readonly("test"):
             assert config._thread_local_env_value("ISSUE_3957_PROBE") == "from-work-profile"
             assert os.environ.get("ISSUE_3957_PROBE") == "from-process-env"
         # Restored after the block exits.
@@ -160,7 +160,7 @@ def test_active_request_env_restores_on_exception(monkeypatch, tmp_path):
     try:
         with_raised = False
         try:
-            with profiles.profile_env_for_active_request("test"):
+            with profiles.profile_env_for_active_request_readonly("test"):
                 assert config._thread_local_env_value("ISSUE_3957_PROBE") == "from-work-profile"
                 assert os.environ.get("ISSUE_3957_PROBE") == "from-process-env"
                 raise ValueError("boom")
@@ -201,7 +201,7 @@ def test_active_request_scope_prefers_profile_key_over_process_env_for_custom_pr
             "from-process-env",
             None,
         )
-        with profiles.profile_env_for_active_request("test"):
+        with profiles.profile_env_for_active_request_readonly("test"):
             assert config.resolve_custom_provider_connection("custom:team") == (
                 "from-work-profile",
                 None,
@@ -225,8 +225,27 @@ def test_active_request_scope_sets_context_local_hermes_home(monkeypatch, tmp_pa
 
     profiles.set_request_profile("work")
     try:
-        with profiles.profile_env_for_active_request("test"):
+        with profiles.profile_env_for_active_request_readonly("test"):
             assert get_hermes_home() == work_home
+    finally:
+        profiles.clear_request_profile()
+
+
+def test_active_request_legacy_scope_still_mirrors_process_env(monkeypatch, tmp_path):
+    """Live-model request scope still mirrors env for agent-side readers."""
+    base = tmp_path / ".hermes"
+    (base / "profiles" / "work").mkdir(parents=True)
+    (base / "profiles" / "work" / ".env").write_text(
+        "ISSUE_3957_PROBE=from-work-profile\n", encoding="utf-8"
+    )
+    monkeypatch.setattr(profiles, "_DEFAULT_HERMES_HOME", base)
+    monkeypatch.setenv("ISSUE_3957_PROBE", "from-process-env")
+
+    profiles.set_request_profile("work")
+    try:
+        with profiles.profile_env_for_active_request("test"):
+            assert os.environ.get("ISSUE_3957_PROBE") == "from-work-profile"
+        assert os.environ.get("ISSUE_3957_PROBE") == "from-process-env"
     finally:
         profiles.clear_request_profile()
 
@@ -236,7 +255,11 @@ def test_providers_and_models_routes_wrap_in_profile_env():
 
     Structural guard: a future refactor that drops the wiring would silently
     reintroduce the bug, so pin it at the source level.
-      - /api/providers wraps the synchronous read in profile_env_for_active_request.
+      - /api/providers and /api/provider/quota wrap the synchronous read in
+        profile_env_for_active_request_readonly.
+      - /api/models/live stays on the mirrored profile_env_for_active_request
+        path because provider_model_ids() still delegates into agent helpers
+        that read process env / HERMES_HOME directly.
       - /api/models relies on get_available_models() scoping its detached
         rebuild worker via profile_scope_for_detached_worker (the request-thread
         wrapper cannot reach the worker thread — Codex CORE finding).
@@ -244,7 +267,8 @@ def test_providers_and_models_routes_wrap_in_profile_env():
     routes_src = Path(profiles.__file__).resolve().parent.joinpath("routes.py").read_text(
         encoding="utf-8"
     )
-    assert "profile_env_for_active_request" in routes_src
+    assert 'with profile_env_for_active_request("/api/models/live"' in routes_src
+    assert "profile_env_for_active_request_readonly" in routes_src
     config_src = Path(config.__file__).resolve().read_text(encoding="utf-8")
     assert "profile_scope_for_detached_worker" in config_src
     assert "_get_models_cache_path" in config_src
