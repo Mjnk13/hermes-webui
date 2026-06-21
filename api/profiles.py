@@ -928,14 +928,20 @@ def profile_env_for_background_worker(
     try:
         _set_thread_env(**thread_env)
         _thread_ctx.block_process_env_fallback = True
+        _secret_scope_mod = None
         try:
-            from agent.secret_scope import reset_secret_scope, set_secret_scope
-            _scope_token = set_secret_scope(thread_env)
-            _has_scope = True
-        except ImportError:
-            import sys as _sys
-            _sys.modules.pop('agent', None)
-            _sys.modules.pop('agent.secret_scope', None)
+            _secret_scope_mod = __import__('sys').modules.get('agent.secret_scope')
+            if _secret_scope_mod is None:
+                import importlib.util
+                if importlib.util.find_spec('agent.secret_scope') is not None:
+                    _secret_scope_mod = __import__('agent.secret_scope', fromlist=['set_secret_scope', 'reset_secret_scope'])
+            if _secret_scope_mod is not None:
+                _scope_token = _secret_scope_mod.set_secret_scope(thread_env)
+                _has_scope = True
+            else:
+                _scope_token = None
+                _has_scope = False
+        except Exception:
             _scope_token = None
             _has_scope = False
         with _ENV_LOCK:
@@ -960,9 +966,9 @@ def profile_env_for_background_worker(
                 )
         yield
     finally:
-        if _has_scope:
+        if _has_scope and _secret_scope_mod is not None:
             try:
-                reset_secret_scope(_scope_token)
+                _secret_scope_mod.reset_secret_scope(_scope_token)
             except Exception:
                 pass
         _thread_ctx.block_process_env_fallback = previous_block_process_env
@@ -1047,23 +1053,29 @@ def profile_env_for_active_request_readonly(
     try:
         _set_thread_env(**thread_env)
         _thread_ctx.block_process_env_fallback = True
+        _secret_scope_mod = None
         try:
-            from agent.secret_scope import reset_secret_scope, set_secret_scope
-            _scope_token = set_secret_scope(thread_env)
-            _has_scope = True
-        except ImportError:
-            import sys as _sys
-            _sys.modules.pop('agent', None)
-            _sys.modules.pop('agent.secret_scope', None)
+            _secret_scope_mod = __import__('sys').modules.get('agent.secret_scope')
+            if _secret_scope_mod is None:
+                import importlib.util
+                if importlib.util.find_spec('agent.secret_scope') is not None:
+                    _secret_scope_mod = __import__('agent.secret_scope', fromlist=['set_secret_scope', 'reset_secret_scope'])
+            if _secret_scope_mod is not None:
+                _scope_token = _secret_scope_mod.set_secret_scope(thread_env)
+                _has_scope = True
+            else:
+                _scope_token = None
+                _has_scope = False
+        except Exception:
             _scope_token = None
             _has_scope = False
         if set_hermes_home_override is not None:
             home_override_token = set_hermes_home_override(profile_home_path)
         yield
     finally:
-        if _has_scope:
+        if _has_scope and _secret_scope_mod is not None:
             try:
-                reset_secret_scope(_scope_token)
+                _secret_scope_mod.reset_secret_scope(_scope_token)
             except Exception:
                 pass
         if home_override_token is not None and reset_hermes_home_override is not None:
