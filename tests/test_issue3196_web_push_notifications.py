@@ -292,6 +292,9 @@ def test_static_sources_cover_closed_app_push_flow():
     assert "const WEB_PUSH_CSRF_TOKEN = __CSRF_TOKEN_JSON__;" in SW_JS
     assert "headers['X-Hermes-CSRF-Token'] = WEB_PUSH_CSRF_TOKEN;" in SW_JS
     assert "self.registration.showNotification(payload.title, payload.options)" in SW_JS
+    assert "self.clients.matchAll({type: 'window', includeUncontrolled: true})" in SW_JS
+    assert "client.visibilityState === 'visible' || client.focused === true" in SW_JS
+    assert "clientUrl.pathname.startsWith(scopePath)" in SW_JS
     assert "/api/push/status" in SW_JS
     assert "/api/push/vapid-public-key" in SW_JS
     assert "method: 'DELETE'" in SW_JS

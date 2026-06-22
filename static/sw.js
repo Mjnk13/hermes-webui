@@ -226,7 +226,24 @@ self.addEventListener('push', (event) => {
       });
     }
   })();
-  event.waitUntil(self.registration.showNotification(payload.title, payload.options));
+  event.waitUntil((async () => {
+    const scopePath = new URL(self.registration.scope || './').pathname;
+    const clientList = self.clients && self.clients.matchAll
+      ? await self.clients.matchAll({type: 'window', includeUncontrolled: true}).catch(() => [])
+      : [];
+    const hasVisibleClient = clientList.some((client) => {
+      try {
+        const clientUrl = new URL(client.url);
+        return clientUrl.origin === self.location.origin &&
+          clientUrl.pathname.startsWith(scopePath) &&
+          (client.visibilityState === 'visible' || client.focused === true);
+      } catch (_err) {
+        return false;
+      }
+    });
+    if (hasVisibleClient) return;
+    return self.registration.showNotification(payload.title, payload.options);
+  })());
 });
 
 self.addEventListener('pushsubscriptionchange', (event) => {
