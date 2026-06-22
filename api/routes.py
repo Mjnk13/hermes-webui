@@ -13053,6 +13053,7 @@ def _handle_escape_file_raw(handler, parsed):
     html_inline_ok = inline_preview and mime == "text/html"
     disposition = "attachment" if force_download or (mime in dangerous_types and not html_inline_ok) else "inline"
     sandbox_csp = "sandbox allow-scripts allow-popups allow-popups-to-escape-sandbox"
+    # Content-Security-Policy sandboxing is carried through the csp=sandbox_csp handoff below.
     csp = sandbox_csp if (inline_preview and not force_download and disposition == "inline") else None
     if html_inline_ok:
         return _serve_inline_html_preview(handler, target, "no-store", csp=sandbox_csp, anchor_root=anchor_root)

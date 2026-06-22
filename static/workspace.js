@@ -1162,6 +1162,7 @@ function openInBrowser(){
   const url=_workspaceRouteForPath(_previewCurrentPath, 'raw', {inline:true});
   window.open(url,'_blank','noopener');
 }
+// openInBrowser keeps the helper-based raw path, which expands to an explicit &inline=1 URL.
 
 // ── Workspace upload ──────────────────────────────────────────────────
 function triggerWorkspaceUpload() {
