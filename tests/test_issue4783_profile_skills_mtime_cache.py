@@ -119,9 +119,14 @@ def profiles_mod(tmp_path):
 
 
 class TestWithinTTLZeroIO:
-    """Proof matrix row 1: within TTL, no I/O at all."""
+    """Within TTL + unchanged files: skip the expensive SKILL.md recompute.
 
-    def test_second_call_skips_compute_and_stat(self, profiles_mod):
+    The cheap stat-only mtime probe DOES run on every call (that is the
+    out-of-band change-detection fix for #4783); only _compute_profile_skills_stats
+    (which reads + parses every SKILL.md) is avoided within the TTL.
+    """
+
+    def test_second_call_within_ttl_skips_compute_but_probes_mtime(self, profiles_mod):
         mod, profile_dir = profiles_mod
         with (
             patch.object(mod, "_compute_profile_skills_stats", wraps=mod._compute_profile_skills_stats) as mock_compute,
@@ -131,13 +136,15 @@ class TestWithinTTLZeroIO:
             compute_calls_after_first = mock_compute.call_count
             stat_calls_after_first = mock_stat.call_count
 
-            # Second call within TTL
+            # Second call within TTL with unchanged files
             result = mod._get_profile_skills_stats(profile_dir)
 
             assert mock_compute.call_count == compute_calls_after_first, \
-                "_compute_profile_skills_stats must NOT be called within TTL"
-            assert mock_stat.call_count == stat_calls_after_first, \
-                "_skill_tree_max_mtime_ns must NOT be called within TTL"
+                "_compute_profile_skills_stats (expensive SKILL.md read) must NOT be called within TTL when files are unchanged"
+            # The cheap mtime probe runs on every call so out-of-band changes are
+            # caught promptly — it must have advanced past the first-call count.
+            assert mock_stat.call_count > stat_calls_after_first, \
+                "_skill_tree_max_mtime_ns (cheap stat probe) MUST run on every call to detect out-of-band changes"
             assert isinstance(result, tuple) and len(result) == 2
 
 
@@ -188,6 +195,35 @@ class TestAfterTTLChangedFilesFullRecompute:
             result = mod._get_profile_skills_stats(profile_dir)
 
         mock_compute.assert_called_once()
+        assert result == (7, 9)
+
+
+class TestWithinTTLChangedFilesRecompute:
+    """Regression for the gate-found SILENT bug: an out-of-band (CLI/git) change
+    WITHIN the TTL must be detected promptly, not hidden until the TTL expires.
+
+    The earlier design returned the cached value on a zero-I/O fast path while
+    still inside the TTL, so the mtime probe never ran and an out-of-band change
+    was invisible for up to the full TTL (worse than master's short window).
+    """
+
+    def test_changed_mtime_within_ttl_triggers_recompute(self, profiles_mod):
+        mod, profile_dir = profiles_mod
+
+        old_mtime_ns = 1_000_000_000_000_000_000
+        changed_mtime_ns = 2_000_000_000_000_000_000
+        future_expiry = time.time() + 9999.0  # firmly WITHIN the TTL
+        resolved = Path(profile_dir).resolve()
+        mod._SKILLS_STATS_CACHE[resolved] = (1, 2, old_mtime_ns, future_expiry)
+
+        with (
+            patch.object(mod, "_compute_profile_skills_stats", return_value=(7, 9)) as mock_compute,
+            patch.object(mod, "_skill_tree_max_mtime_ns", return_value=changed_mtime_ns),
+        ):
+            result = mod._get_profile_skills_stats(profile_dir)
+
+        mock_compute.assert_called_once(), \
+            "an out-of-band change within the TTL must trigger a recompute, not be hidden until expiry"
         assert result == (7, 9)
 
 

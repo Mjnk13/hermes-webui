@@ -1674,10 +1674,23 @@ def _compute_profile_skills_stats(profile_dir: Path) -> tuple[int, int]:
 
 
 def _get_profile_skills_stats(profile_dir: Path) -> tuple[int, int]:
-    """Calculate (enabled_count, compatible_count) with two-tier mtime cache."""
+    """Calculate (enabled_count, compatible_count) with two-tier mtime cache.
+
+    A cheap stat-only mtime probe runs on EVERY call so out-of-band (CLI/git)
+    skill changes are reflected promptly — the expensive part (reading + parsing
+    every SKILL.md) is what the cache avoids, not the change detection. The TTL
+    is only a safety-net upper bound that forces an occasional full recompute
+    even when the mtime probe sees no change.
+    """
     import time
     profile_dir = Path(profile_dir).resolve()
     now = time.time()
+    skills_dir = profile_dir / "skills"
+    config_path = profile_dir / "config.yaml"
+
+    # Always run the cheap stat-only probe first — this is what catches an
+    # out-of-band create/edit/delete within the same request (not after the TTL).
+    current_mtime_ns = _skill_tree_max_mtime_ns(skills_dir, config_path)
 
     # Read via .get() (not membership-check + index) so a concurrent
     # _SKILLS_STATS_CACHE.clear() on another thread can't raise KeyError
@@ -1685,22 +1698,21 @@ def _get_profile_skills_stats(profile_dir: Path) -> tuple[int, int]:
     cached = _SKILLS_STATS_CACHE.get(profile_dir)
     if cached is not None:
         enabled, compat, cached_mtime_ns, expiry = cached
-        if now < expiry:
-            return enabled, compat  # fast path: within TTL, zero I/O
-        # TTL expired — stat-only probe to check whether files actually changed
-        skills_dir = profile_dir / "skills"
-        config_path = profile_dir / "config.yaml"
-        current_mtime_ns = _skill_tree_max_mtime_ns(skills_dir, config_path)
+        # Files unchanged (by mtime probe) → serve cached without re-reading any
+        # SKILL.md, and refresh the safety-net TTL. The mtime probe already ran
+        # above, so an out-of-band change is caught here regardless of the TTL —
+        # the TTL only bounds how long we trust an unchanged-mtime reading before
+        # forcing a belt-and-suspenders full recompute.
+        if current_mtime_ns == cached_mtime_ns and now < expiry:
+            return enabled, compat
         if current_mtime_ns == cached_mtime_ns:
-            # Files unchanged — refresh TTL without re-reading
+            # TTL expired but files genuinely unchanged — refresh TTL, no recompute.
             _SKILLS_STATS_CACHE[profile_dir] = (enabled, compat, cached_mtime_ns, now + _SKILLS_STATS_CACHE_TTL)
             return enabled, compat
 
     # Cache miss or mtime changed — snapshot mtime BEFORE compute so any
     # concurrent SKILL.md write during the compute window causes a mismatch
-    # on the next TTL probe instead of silently serving stale data (TOCTOU).
-    skills_dir = profile_dir / "skills"
-    config_path = profile_dir / "config.yaml"
+    # on the next probe instead of silently serving stale data (TOCTOU).
     new_mtime_ns = _skill_tree_max_mtime_ns(skills_dir, config_path)
     res = _compute_profile_skills_stats(profile_dir)
     _SKILLS_STATS_CACHE[profile_dir] = (res[0], res[1], new_mtime_ns, now + _SKILLS_STATS_CACHE_TTL)
