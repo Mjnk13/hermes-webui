@@ -139,10 +139,16 @@ console.log(JSON.stringify(result));
         "blankPrefillIgnored": False,
     }
     prefill_guard = BOOT_JS.find("if(_rootPrefillNeedsFreshComposer(urlSession, savedLocal, prefillIntent)){")
-    saved_guard = BOOT_JS.find("if(!urlSession&&savedLocal&&await _savedSessionShouldStaySidebarOnly(savedLocal)){")
-    load_pos = BOOT_JS.find("await loadSession(saved);")
+    saved_state_pos = BOOT_JS.find("const savedSidebarOnlyState=(!urlSession&&savedLocal)")
+    saved_guard = BOOT_JS.find(
+        "if(savedSidebarOnlyState&&savedSidebarOnlyState.sidebarOnly){",
+        saved_state_pos,
+    )
+    load_pos = BOOT_JS.find("await loadSession(saved, {preserveActiveInput:true});")
     assert prefill_guard >= 0
-    assert saved_guard > prefill_guard
+    assert saved_state_pos >= 0
+    assert saved_guard > saved_state_pos
+    assert prefill_guard > saved_guard
     assert load_pos > prefill_guard
 
 
@@ -229,7 +235,7 @@ console.log(JSON.stringify({
     assert 0 <= consume_pos < load_pos
     assert 0 <= check_pos < apply_pos
     zero_message_pos = BOOT_JS.find(
-        "await renderSessionList();if(typeof startGatewaySSE==='function')startGatewaySSE();await _applyComposerPrefillOnBoot(prefillIntent);",
+        "await renderSessionList();await _applyComposerPrefillOnBoot(prefillIntent);if(typeof startGatewaySSE==='function')startGatewaySSE();",
         load_pos,
     )
     assert zero_message_pos > load_pos
