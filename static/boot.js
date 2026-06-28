@@ -1988,9 +1988,23 @@ function _buildSkinPicker(activeSkin){
     btn.dataset.skinVal=key;
     btn.style.cssText='border:1px solid var(--border2);border-radius:8px;padding:8px 4px;text-align:center;cursor:pointer;background:none;transition:all .15s';
     btn.onclick=()=>_pickSkin(key);
-    const dots=skin.colors.map(c=>`<span style="display:inline-block;width:10px;height:10px;border-radius:50%;background:${c}"></span>`).join('');
-    const label=skin.label||skin.name;
-    btn.innerHTML=`<div style="display:flex;gap:3px;justify-content:center;margin-bottom:4px">${dots}</div><span style="font-size:11px;color:var(--text)">${label}</span>`;
+    // Build with DOM nodes + textContent so an extension-registered skin's
+    // label/name (registerHermesSkin descriptor) can never inject markup into
+    // the picker. Swatch colors are already value-sanitized upstream, but set
+    // them via element.style.background (not interpolated HTML) as defense in depth.
+    const dotRow=document.createElement('div');
+    dotRow.style.cssText='display:flex;gap:3px;justify-content:center;margin-bottom:4px';
+    for(const c of (skin.colors||[])){
+      const dot=document.createElement('span');
+      dot.style.cssText='display:inline-block;width:10px;height:10px;border-radius:50%';
+      dot.style.background=c;
+      dotRow.appendChild(dot);
+    }
+    const labelEl=document.createElement('span');
+    labelEl.style.cssText='font-size:11px;color:var(--text)';
+    labelEl.textContent=skin.label||skin.name||'';
+    btn.appendChild(dotRow);
+    btn.appendChild(labelEl);
     grid.appendChild(btn);
   }
   _syncSkinPicker((activeSkin||'default').toLowerCase());
