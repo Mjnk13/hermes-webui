@@ -603,6 +603,21 @@ cloudflared tunnel \
         <summary>Port 8787 is already taken</summary>
         <p>Start on another port with <code>HERMES_WEBUI_PORT=8788 ./start.sh</code>, and use that port everywhere — your client URL, the tunnel command, and the SSH forward.</p>
       </details>
+      <details>
+        <summary>bootstrap.py: "cannot import both WebUI dependencies and Hermes Agent"</summary>
+        <p>This means <code>bootstrap.py</code> couldn't locate your Hermes Agent install, so it built a WebUI-only virtualenv that can't load the agent. It happens most often when you installed the agent <b>as root</b> (the installer uses the FHS layout <code>/usr/local/lib/hermes-agent</code>) or cloned it to a non-default path. Point the launcher at the agent's Python and relaunch:</p>
+        <div class="code">
+          <div class="code-head"><span class="code-label">bash — find the agent and relaunch</span><button class="code-copy">Copy</button></div>
+          <pre><code># 1. Find where the agent lives (the dir containing run_agent.py):
+ls /usr/local/lib/hermes-agent/run_agent.py 2>/dev/null \
+  || ls ~/.hermes/hermes-agent/run_agent.py 2>/dev/null
+
+# 2. Point bootstrap at that install's venv Python and relaunch:
+HERMES_WEBUI_PYTHON=/usr/local/lib/hermes-agent/venv/bin/python python3 bootstrap.py
+# (use ~/.hermes/hermes-agent/venv/bin/python instead for a non-root install)</code></pre>
+        </div>
+        <p>Upgrading the WebUI (<code>git pull</code>) also fixes this — newer <code>bootstrap.py</code> auto-discovers the root/FHS layout and follows the <code>hermes</code> launcher to the agent, so no environment variable is needed.</p>
+      </details>
     </div>
   </div>
 </section>
