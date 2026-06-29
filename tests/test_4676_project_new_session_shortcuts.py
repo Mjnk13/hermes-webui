@@ -234,6 +234,9 @@ globalThis.document = {
       children: [],
       appendChild(child) { this.children.push(child); },
       appendChildCallCount: 0,
+      attributes: {},
+      setAttribute(name, value) { this.attributes[name] = String(value); },
+      getAttribute(name) { return Object.prototype.hasOwnProperty.call(this.attributes, name) ? this.attributes[name] : null; },
       dataset: {},
       type: '',
     };
@@ -292,6 +295,7 @@ const touchEv = {
     buttonClass: btn.className,
     buttonTag: btn.tagName,
     buttonText: btn.textContent,
+    buttonAriaLabel: btn.getAttribute('aria-label'),
     newSession: params.newSession,
     filterProjectId: params.filterProjectId,
     stopCount: params.stopCount,
@@ -354,6 +358,7 @@ def test_project_chip_quick_create_keeps_active_filter_and_uses_project_override
     assert out["buttonClass"] == "project-chip-quick-create"
     assert out["buttonTag"] == "BUTTON"
     assert out["buttonText"] == "+"
+    assert out["buttonAriaLabel"] == "New conversation in this project"
     assert out["filterProjectId"] == "project-123"
     assert out["newSession"] == {"flash": False, "options": {"project_id": "project-123"}}
     assert {"type": "set-filter", "projectId": "project-123"} in out["calls"]

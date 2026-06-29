@@ -6154,6 +6154,7 @@ function _attachProjectQuickCreateButton(chip, project){
   btn.className='project-chip-quick-create';
   btn.textContent='+';
   btn.title='New conversation in this project';
+  btn.setAttribute('aria-label','New conversation in this project');
   const stop=function(e){
     if(!e) return;
     if(typeof e.preventDefault==='function') e.preventDefault();
