@@ -17,7 +17,6 @@ _DOCX_BODY_CHILDREN = {qn("w:p"), qn("w:sectPr")}
 _DOCX_PARAGRAPH_CHILDREN = {qn("w:pPr"), qn("w:r")}
 _DOCX_SAFE_PARAGRAPH_PROPERTY_CHILDREN = {qn("w:pStyle")}
 _DOCX_RUN_CHILDREN = {qn("w:t")}
-_DOCX_UNSAFE_SECTION_CHILDREN = {qn("w:headerReference"), qn("w:footerReference")}
 
 
 def is_claimed_office_path(path: str | Path) -> bool:
@@ -72,15 +71,38 @@ def _docx_paragraph_properties_are_safe(properties) -> bool:
     return True
 
 
+def _docx_xml_signature(element) -> tuple:
+    attributes = tuple(
+        sorted(
+            (key, value)
+            for key, value in element.attrib.items()
+            if not key.rsplit("}", 1)[-1].startswith("rsid")
+        )
+    )
+    children = tuple(_docx_xml_signature(child) for child in element)
+    text = (element.text or "").strip()
+    return element.tag, attributes, text, children
+
+
+def _default_docx_section_signature() -> tuple:
+    document = Document()
+    return tuple(_docx_xml_signature(child) for child in document._element.body.sectPr)
+
+
+_DEFAULT_DOCX_SECTION_SIGNATURE = _default_docx_section_signature()
+
+
+def _docx_section_properties_are_safe(section_properties) -> bool:
+    return tuple(_docx_xml_signature(child) for child in section_properties) == _DEFAULT_DOCX_SECTION_SIGNATURE
+
+
 def _docx_editability(document: Document) -> tuple[bool, str | None]:
     body = document._element.body
     for child in body:
         if child.tag not in _DOCX_BODY_CHILDREN:
             return False, "docx contains unsupported structures"
-        if child.tag == qn("w:sectPr"):
-            for section_child in child:
-                if section_child.tag in _DOCX_UNSAFE_SECTION_CHILDREN:
-                    return False, "docx contains unsupported section content"
+        if child.tag == qn("w:sectPr") and not _docx_section_properties_are_safe(child):
+            return False, "docx contains unsupported section content"
     for paragraph in document.paragraphs:
         for child in paragraph._p:
             if child.tag not in _DOCX_PARAGRAPH_CHILDREN:

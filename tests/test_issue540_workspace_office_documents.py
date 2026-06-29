@@ -78,6 +78,15 @@ def _header_docx_bytes() -> bytes:
     return buffer.getvalue()
 
 
+def _custom_section_docx_bytes() -> bytes:
+    document = DocxDocument()
+    document.add_paragraph("Body text")
+    document.sections[0].left_margin = Inches(2)
+    buffer = io.BytesIO()
+    document.save(buffer)
+    return buffer.getvalue()
+
+
 def _simple_xlsx_bytes() -> bytes:
     workbook = Workbook()
     sheet = workbook.active
@@ -258,6 +267,20 @@ def test_formatted_docx_stays_preview_only():
 def test_header_docx_stays_preview_only():
     path = "headed.docx"
     raw = _header_docx_bytes()
+
+    preview = preview_office_document(path, raw)
+
+    assert preview["preview_kind"] == "office"
+    assert preview["editable"] is False
+    assert preview.get("edit_blocked_reason")
+
+    with pytest.raises(ValueError):
+        save_office_document(path, raw, "edited text")
+
+
+def test_custom_section_docx_stays_preview_only():
+    path = "custom-section.docx"
+    raw = _custom_section_docx_bytes()
 
     preview = preview_office_document(path, raw)
 
