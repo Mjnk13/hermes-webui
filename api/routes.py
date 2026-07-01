@@ -11320,7 +11320,13 @@ def handle_get(handler, parsed) -> bool:
                 "archived": bool(getattr(synth, "archived", False)),
                 "project_id": getattr(synth, "project_id", None),
                 "profile": synth.profile,
-                "is_cli_session": True,
+                # Read is_cli_session from the synthesized Session, not a
+                # hardcoded True: delegated subagent children (#5307) are
+                # recovered read-only with is_cli_session=False so they don't
+                # pass the frontend _isExternalSession poll-skip / active-refresh
+                # gates (#3603). Every other synthesized foreign session keeps
+                # is_cli_session=True so its source badge renders.
+                "is_cli_session": bool(getattr(synth, "is_cli_session", False)),
                 "source_tag": synth.source_tag,
                 "raw_source": synth.raw_source,
                 "session_source": synth.session_source,
@@ -22313,6 +22319,14 @@ def _handle_session_import_cli(handler, body):
     cli_platform = cli_meta.get("platform") if cli_meta else None
     cli_parent_session_id = cli_meta.get("parent_session_id") if cli_meta else None
     cli_read_only = bool((cli_meta or {}).get("read_only"))
+    # Delegated subagent children (#5307) are recovered VIEW-ONLY: they must
+    # never be materialized as a writable WebUI sidecar via this endpoint, or a
+    # subsequent chat-start/composer write would take ownership of a session
+    # that belongs to the delegate runner. Treat them like an explicitly
+    # read-only source (return the read-only stub payload, do not import), and
+    # keep them out of the _isExternalSession frontend gates (is_cli_session=False).
+    _sa_child = _is_subagent_child_session_id(sid)
+    _read_only_view = cli_read_only or _sa_child
 
     # Use the CLI session title if available (e.g., cron job name), otherwise derive from messages
     title = cli_title or title_from(msgs, "CLI Session")
@@ -22322,7 +22336,7 @@ def _handle_session_import_cli(handler, body):
     if is_cron_session(sid, cli_source_tag):
         cron_project_id = ensure_cron_project()
 
-    if cli_read_only:
+    if _read_only_view:
         session_payload = {
             "session_id": sid,
             "title": title,
@@ -22336,7 +22350,10 @@ def _handle_session_import_cli(handler, body):
             "archived": False,
             "project_id": None,
             "profile": profile,
-            "is_cli_session": True,
+            # Subagent children (#5307) are recovered view-only and must NOT be
+            # CLI-classified (keeps them out of the frontend _isExternalSession
+            # gates); other explicitly-read-only sources keep is_cli_session=True.
+            "is_cli_session": (False if _sa_child else True),
             "source_tag": cli_source_tag,
             "raw_source": cli_raw_source or cli_source_tag,
             "session_source": cli_session_source,

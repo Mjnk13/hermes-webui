@@ -257,3 +257,28 @@ def test_state_db_source_helper_reads_subagent(routes_module, isolated_state_db)
     assert routes_module._state_db_session_source("sa-1") == "subagent"
     assert routes_module._is_subagent_child_session_id("sa-1") is True
     assert routes_module._is_subagent_child_session_id("does-not-exist") is False
+
+
+def test_import_cli_endpoint_does_not_materialize_subagent_child():
+    """Codex hardening: POST /api/session/import_cli must NOT create a writable
+    sidecar for a subagent child — the handler gates source='subagent' into the
+    read-only view payload (is_cli_session=False, imported=False) before ever
+    calling import_cli_session(). Pinned as a static-source contract check."""
+    src = ROUTES_PY.read_text(encoding="utf-8")
+    start = src.index("def _handle_session_import_cli(")
+    m = re.search(r"\n(?:def |class )", src[start + 1:])
+    block = src[start:(start + 1 + m.start()) if m else len(src)]
+    assert "_is_subagent_child_session_id(sid)" in block, (
+        "import_cli handler must detect subagent children"
+    )
+    assert "_read_only_view" in block, (
+        "import_cli must route subagent children through the read-only view "
+        "payload (no writable import_cli_session materialization)"
+    )
+    # the read-only view branch must return before import_cli_session()
+    ro_idx = block.index("_read_only_view")
+    import_idx = block.index("import_cli_session(")
+    assert ro_idx < import_idx, (
+        "the read-only-view gate must precede import_cli_session() so subagent "
+        "children never materialize a writable sidecar"
+    )
