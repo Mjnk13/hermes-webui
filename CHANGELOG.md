@@ -11,6 +11,10 @@
 
 - **No more 57–70 s cold-startup stalls from the profile skills-stats thundering herd.** At container boot the frontend fires several profile-data requests at once; with `ThreadingHTTPServer` (one thread per request) they all missed the empty skills-stats cache simultaneously and each walked + parsed every profile's skill tree, stacking thousands of concurrent `stat()` calls under Docker's overlay2 filesystem. `_get_profile_skills_stats()` now serializes per-profile with double-checked locking (concurrent misses on one profile collapse to a single compute; independent profiles still compute in parallel), and `list_profiles_api()` single-flights the row build under `_LIST_PROFILES_CACHE_LOCK` so one thread builds while the rest wait for the cached result. The every-call cheap mtime probe (the #4783 out-of-band change-detection contract) is unchanged. (#5364)
 
+### Added
+
+- **The workspace file viewer now previews modern Office documents (`.docx` / `.xlsx` / `.pptx`) and lets you edit plain, structurally-simple `.docx` files in place.** A shared backend Office authority owns previewability, editability, and archive-safety: parsers are optional at runtime (lazy-imported; a lean install degrades to a clean 503 install hint, not a crash), every OOXML archive is preflighted against decompression-bomb limits on *actual inflated bytes* before any parser runs, and preview size is bounded during accumulation. `.docx` editing is fail-closed — only documents whose body is plain paragraphs (no custom sections/tables/headers/rich runs) are editable, save rebuilds from the original package so document metadata/styles/theme are preserved, and the saved bytes are re-verified before write. Previews render as escaped text (no HTML injection). Thanks @rodboev. (#5142, part of #540)
+
 ## [v0.51.792] — 2026-07-01
 
 ### Fixed

@@ -676,3 +676,32 @@ def test_oversized_docx_save_content_rejected_before_build():
     too_many_chars = "a" * (office_documents.MAX_OFFICE_PREVIEW_CHARS + 1)
     with pytest.raises(ValueError):
         save_office_document("authored.docx", raw, too_many_chars)
+
+
+@pytest.mark.parametrize(
+    "paragraphs",
+    [
+        ["Hello", "", ""],   # trailing blank paragraphs (normal Word convention)
+        ["", "World"],        # leading blank paragraph
+        ["a", "", "b"],       # interior blank (already worked — guard against regression)
+    ],
+)
+def test_unedited_docx_save_preserves_edge_blank_paragraphs(paragraphs):
+    """Round-trip fidelity: leading/trailing blank paragraphs must survive an
+    unedited open->save. _finalize_preview_text used to .strip() the whole
+    preview, and since the editor textarea is prefilled from the preview text,
+    a no-op save silently dropped edge blank paragraphs. The docx preview path
+    now preserves edge whitespace (strip_edges=False)."""
+    document = DocxDocument()
+    for text in paragraphs:
+        document.add_paragraph(text)
+    buffer = io.BytesIO()
+    document.save(buffer)
+    raw = buffer.getvalue()
+
+    preview = preview_office_document("edge.docx", raw)
+    assert preview["editable"] is True
+
+    _saved_preview, saved_bytes = save_office_document("edge.docx", raw, preview["content"])
+    reloaded = [p.text for p in DocxDocument(io.BytesIO(saved_bytes)).paragraphs]
+    assert reloaded == paragraphs

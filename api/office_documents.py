@@ -167,8 +167,13 @@ def _preview_line_count(content: str) -> int:
     return content.count("\n") + 1
 
 
-def _finalize_preview_text(content: str, truncated: bool = False) -> tuple[str, bool]:
-    text = (content or "").strip()
+def _finalize_preview_text(content: str, truncated: bool = False, strip_edges: bool = True) -> tuple[str, bool]:
+    # docx passes strip_edges=False: leading/trailing blank paragraphs are
+    # meaningful body content and the editor textarea is prefilled from this
+    # text, so stripping edge whitespace would silently drop those paragraphs on
+    # an unedited save (interior blanks already round-trip). xlsx/pptx keep the
+    # strip — their previews are read-only and edge whitespace is just noise.
+    text = (content or "").strip() if strip_edges else (content or "")
     if len(text) > MAX_OFFICE_PREVIEW_CHARS:
         text = text[:MAX_OFFICE_PREVIEW_CHARS].rstrip()
         truncated = True
@@ -235,8 +240,8 @@ class _PreviewBuilder:
             self._started = True
         return self._append_piece(text)
 
-    def finish(self) -> tuple[str, bool]:
-        return _finalize_preview_text(self.text, self.truncated)
+    def finish(self, strip_edges: bool = True) -> tuple[str, bool]:
+        return _finalize_preview_text(self.text, self.truncated, strip_edges=strip_edges)
 
 
 def _append_normalized_preview_text(builder: _PreviewBuilder, value) -> bool:
@@ -358,7 +363,9 @@ def _docx_preview_text(document) -> tuple[str, bool]:
                 break
         if builder.truncated:
             break
-    return builder.finish()
+    # strip_edges=False: preserve leading/trailing blank paragraphs so an
+    # unedited open->save round-trips them (the editor prefills from this text).
+    return builder.finish(strip_edges=False)
 
 
 def _docx_paragraph_properties_are_safe(properties) -> bool:
