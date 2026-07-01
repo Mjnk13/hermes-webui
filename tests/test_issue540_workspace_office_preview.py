@@ -9,6 +9,12 @@ from types import SimpleNamespace
 from urllib.parse import urlparse
 
 import pytest
+
+# Optional Office parsers — importorskip so a lean install (parsers absent)
+# skips this file cleanly rather than aborting collection suite-wide.
+pytest.importorskip("docx")
+pytest.importorskip("openpyxl")
+
 from docx import Document as DocxDocument
 from openpyxl import Workbook
 

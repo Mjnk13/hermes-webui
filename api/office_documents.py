@@ -3,6 +3,7 @@ from __future__ import annotations
 import io
 import posixpath
 import zipfile
+import zlib
 from pathlib import Path
 
 CLAIMED_OFFICE_EXTENSIONS = frozenset({".docx", ".xlsx", ".pptx"})
@@ -121,14 +122,24 @@ def _preflight_office_archive(office_format: str, raw: bytes) -> None:
             except Exception as exc:  # pragma: no cover - malformed archive path
                 raise _office_preview_read_error(office_format) from exc
             with member:
-                while True:
-                    chunk = member.read(64 * 1024)
-                    if not chunk:
-                        break
-                    member_size += len(chunk)
-                    total_uncompressed += len(chunk)
-                    if member_size > member_limit or total_uncompressed > MAX_OFFICE_ARCHIVE_TOTAL_UNCOMPRESSED_BYTES:
-                        raise _office_archive_limit_error()
+                try:
+                    while True:
+                        chunk = member.read(64 * 1024)
+                        if not chunk:
+                            break
+                        member_size += len(chunk)
+                        total_uncompressed += len(chunk)
+                        if member_size > member_limit or total_uncompressed > MAX_OFFICE_ARCHIVE_TOTAL_UNCOMPRESSED_BYTES:
+                            raise _office_archive_limit_error()
+                except (zipfile.BadZipFile, zlib.error, EOFError, OSError) as exc:
+                    # Corrupt/truncated member data (bad CRC, short read, etc.) —
+                    # mundane for partially-uploaded files, not adversarial. Raise
+                    # the module's intended read-error ValueError (handled as a
+                    # clean 4xx) instead of letting BadZipFile/zlib.error escape to
+                    # the route's catch-all as an unhandled 500 + traceback. The
+                    # limit-exceeded ValueError above is deliberately NOT caught
+                    # here (it is not one of these decompression exception types).
+                    raise _office_preview_read_error(office_format) from exc
             if member_size > max(info.compress_size, 1) * MAX_OFFICE_ARCHIVE_MAX_COMPRESSION_RATIO:
                 raise _office_archive_limit_error()
 
@@ -245,6 +256,36 @@ def _append_normalized_preview_text(builder: _PreviewBuilder, value) -> bool:
     return True
 
 
+def _append_verbatim_preview_text(builder: _PreviewBuilder, value) -> bool:
+    """Append run text WITHOUT per-node strip/space-normalization (docx runs).
+
+    A docx paragraph is split across multiple ``<w:t>`` runs and the whitespace
+    at run boundaries is significant: ``p.add_run("Hello ") + p.add_run("world")``
+    stores two runs whose text is ``"Hello "`` and ``"world"``. The general
+    ``_normalise_preview_text`` path ``.strip()``s each node and concatenates
+    with no separator, which corrupts that to ``"Helloworld"`` — and because the
+    editor textarea is prefilled from the preview text, opening + saving such a
+    file (even with no edits) persisted the corruption to disk. That
+    normalization is still correct for xlsx cells / pptx shapes (whole-cell
+    values, not run fragments), so only the docx run path switches to verbatim
+    append. Text is budget-clipped but never stripped/space-collapsed.
+    """
+    if builder.truncated:
+        return False
+    remaining = builder.remaining_chars
+    if remaining <= 0:
+        builder.truncated = True
+        return False
+    raw_text = "" if value is None else str(value)
+    clipped = len(raw_text) > remaining
+    if not builder.append_text(raw_text):
+        return False
+    if clipped:
+        builder.truncated = True
+        return False
+    return True
+
+
 def _iter_docx_text_nodes(element):
     for node in element.iter():
         if node.tag == f"{_WORD_NAMESPACE}t" and node.text:
@@ -253,7 +294,10 @@ def _iter_docx_text_nodes(element):
 
 def _append_docx_element_text(builder: _PreviewBuilder, element) -> bool:
     for text in _iter_docx_text_nodes(element):
-        if not _append_normalized_preview_text(builder, text):
+        # Verbatim (not _normalise_preview_text): preserve run-boundary
+        # whitespace so multi-run paragraphs round-trip losslessly. See
+        # _append_verbatim_preview_text for why docx differs from xlsx/pptx.
+        if not _append_verbatim_preview_text(builder, text):
             return False
     return True
 
@@ -406,10 +450,26 @@ def _preview_xlsx(raw: bytes) -> tuple[str, bool]:
                 break
             rows_seen = 0
             cells_seen = 0
-            max_row = min(getattr(sheet, "max_row", MAX_XLSX_PREVIEW_ROWS_PER_SHEET), MAX_XLSX_PREVIEW_ROWS_PER_SHEET)
-            max_col = min(getattr(sheet, "max_column", MAX_XLSX_PREVIEW_CELLS_PER_SHEET), MAX_XLSX_PREVIEW_CELLS_PER_SHEET)
+            # openpyxl read-only mode reports max_row/max_column as None for any
+            # workbook lacking a <dimension> record — which includes everything
+            # openpyxl.Workbook(write_only=True) produces. `getattr(..., DEFAULT)`
+            # does NOT help (the attribute exists; its value is None).
+            #
+            # When the dimension IS known, bound iter_rows to the capped extent.
+            # When it's UNKNOWN, pass None so openpyxl yields each row's NATURAL
+            # width — passing the cap instead would make openpyxl pad every row
+            # out to `max_col` with None cells, exhausting the per-sheet cell
+            # budget on row 1 and dropping the rest of the sheet. The rows_seen /
+            # cells_seen counters below bound the work in the unknown case.
+            sheet_max_row = getattr(sheet, "max_row", None)
+            sheet_max_col = getattr(sheet, "max_column", None)
+            max_row = min(sheet_max_row, MAX_XLSX_PREVIEW_ROWS_PER_SHEET) if sheet_max_row else None
+            max_col = min(sheet_max_col, MAX_XLSX_PREVIEW_CELLS_PER_SHEET) if sheet_max_col else None
             for row in sheet.iter_rows(values_only=True, max_row=max_row, max_col=max_col):
                 rows_seen += 1
+                if rows_seen > MAX_XLSX_PREVIEW_ROWS_PER_SHEET:
+                    builder.truncated = True
+                    break
                 row_budget = builder.remaining_chars - (1 if builder.started else 0)
                 row_builder = _PreviewBuilder(row_budget)
                 for value in row:
@@ -433,10 +493,10 @@ def _preview_xlsx(raw: bytes) -> tuple[str, bool]:
                         break
             if builder.truncated:
                 break
-            if getattr(sheet, "max_row", rows_seen) > MAX_XLSX_PREVIEW_ROWS_PER_SHEET:
+            if (getattr(sheet, "max_row", None) or rows_seen) > MAX_XLSX_PREVIEW_ROWS_PER_SHEET:
                 builder.truncated = True
                 break
-            if getattr(sheet, "max_column", 0) > MAX_XLSX_PREVIEW_CELLS_PER_SHEET:
+            if (getattr(sheet, "max_column", None) or 0) > MAX_XLSX_PREVIEW_CELLS_PER_SHEET:
                 builder.truncated = True
                 break
     finally:

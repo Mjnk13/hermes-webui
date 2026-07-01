@@ -8,6 +8,16 @@ import zipfile
 from pathlib import Path
 
 import pytest
+
+# The Office parsers are optional deps (commented-optional in requirements.txt;
+# installed by CI and requirements-dev.txt). On a lean install they are absent,
+# so importorskip these modules to skip this file cleanly instead of aborting
+# collection for the WHOLE suite with a module-level ImportError (repo idiom —
+# see the ~12 other test files that importorskip an optional dependency).
+pytest.importorskip("docx")
+pytest.importorskip("openpyxl")
+pytest.importorskip("pptx")
+
 from docx import Document as DocxDocument
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
@@ -501,3 +511,122 @@ def test_workspace_office_state_block_routes_all_office_formats_through_office_s
     assert xlsx_state["_previewOfficeFormat"] == "xlsx"
     assert docx_state["_previewSaveRoute"] == "/api/file/office-save"
     assert docx_state["_previewServerEditable"] is True
+
+
+# ---------------------------------------------------------------------------
+# Regression coverage for the four blockers found in the v0.51.802 gate review
+# (all reproduced against legitimate-but-common inputs the earlier adversarial
+# rounds never exercised).
+# ---------------------------------------------------------------------------
+
+
+def _write_only_xlsx_bytes() -> bytes:
+    """A workbook produced by openpyxl's streaming writer.
+
+    ``Workbook(write_only=True)`` omits the ``<dimension>`` record, so when the
+    preview re-opens it in read_only mode ``sheet.max_row``/``max_column`` are
+    ``None``. This is exactly issue #540's own use case (agents streaming large
+    sheets) and previously crashed the preview with a ``TypeError`` 500.
+    """
+    workbook = Workbook(write_only=True)
+    sheet = workbook.create_sheet("Streamed")
+    sheet.append(["alpha", "beta", "gamma"])
+    sheet.append(["one", "two", "three"])
+    buffer = io.BytesIO()
+    workbook.save(buffer)
+    return buffer.getvalue()
+
+
+def _multi_run_docx_bytes() -> bytes:
+    """A docx whose paragraph spans multiple runs with a run-boundary space.
+
+    ``add_run("Hello ") + add_run("world")`` is ubiquitous in real Word files
+    (and trivially produced by agent code). Each run is a separate ``<w:t>``
+    node; the preview previously ``.strip()``-ed each node and concatenated with
+    no separator, corrupting the text to "Helloworld".
+    """
+    document = DocxDocument()
+    paragraph = document.add_paragraph()
+    paragraph.add_run("Hello ")
+    paragraph.add_run("world")
+    document.add_paragraph("Second paragraph.")
+    buffer = io.BytesIO()
+    document.save(buffer)
+    return buffer.getvalue()
+
+
+def test_write_only_xlsx_without_dimension_previews_without_crash():
+    """BLOCKING 1: dimension-less xlsx (max_row/max_column None) must not 500."""
+    raw = _write_only_xlsx_bytes()
+    # Must not raise TypeError — the pre-fix code did `min(None, CAP)`.
+    preview = preview_office_document("streamed.xlsx", raw)
+    assert preview["preview_kind"] == "office"
+    assert preview["office_format"] == "xlsx"
+    # The streamed cell values must actually appear in the preview.
+    assert "alpha" in preview["content"]
+    assert "three" in preview["content"]
+
+
+def test_multi_run_docx_preserves_run_boundary_whitespace():
+    """BLOCKING 2 (preview): run-boundary space must survive extraction."""
+    raw = _multi_run_docx_bytes()
+    preview = preview_office_document("multi-run.docx", raw)
+    assert "Hello world" in preview["content"]
+    assert "Helloworld" not in preview["content"]
+
+
+def test_multi_run_docx_round_trips_text_identically_on_save():
+    """BLOCKING 2 (save): opening the editor and saving unchanged preview text
+    must NOT corrupt the on-disk document. This is the data-loss path: the
+    editor textarea is prefilled from the preview text, so a no-op save writes
+    the preview text back verbatim."""
+    raw = _multi_run_docx_bytes()
+    preview = preview_office_document("multi-run.docx", raw)
+    assert preview["editable"] is True
+
+    # Simulate a save with the UNMODIFIED preview text (the no-op-save path).
+    _saved_preview, saved_bytes = save_office_document(
+        "multi-run.docx", raw, preview["content"]
+    )
+
+    # Read the saved bytes back and confirm the paragraph text is intact.
+    reloaded = DocxDocument(io.BytesIO(saved_bytes))
+    paragraph_texts = [p.text for p in reloaded.paragraphs]
+    assert "Hello world" in paragraph_texts
+    assert "Helloworld" not in paragraph_texts
+
+
+def test_corrupt_archive_member_raises_value_error_not_unhandled():
+    """BLOCKING 3: a valid zip central directory with corrupt member DATA (bad
+    CRC / truncated) must raise the module's ValueError (handled as a clean
+    error) instead of an unhandled BadZipFile/zlib.error that escapes as a 500."""
+    raw = bytearray(_simple_docx_bytes("hello"))
+    # Corrupt the deflate stream bytes without touching the central directory,
+    # so the archive opens but a member.read() fails a CRC/zlib check. Flip a
+    # run of bytes in the middle of the compressed payload region.
+    start = len(raw) // 3
+    for i in range(start, start + 64):
+        raw[i] ^= 0xFF
+    with pytest.raises(ValueError):
+        preview_office_document("corrupt.docx", bytes(raw))
+
+
+def test_archive_limit_error_still_raised_over_corrupt_catch():
+    """BLOCKING 3 guard: the limit-exceeded ValueError raised INSIDE the member
+    read loop must not be swallowed by the new corrupt-member except clause
+    (it catches only decompression exceptions, never ValueError)."""
+    # A docx whose main document part inflates beyond the per-member cap.
+    document = DocxDocument()
+    document.add_paragraph("x" * 5_000)
+    buffer = io.BytesIO()
+    document.save(buffer)
+    raw = buffer.getvalue()
+    # Temporarily force a tiny member cap so the real (well-formed) archive
+    # trips the limit path — proving the limit ValueError propagates.
+    original = office_documents.MAX_OFFICE_ARCHIVE_MEMBER_BYTES
+    office_documents.MAX_OFFICE_ARCHIVE_MEMBER_BYTES = 10
+    try:
+        with pytest.raises(ValueError):
+            preview_office_document("big.docx", raw)
+    finally:
+        office_documents.MAX_OFFICE_ARCHIVE_MEMBER_BYTES = original
