@@ -65,13 +65,6 @@ def _extract_balanced_block(src, marker):
     return src[start:end]
 
 
-def _reset_speech_settings(extra=None):
-    payload = dict(SPEECH_DEFAULTS)
-    if extra:
-        payload.update(extra)
-    post("/api/settings", payload)
-
-
 def _settings_file_snapshot():
     cfg = importlib.import_module("api.config")
     path = cfg.SETTINGS_FILE
@@ -98,6 +91,7 @@ def test_settings_api_exposes_tts_voice_and_raw_audio_defaults():
 
 
 def test_settings_api_round_trips_speech_preferences():
+    path, original = _settings_file_snapshot()
     payload = {
         "tts_enabled": True,
         "tts_auto_read": True,
@@ -132,7 +126,7 @@ def test_settings_api_round_trips_speech_preferences():
             assert reloaded[key] == expected
         assert reloaded[PERSISTED_SPEECH_KEYS_FIELD] == sorted(payload)
     finally:
-        _reset_speech_settings()
+        _restore_settings_file(path, original)
 
 
 def test_settings_api_reports_only_raw_persisted_speech_keys():
@@ -222,6 +216,7 @@ def test_startup_workspace_repair_write_drops_merged_speech_defaults():
 
 
 def test_invalid_speech_settings_preserve_previous_values_and_unrelated_settings():
+    path, original = _settings_file_snapshot()
     data, status = get("/api/settings")
     original_show_tps = bool(data.get("show_tps"))
     valid = {
@@ -253,7 +248,7 @@ def test_invalid_speech_settings_preserve_previous_values_and_unrelated_settings
             assert invalid[key] == value
         assert invalid["show_tps"] is (not original_show_tps)
     finally:
-        _reset_speech_settings({"show_tps": original_show_tps})
+        _restore_settings_file(path, original)
 
 
 def test_backend_schema_contains_typed_speech_validation():
