@@ -641,9 +641,9 @@ def test_transparent_tool_completion_preserves_expand_state():
 
 
 def test_transparent_entrance_animation_is_live_turn_only():
-    """The entrance animation must be scoped to the live turn so it doesn't
-    replay across the whole transcript on every renderMessages. (Trifecta V9.)"""
-    assert "#liveAssistantTurn .transparent-event-row{animation:transparent-event-enter" in STYLE_CSS
+    """The live turn must suppress entrance animation replay during streaming rebuilds."""
+    assert "#liveAssistantTurn .transparent-event-row{animation:none!important" in STYLE_CSS
+    assert "transparent-event-enter" not in STYLE_CSS
 
 
 def test_live_worklog_reason_mirror_is_gated_to_compact_mode():
