@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import io
 import json
+import socket
 import threading
 from pathlib import Path
 from types import SimpleNamespace
+
+import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -56,6 +59,26 @@ def _subscription(endpoint: str) -> dict:
     }
 
 
+def _validated_fake_requests_session_factory(web_push):
+    def _factory(endpoint: str):
+        web_push._reject_unsafe_push_endpoint(endpoint)
+        return SimpleNamespace(trust_env=False)
+
+    return _factory
+
+
+@pytest.fixture(autouse=True)
+def _push_example_resolves_public(monkeypatch):
+    real_getaddrinfo = socket.getaddrinfo
+
+    def _getaddrinfo(host, port=None, *args, **kwargs):
+        if str(host).lower() == "push.example":
+            return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", port or 443))]
+        return real_getaddrinfo(host, port, *args, **kwargs)
+
+    monkeypatch.setattr(socket, "getaddrinfo", _getaddrinfo)
+
+
 def test_subscription_store_round_trip_and_stale_prune(monkeypatch, tmp_path):
     import api.config as config
     import api.web_push as web_push
@@ -71,13 +94,14 @@ def test_subscription_store_round_trip_and_stale_prune(monkeypatch, tmp_path):
 
     calls = []
 
-    def _fake_webpush(*, subscription_info, data, vapid_private_key, vapid_claims, timeout):
+    def _fake_webpush(*, subscription_info, data, vapid_private_key, vapid_claims, requests_session, timeout):
         calls.append(
             {
                 "endpoint": subscription_info["endpoint"],
                 "data": json.loads(data),
                 "vapid_private_key": vapid_private_key,
                 "vapid_claims": dict(vapid_claims),
+                "requests_session": requests_session,
                 "timeout": timeout,
             }
         )
@@ -87,6 +111,7 @@ def test_subscription_store_round_trip_and_stale_prune(monkeypatch, tmp_path):
             raise exc
 
     monkeypatch.setattr(web_push, "_get_pywebpush_impl", lambda: (_fake_webpush, _WebPushException))
+    monkeypatch.setattr(web_push, "_web_push_requests_session", _validated_fake_requests_session_factory(web_push))
 
     web_push.upsert_subscription(_subscription("https://push.example/live"), owner_key="owner-a")
     web_push.upsert_subscription(_subscription("https://push.example/dead"), owner_key="owner-a")
@@ -105,6 +130,7 @@ def test_subscription_store_round_trip_and_stale_prune(monkeypatch, tmp_path):
     assert calls[0]["data"]["options"]["data"]["url"] == "session/session-123"
     assert calls[0]["vapid_private_key"] == "private-key"
     assert calls[0]["vapid_claims"]["sub"] == "mailto:test@example.com"
+    assert calls[0]["requests_session"].trust_env is False
     assert calls[0]["timeout"] == web_push._WEB_PUSH_TIMEOUT_SECONDS
     assert [sub["endpoint"] for sub in web_push.list_subscriptions(owner_key="owner-a")] == ["https://push.example/live"]
     assert [sub["endpoint"] for sub in web_push.list_subscriptions(owner_key="owner-b")] == ["https://push.example/other"]
@@ -355,10 +381,11 @@ def test_send_web_push_skips_other_browser_owners(monkeypatch, tmp_path):
 
     seen = []
 
-    def _fake_webpush(*, subscription_info, data, vapid_private_key, vapid_claims, timeout):
+    def _fake_webpush(*, subscription_info, data, vapid_private_key, vapid_claims, requests_session, timeout):
         seen.append(subscription_info["endpoint"])
 
     monkeypatch.setattr(web_push, "_get_pywebpush_impl", lambda: (_fake_webpush, RuntimeError))
+    monkeypatch.setattr(web_push, "_web_push_requests_session", _validated_fake_requests_session_factory(web_push))
 
     web_push.upsert_subscription(_subscription("https://push.example/a"), owner_key="owner-a")
     web_push.upsert_subscription(_subscription("https://push.example/b"), owner_key="owner-b")
@@ -384,10 +411,11 @@ def test_send_web_push_prunes_invalid_stored_subscriptions(monkeypatch, tmp_path
 
     seen = []
 
-    def _fake_webpush(*, subscription_info, data, vapid_private_key, vapid_claims, timeout):
+    def _fake_webpush(*, subscription_info, data, vapid_private_key, vapid_claims, requests_session, timeout):
         seen.append(subscription_info["endpoint"])
 
     monkeypatch.setattr(web_push, "_get_pywebpush_impl", lambda: (_fake_webpush, RuntimeError))
+    monkeypatch.setattr(web_push, "_web_push_requests_session", _validated_fake_requests_session_factory(web_push))
 
     web_push._save_store({
         "subscriptions": [
@@ -412,6 +440,153 @@ def test_send_web_push_prunes_invalid_stored_subscriptions(monkeypatch, tmp_path
     assert [sub["endpoint"] for sub in web_push.list_subscriptions(owner_key="owner-a")] == [
         "https://push.example/live"
     ]
+
+
+def test_send_web_push_keeps_subscription_on_transient_dns_failure(monkeypatch, tmp_path):
+    import api.config as config
+    import api.web_push as web_push
+
+    store_path = tmp_path / "webui_push_subscriptions.json"
+    seen = []
+
+    monkeypatch.setattr(web_push, "_subscription_store_path", lambda: store_path)
+    monkeypatch.setattr(config, "web_push_configured", lambda: True)
+    monkeypatch.setattr(config, "web_push_private_key", lambda: "private-key")
+    monkeypatch.setattr(config, "web_push_subject", lambda: "mailto:test@example.com")
+
+    def _getaddrinfo(host, port=None, *args, **kwargs):
+        if str(host).lower() == "offline.example":
+            raise socket.gaierror("temporary failure")
+        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", port or 443))]
+
+    def _fake_webpush(*, subscription_info, data, vapid_private_key, vapid_claims, requests_session, timeout):
+        seen.append(subscription_info["endpoint"])
+
+    monkeypatch.setattr(socket, "getaddrinfo", _getaddrinfo)
+    monkeypatch.setattr(web_push, "_get_pywebpush_impl", lambda: (_fake_webpush, RuntimeError))
+    web_push._save_store({
+        "subscriptions": [
+            {
+                **_subscription("https://offline.example/push"),
+                "owner": "owner-a",
+            }
+        ]
+    })
+
+    sent = web_push.send_web_push(
+        web_push._notification_payload("Response complete", "Task finished", session_id="session-123"),
+        owner_key="owner-a",
+    )
+
+    assert sent == 0
+    assert seen == []
+    assert [sub["endpoint"] for sub in web_push.list_subscriptions(owner_key="owner-a")] == [
+        "https://offline.example/push"
+    ]
+
+
+def test_web_push_transport_unavailable_after_endpoint_validation(monkeypatch):
+    import builtins
+    import api.web_push as web_push
+
+    real_import = builtins.__import__
+
+    def _import(name, globals=None, locals=None, fromlist=(), level=0):
+        if name == "requests" or name.startswith("requests."):
+            raise ImportError("requests intentionally unavailable")
+        return real_import(name, globals, locals, fromlist, level)
+
+    monkeypatch.setattr(builtins, "__import__", _import)
+
+    with pytest.raises(ValueError, match="private IP"):
+        web_push._web_push_requests_session("https://127.0.0.1/push")
+    with pytest.raises(web_push._PushTransportUnavailable):
+        web_push._web_push_requests_session("https://push.example/path")
+
+
+def test_send_web_push_pins_transport_against_dns_rebind(monkeypatch, tmp_path):
+    pytest.importorskip("requests")
+    import api.config as config
+    import api.web_push as web_push
+
+    store_path = tmp_path / "webui_push_subscriptions.json"
+    dns_answers = iter(["93.184.216.34", "93.184.216.34"])
+    resolved_hosts = []
+    dialed_hosts = []
+    webpush_calls = []
+
+    monkeypatch.setattr(web_push, "_subscription_store_path", lambda: store_path)
+    monkeypatch.setattr(config, "web_push_configured", lambda: True)
+    monkeypatch.setattr(config, "web_push_private_key", lambda: "private-key")
+    monkeypatch.setattr(config, "web_push_subject", lambda: "mailto:test@example.com")
+
+    def _getaddrinfo(host, port=None, *args, **kwargs):
+        if str(host).lower() == "rebind.example":
+            resolved_hosts.append(str(host))
+            return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (next(dns_answers), port or 443))]
+        raise AssertionError(f"unexpected DNS lookup for {host}")
+
+    def _create_connection(pinned_host, port, timeout, source_address, socket_options):
+        dialed_hosts.append(pinned_host)
+        raise OSError("stop before network")
+
+    def _fake_webpush(*, subscription_info, data, vapid_private_key, vapid_claims, requests_session, timeout):
+        webpush_calls.append(subscription_info["endpoint"])
+        requests_session.post(subscription_info["endpoint"], data=b"{}", timeout=0.1)
+
+    monkeypatch.setattr(socket, "getaddrinfo", _getaddrinfo)
+    monkeypatch.setattr(web_push, "_create_pinned_push_connection", _create_connection)
+    monkeypatch.setattr(web_push, "_get_pywebpush_impl", lambda: (_fake_webpush, RuntimeError))
+
+    web_push.upsert_subscription(_subscription("https://rebind.example/push"), owner_key="owner-a")
+
+    sent = web_push.send_web_push(
+        web_push._notification_payload("Response complete", "Task finished", session_id="session-123"),
+        owner_key="owner-a",
+    )
+
+    assert sent == 0
+    assert webpush_calls == ["https://rebind.example/push"]
+    assert resolved_hosts == ["rebind.example", "rebind.example"]
+    assert dialed_hosts == ["93.184.216.34"]
+    assert [sub["endpoint"] for sub in web_push.list_subscriptions(owner_key="owner-a")] == [
+        "https://rebind.example/push"
+    ]
+
+
+def test_web_push_transport_refuses_redirects(monkeypatch):
+    requests = pytest.importorskip("requests")
+    import api.web_push as web_push
+
+    session = web_push._web_push_requests_session("https://push.example/path")
+    adapter = session.get_adapter("https://push.example/path")
+
+    def _redirect_response(self, request, **kwargs):
+        response = requests.Response()
+        response.status_code = 307
+        response.headers["Location"] = "https://127.0.0.1/push"
+        response.url = request.url
+        response.request = request
+        return response
+
+    monkeypatch.setattr(type(adapter), "send", _redirect_response)
+
+    with pytest.raises(ValueError, match="does not allow redirects"):
+        session.post("https://push.example/path", data=b"{}", timeout=0.1)
+
+
+def test_web_push_transport_ignores_environment_proxies(monkeypatch):
+    pytest.importorskip("requests")
+    import api.web_push as web_push
+
+    monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:9")
+    monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:9")
+
+    session = web_push._web_push_requests_session("https://push.example/path")
+    settings = session.merge_environment_settings("https://push.example/path", {}, None, None, None)
+
+    assert session.trust_env is False
+    assert settings["proxies"] == {}
 
 
 def test_bg_task_complete_producer_fans_out_web_push(monkeypatch):

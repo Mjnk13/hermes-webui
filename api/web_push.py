@@ -24,6 +24,14 @@ _WEB_PUSH_TIMEOUT_SECONDS = 10
 _LOCAL_PUSH_HOST_ALIASES = {"localhost", "ip6-localhost", "ip6-loopback"}
 
 
+class _PushEndpointResolutionError(ValueError):
+    pass
+
+
+class _PushTransportUnavailable(ValueError):
+    pass
+
+
 def _subscription_store_path() -> Path:
     from api.profiles import _DEFAULT_HERMES_HOME
 
@@ -85,7 +93,43 @@ def _normalize_push_owner(owner_key: str | None) -> str:
     return owner
 
 
-def _reject_unsafe_push_endpoint(endpoint: str) -> str:
+def _push_addr_is_blocked(addr: str) -> bool:
+    try:
+        addr_obj = ipaddress.ip_address(addr)
+    except ValueError:
+        return True
+    return (
+        addr_obj.is_private
+        or addr_obj.is_loopback
+        or addr_obj.is_link_local
+        or addr_obj.is_multicast
+        or addr_obj.is_reserved
+        or addr_obj.is_unspecified
+    )
+
+
+def _resolve_safe_push_addresses(hostname: str, port: int | None = None) -> list[str]:
+    host = str(hostname or "").strip().lower()
+    if not host:
+        raise ValueError("subscription endpoint host is required")
+    try:
+        resolved_ips = socket.getaddrinfo(host, port or 443, type=socket.SOCK_STREAM)
+    except socket.gaierror as exc:
+        raise _PushEndpointResolutionError("subscription endpoint host could not be resolved") from exc
+    pinned_hosts = []
+    for _, _, _, _, addr in resolved_ips:
+        if not addr:
+            continue
+        pinned_host = str(addr[0])
+        if _push_addr_is_blocked(pinned_host):
+            raise ValueError(f"subscription endpoint resolved to a private IP: {pinned_host}")
+        pinned_hosts.append(pinned_host)
+    if not pinned_hosts:
+        raise _PushEndpointResolutionError("subscription endpoint host could not be resolved")
+    return pinned_hosts
+
+
+def _parse_push_endpoint(endpoint: str):
     endpoint = str(endpoint or "").strip()
     if not endpoint:
         raise ValueError("subscription endpoint is required")
@@ -99,25 +143,98 @@ def _reject_unsafe_push_endpoint(endpoint: str) -> str:
         raise ValueError("subscription endpoint host is required")
     if host in _LOCAL_PUSH_HOST_ALIASES or host.endswith(".localhost"):
         raise ValueError("subscription endpoint must not target localhost")
-    try:
-        resolved_ips = socket.getaddrinfo(host, parsed.port or 443)
-    except socket.gaierror:
-        return endpoint
-    for _, _, _, _, addr in resolved_ips:
-        try:
-            addr_obj = ipaddress.ip_address(addr[0])
-        except ValueError:
-            continue
-        if (
-            addr_obj.is_private
-            or addr_obj.is_loopback
-            or addr_obj.is_link_local
-            or addr_obj.is_multicast
-            or addr_obj.is_reserved
-            or addr_obj.is_unspecified
-        ):
-            raise ValueError(f"subscription endpoint resolved to a private IP: {addr[0]}")
+    return endpoint, parsed, host
+
+
+def _reject_unsafe_push_endpoint(endpoint: str) -> str:
+    endpoint, parsed, host = _parse_push_endpoint(endpoint)
+    _resolve_safe_push_addresses(host, parsed.port or 443)
     return endpoint
+
+
+def _create_pinned_push_connection(
+    pinned_host: str,
+    port: int,
+    timeout,
+    source_address,
+    socket_options,
+):
+    from urllib3.util import connection
+
+    return connection.create_connection(
+        (pinned_host, port),
+        timeout,
+        source_address=source_address,
+        socket_options=socket_options,
+    )
+
+
+def _web_push_requests_session(endpoint: str):
+    _, parsed, host = _parse_push_endpoint(endpoint)
+    pinned_hosts = _resolve_safe_push_addresses(host, parsed.port or 443)
+    try:
+        import requests
+        from requests.adapters import HTTPAdapter
+        from urllib3 import HTTPSConnectionPool
+        from urllib3.connection import HTTPSConnection
+    except ImportError as exc:
+        raise _PushTransportUnavailable("Web Push requests transport is unavailable") from exc
+
+    class _PinnedWebPushHTTPSConnection(HTTPSConnection):
+        def _new_conn(self):
+            last_error = None
+            for pinned_host in pinned_hosts:
+                try:
+                    return _create_pinned_push_connection(
+                        pinned_host,
+                        self.port,
+                        self.timeout,
+                        self.source_address,
+                        self.socket_options,
+                    )
+                except OSError as exc:
+                    last_error = exc
+            if last_error is not None:
+                raise last_error
+            raise OSError("could not connect to any pinned Web Push target")
+
+    class _PinnedWebPushHTTPSConnectionPool(HTTPSConnectionPool):
+        ConnectionCls = _PinnedWebPushHTTPSConnection
+
+    class _PinnedWebPushHTTPAdapter(HTTPAdapter):
+        def init_poolmanager(self, connections, maxsize, block=False, **pool_kwargs):
+            super().init_poolmanager(connections, maxsize, block=block, **pool_kwargs)
+            self.poolmanager.pool_classes_by_scheme = dict(self.poolmanager.pool_classes_by_scheme)
+            self.poolmanager.pool_classes_by_scheme["https"] = _PinnedWebPushHTTPSConnectionPool
+
+        def send(self, request, **kwargs):
+            if kwargs.get("proxies"):
+                raise ValueError("Web Push delivery does not allow proxies")
+            return super().send(request, **kwargs)
+
+        def proxy_manager_for(self, *args, **kwargs):
+            raise ValueError("Web Push delivery does not allow proxies")
+
+    class _BlockedSchemeAdapter(HTTPAdapter):
+        def send(self, request, **kwargs):
+            raise ValueError("Web Push delivery requires https")
+
+    class _NoRedirectPinnedSession(requests.Session):
+        def rebuild_proxies(self, prepared_request, proxies):
+            return {}
+
+        def request(self, method, url, **kwargs):
+            kwargs["allow_redirects"] = False
+            response = super().request(method, url, **kwargs)
+            if 300 <= int(getattr(response, "status_code", 0) or 0) < 400:
+                raise ValueError("Web Push delivery does not allow redirects")
+            return response
+
+    session = _NoRedirectPinnedSession()
+    session.trust_env = False
+    session.mount("https://", _PinnedWebPushHTTPAdapter())
+    session.mount("http://", _BlockedSchemeAdapter())
+    return session
 
 
 def _parse_cookie_value(handler, cookie_name: str) -> str | None:
@@ -331,7 +448,10 @@ def send_web_push(payload: dict, *, owner_key: str | None) -> int:
     for subscription in subscriptions:
         endpoint = str(subscription.get("endpoint") or "").strip()
         try:
-            _reject_unsafe_push_endpoint(endpoint)
+            requests_session = _web_push_requests_session(endpoint)
+        except (_PushEndpointResolutionError, _PushTransportUnavailable):
+            logger.debug("Skipping temporarily unresolved Web Push endpoint %s", endpoint, exc_info=True)
+            continue
         except ValueError:
             if endpoint:
                 stale_endpoints.append(endpoint)
@@ -343,6 +463,7 @@ def send_web_push(payload: dict, *, owner_key: str | None) -> int:
                 data=data,
                 vapid_private_key=web_push_private_key(),
                 vapid_claims=claims,
+                requests_session=requests_session,
                 timeout=_WEB_PUSH_TIMEOUT_SECONDS,
             )
             sent += 1
