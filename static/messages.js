@@ -6181,9 +6181,18 @@ function autoResize(){
     _composerAutoResizeRaf=0;
   }
   const el=$('msg');
+  const _prevComposerH=el.offsetHeight;
   el.style.height='auto';
   el.style.height=Math.min(el.scrollHeight,200)+'px';
   updateSendBtn();
+  // #5514/#5515: growing the composer shrinks the flex:1 transcript viewport, so
+  // a reader pinned to the bottom would be stranded above it ("scrolls up 1 row
+  // per composer row"). Re-pin the transcript when it's genuinely still pinned —
+  // but only when the composer actually GREW (a shrink enlarges the viewport and
+  // can't strand a reader), so the common no-height-change keystroke skips the
+  // re-pin's DOM read entirely. The #composerWrap ResizeObserver is the safety
+  // net for any growth path that doesn't route through here.
+  if(el.offsetHeight>_prevComposerH && typeof _repinMessagesAfterComposerResize==='function') _repinMessagesAfterComposerResize();
 }
 function scheduleComposerAutoResize(){
   if(typeof requestAnimationFrame!=='function'){autoResize();return;}
