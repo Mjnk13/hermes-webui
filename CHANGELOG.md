@@ -3,6 +3,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- **Faster session loads on long conversations.** Opening a session with thousands of messages was taking multiple seconds because `Session.compact()` re-walked the whole message list on every response (an O(N) user-message count plus a full reverse scan for the last-message timestamp), and the slow-request watchdog didn't cover the `/api/session` path. The user-count and last-message-timestamp lookups are now bounded (a tail-window scan with an exact full-scan fallback), and slow-request instrumentation covers the session-load path so future regressions are caught. Multi-second loads on large sessions drop to sub-second. Thanks @Kopamed. (#5696, #5455)
+
 ### Internal
 
 - **Fixed the chronic full-suite test-isolation flakes (8 tests).** A cluster of profile-resolution tests (`test_profile_skills_stats`, `test_scheduled_jobs_profile_isolation`, `test_sprint10` cron-output) passed in isolation but failed in the full suite: a test that simulates "the agent package isn't installed" emptied the real `hermes_cli` package's `__path__` in place, which `monkeypatch` can't undo, so every later `import hermes_cli.profiles` failed for the rest of the run. Added an autouse conftest guard that snapshots the real `hermes_cli` / `hermes_state` packages, their `__path__`, and the agent-path env vars + `sys.path` at session start and restores them after every test, so a "package unavailable" simulation can't poison later tests. Test-only; no product code changes.
