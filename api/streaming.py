@@ -9821,6 +9821,23 @@ def _run_agent_streaming(
             _lock_ctx = _agent_lock if _agent_lock is not None else contextlib.nullcontext()
             with _lock_ctx:
                 if not ephemeral and not _stream_writeback_is_current(s, stream_id):
+                    _pending_source = getattr(s, 'pending_user_source', None) or 'webui'
+                    if _pending_source == 'process_wakeup':
+                        _stale_pause = record_process_wakeup_provider_unavailable_pause(
+                            s,
+                            classification=_exc_type,
+                            model=getattr(s, 'model', None) or resolved_model or model,
+                            provider=getattr(s, 'model_provider', None) or resolved_provider,
+                        )
+                        if _stale_pause is not None:
+                            try:
+                                s.save(touch_updated_at=False)
+                            except Exception:
+                                logger.debug(
+                                    "Failed to persist stale process_wakeup pause for %s",
+                                    getattr(s, 'session_id', session_id),
+                                    exc_info=True,
+                                )
                     logger.info(
                         "Skipping stale stream error writeback for session %s stream %s; active_stream_id=%s",
                         getattr(s, 'session_id', session_id),

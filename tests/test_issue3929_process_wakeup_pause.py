@@ -111,6 +111,14 @@ class _CredentialPoolEmptyAgent(_MockAgent):
         raise RuntimeError("All 0 credential(s) exhausted for test-provider")
 
 
+class _StaleCredentialPoolEmptyAgent(_MockAgent):
+    def run_conversation(self, **_kwargs):
+        session = models.SESSIONS[self.session_id]
+        session.active_stream_id = "stream-newer-run"
+        session.save(touch_updated_at=False)
+        raise RuntimeError("All 0 credential(s) exhausted for test-provider")
+
+
 def _run_failing_process_wakeup(session: Session, tmp_path):
     stream_id = str(session.active_stream_id)
     fake_queue = queue.Queue()
@@ -185,6 +193,48 @@ def test_credential_empty_process_wakeup_pauses_repeated_automatic_turns(tmp_pat
     assert saved_after.context_messages == context_before
     assert saved_after.process_wakeup_pause["suppressed_count"] == 1
     assert "last_suppressed_at" in saved_after.process_wakeup_pause
+
+
+def test_stale_credential_empty_process_wakeup_still_records_pause(tmp_path):
+    session = Session(
+        session_id="wakeup_pause_stale",
+        title="Wakeup pause stale",
+        workspace=str(tmp_path),
+        model="test-model",
+        model_provider="test-provider",
+        messages=[{"role": "user", "content": "Earlier prompt", "timestamp": 1}],
+        context_messages=[{"role": "user", "content": "Earlier prompt"}],
+        active_stream_id="stream-wakeup-pause-stale",
+        pending_user_message="[IMPORTANT: Background process first completed.]",
+        pending_started_at=1234.0,
+        pending_user_source="process_wakeup",
+    )
+    session.save()
+    models.SESSIONS[session.session_id] = session
+    stream_id = str(session.active_stream_id)
+    fake_queue = queue.Queue()
+    streaming.STREAMS[stream_id] = fake_queue
+    config.STREAM_PARTIAL_TEXT[stream_id] = ""
+
+    with mock.patch.object(streaming, "_get_ai_agent", return_value=_StaleCredentialPoolEmptyAgent), \
+         mock.patch.object(streaming, "resolve_model_provider", return_value=("test-model", "test-provider", None)), \
+         mock.patch("api.config._resolve_cli_toolsets", return_value=[]):
+        streaming._run_agent_streaming(
+            session_id=session.session_id,
+            msg_text=session.pending_user_message,
+            model="test-model",
+            model_provider="test-provider",
+            workspace=str(tmp_path),
+            stream_id=stream_id,
+        )
+
+    saved = Session.load(session.session_id)
+    assert saved is not None
+    assert saved.active_stream_id == "stream-newer-run"
+    assert saved.process_wakeup_pause["paused"] is True
+    assert saved.process_wakeup_pause["classification"] == "credential_pool_empty"
+    assert saved.process_wakeup_pause["suppressed_count"] == 0
+    assert not any(message.get("_error") for message in saved.messages)
 
 
 def test_process_wakeup_pause_resets_when_model_provider_lane_changes(tmp_path, monkeypatch):
