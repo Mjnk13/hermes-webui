@@ -144,6 +144,14 @@ class RequestDiagnostics:
             # of the multi-second waterfalls in the slow-request logs.
             ("GET", "/api/profiles"),
             ("GET", "/api/models"),
+            # perf(webui/session-load-latency) tier2c: /api/session is the
+            # chat-open hot path. The handler also calls maybe_start() and
+            # finish() at its _t0/_t6 boundaries, so adding this entry to
+            # the allowlist is NOT a dead-code addition (the Greptile P1
+            # trap for previous similar entries): without the handler call
+            # the watchdog entry would never register and the structured
+            # log would never fire.
+            ("GET", "/api/session"),
         }:
             return None
         return cls(method, clean_path, logger=logger)

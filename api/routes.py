@@ -11700,6 +11700,11 @@ def handle_get(handler, parsed) -> bool:
         import time as _time
         _t0 = _time.monotonic()
         _debug_slow = os.environ.get("HERMES_DEBUG_SLOW", "")
+        # perf(webui/session-load-latency) tier2c: per-stage breakdown via
+        # RequestDiagnostics. maybe_start() returns None for paths not in
+        # the allowlist, in which case the existing _tN-driven [SLOW] log
+        # is the only signal — same as before.
+        _diag = RequestDiagnostics.maybe_start("GET", parsed.path, logger=logger)
         query = parse_qs(parsed.query)
         sid = query.get("session_id", [""])[0]
         if not sid:
@@ -11735,6 +11740,7 @@ def handle_get(handler, parsed) -> bool:
         expand_renderable = str(_expand_renderable).strip() in ("1", "true", "True")
         try:
             _t1 = _time.monotonic()
+            if _diag: _diag.stage("t1_after_get_session_check")
             s = get_session(sid, metadata_only=(not load_messages))
             _session_profile = getattr(s, 'profile', None) or None
             if not _session_visible_to_active_profile(_session_profile, handler):
@@ -11789,6 +11795,7 @@ def handle_get(handler, parsed) -> bool:
                 # honor #2827's TLS-vs-thread fix.
                 metadata_summary = _metadata_only_message_summary(sid, profile=_session_profile)
             _t2 = _time.monotonic()
+            if _diag: _diag.stage("t2_after_state_db_load")
             effective_model = (
                 _resolve_effective_session_model_for_display(s)
                 if resolve_model
@@ -11800,6 +11807,7 @@ def handle_get(handler, parsed) -> bool:
                 else None
             )
             _t3 = _time.monotonic()
+            if _diag: _diag.stage("t3_after_model_resolve")
             if load_messages:
                 if is_messaging_session and cli_messages:
                     # Recovery/aggregate sidecars can intentionally contain a
@@ -12042,6 +12050,7 @@ def handle_get(handler, parsed) -> bool:
             raw["_messages_truncated"] = _truncated
             raw["_messages_offset"] = _messages_offset
             _t4 = _time.monotonic()
+            if _diag: _diag.stage("t4_after_compact_and_merge")
             if effective_model:
                 raw["model"] = effective_model
             if effective_provider:
@@ -12057,8 +12066,10 @@ def handle_get(handler, parsed) -> bool:
                 raw["read_only"] = True
             redact = redact_session_data(raw)
             _t5 = _time.monotonic()
+            if _diag: _diag.stage("t5_after_redact")
             resp = j(handler, {"session": redact})
             _t6 = _time.monotonic()
+            if _diag: _diag.stage("t6_after_json_write")
             _total_ms = (_t6 - _t0) * 1000
             # Always log when slow (>2s) so we don't need HERMES_DEBUG_SLOW env var
             # to diagnose latency regressions. Opt-in env var still forces
@@ -12071,6 +12082,7 @@ def handle_get(handler, parsed) -> bool:
                     (_t2-_t1)*1000, (_t3-_t2)*1000, (_t4-_t3)*1000,
                     (_t5-_t4)*1000, (_t6-_t5)*1000, _total_ms,
                 )
+            if _diag: _diag.finish()
             return resp
         except KeyError:
             # No WebUI sidecar. Delegate to the shared foreign-session
