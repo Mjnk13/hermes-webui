@@ -6309,10 +6309,11 @@ def _read_profile_model_config(
 
 
 # perf(webui/session-load-latency) tier2a: process-wide cache for parsed
-# profile config.yaml. Key = (profile_name, mtime, size); value = parsed
-# dict. mtime+size auto-invalidates on edit; a 60s TTL is the backstop
-# in case of coarse mtime resolution (some network filesystems round
-# mtime to whole seconds — the size guard catches a write of equal-length
+# profile config.yaml. Key = (profile_name, inode, mtime, size); value = parsed
+# dict. inode tracks atomic-rename edits (most editors replace files, giving a
+# new inode on Linux). mtime+size auto-invalidates on in-place edits; a 60s TTL
+# is the backstop in case of coarse mtime resolution (some network filesystems
+# round mtime to whole seconds — the size guard catches a write of equal-length
 # bytes within the same second). Reads are guarded by a single Lock to
 # keep the hot path simple; the underlying yaml.safe_load is the slow
 # step, not the lock, so contention is bounded.
@@ -6329,7 +6330,8 @@ def _read_profile_config_cached(profile_name: str, cfg_path: str) -> dict | None
         return None
     mtime = float(getattr(st, "st_mtime", 0.0) or 0.0)
     size = int(getattr(st, "st_size", 0) or 0)
-    key = (str(profile_name or ""), mtime, size)
+    inode = int(getattr(st, "st_ino", 0) or 0)
+    key = (str(profile_name or ""), inode, mtime, size)
     now = time.monotonic()
     with _PROFILE_CONFIG_CACHE_LOCK:
         cached = _PROFILE_CONFIG_CACHE.get(key)
@@ -13807,10 +13809,11 @@ def handle_post(handler, parsed) -> bool:
                 f"{n}={((t - prev[1]) * 1000):.1f}ms"
                 for (n, t), prev in zip(_draft_stages[1:], _draft_stages[:-1])
             )
-            logger.warning(
-                "[SLOW] /api/session/draft total=%.1fms stages: %s",
-                (_draft_stages[-1][1] - _draft_t0) * 1000,
-                parts,
+            handler._safe_webui_print(
+                "[SLOW] /api/session/draft total=%.1fms stages: %s" % (
+                    (_draft_stages[-1][1] - _draft_t0) * 1000,
+                    parts,
+                )
             )
         return True
 

@@ -3152,6 +3152,15 @@ def _cached_session_lags_disk(cached) -> bool:
                     return latest
                 if _max_updated(disk_scenes) > _max_updated(cached_scenes):
                     return True
+        else:
+            # Cached session has no scene records. Check if disk has gained
+            # the first scene record — without this the fast-path would miss
+            # a newly persisted scene and return the stale cache. Greptile P1.
+            disk_meta_quick = _persisted_session_meta_prefix(sid)
+            if disk_meta_quick is not None:
+                disk_scenes = disk_meta_quick.get('anchor_activity_scenes') or {}
+                if isinstance(disk_scenes, dict) and disk_scenes:
+                    return True
         if getattr(cached, 'active_stream_id', None) or getattr(cached, 'pending_user_message', None):
             # Active session: messages may be in flight; fall through to the
             # full check to be safe.
