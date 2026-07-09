@@ -3127,6 +3127,10 @@ def _cached_session_lags_disk(cached) -> bool:
         cached_scenes = getattr(cached, 'anchor_activity_scenes', None) or {}
         if not isinstance(cached_scenes, dict):
             cached_scenes = {}
+        # Track whether the cheap scene check was inconclusive — when it is,
+        # we must fall through to the full metadata comparison instead of
+        # returning False for inactive sessions with matching counts.
+        _scene_check_inconclusive = False
         if cached_scenes:
             disk_meta_quick = _persisted_session_meta_prefix(sid)
             if disk_meta_quick is not None:
@@ -3160,6 +3164,13 @@ def _cached_session_lags_disk(cached) -> bool:
                     if _max_updated(disk_scenes) > _anchor_scene_records_updated_at(cached):
                         return True
                 # disk has no scenes, cache does -> cache is ahead; keep it.
+            else:
+                # Can't cheaply verify scene freshness from disk. The prefix
+                # reader may have failed while _persisted_message_count
+                # succeeded via index fallback. Fall through to the full
+                # metadata load so we don't serve stale scenes on the next
+                # equal-count inactive session path. Greptile P1.
+                _scene_check_inconclusive = True
         else:
             # Cached session has no scene records. Check if disk has gained
             # the first scene record — without this the fast-path would miss
@@ -3172,6 +3183,11 @@ def _cached_session_lags_disk(cached) -> bool:
         if getattr(cached, 'active_stream_id', None) or getattr(cached, 'pending_user_message', None):
             # Active session: messages may be in flight; fall through to the
             # full check to be safe.
+            pass
+        elif _scene_check_inconclusive:
+            # Could not cheaply verify scene freshness from disk; fall through
+            # to the full metadata comparison rather than returning False
+            # (which would serve a potentially stale cache). Greptile P1.
             pass
         else:
             # Inactive session, count matches, scene records match — cache is

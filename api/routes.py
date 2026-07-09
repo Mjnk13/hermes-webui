@@ -6314,32 +6314,34 @@ def _read_profile_model_config(
 # new inode on Linux). mtime+size auto-invalidates on in-place edits; a 60s TTL
 # is the backstop in case of coarse mtime resolution (some network filesystems
 # round mtime to whole seconds — the size guard catches a write of equal-length
-# bytes within the same second). On cache hit, a quick content-prefix comparison
-# (first 128 chars) catches in-place rewrites that inode+mtime+size miss on
-# coarse filesystems (Greptile P1, PR#5803 discussion_r3548069113).
-# Reads are guarded by a single Lock to keep the hot path simple;
-# the underlying yaml.safe_load is the slow step, not the lock, so contention
-# is bounded.
-_PROFILE_CONFIG_CACHE: "dict[tuple, tuple[float, str | None, dict]]" = {}
+# bytes within the same second). On cache hit, a full-content comparison catches
+# any in-place rewrite that inode+mtime+size missed (Greptile P1, PR#5803
+# discussion_r3548477915). Reading and comparing the full file content (~1-10KB)
+# is much cheaper than yaml.safe_load(). Reads are guarded by a single Lock to
+# keep the hot path simple; the underlying yaml.safe_load is the slow step, not
+# the lock, so contention is bounded.
+_PROFILE_CONFIG_CACHE: "dict[tuple, tuple[float, str, dict]]" = {}
 _PROFILE_CONFIG_CACHE_TTL_SECONDS = 60.0
 _PROFILE_CONFIG_CACHE_LOCK = threading.Lock()
 
 
 def _read_profile_config_cached(profile_name: str, cfg_path: str) -> dict | None:
     """Return parsed profile config, caching by (inode, mtime, size) with
-    TTL backstop and content-prefix verification.
+    TTL backstop and full-content verification.
 
-    The content-prefix comparison (first 128 chars of the file) catches
-    in-place rewrites where inode+mtime+size are identical on coarse
-    filesystems — most editors use atomic-rename (new inode), but tools
-    like sed -i or file.write() in-place can keep the same inode.
+    The full-content comparison reads the current file and compares it to a
+    copy stored in the cache entry. This catches any in-place rewrite where
+    inode+mtime+size are identical, regardless of where in the file the change
+    occurs — unlike a fixed-length prefix comparison, edits to fields after the
+    first N characters are always detected. Reading and comparing the full file
+    content (~1-10KB for a typical config.yaml) is much cheaper than
+    yaml.safe_load().
 
-    NOTE: This is a best-effort backstop, not a full integrity check.
-    Edits that change bytes only after the first 128 characters while
-    keeping inode+mtime+size identical are not detected until the TTL
-    expires. This trade-off is acceptable because the TTL is only 60s
-    and the common case (atomic-rename editors) is fully handled by
-    the inode key component.
+    NOTE: The cache key uses inode+mtime+size to handle the common cases
+    (atomic-rename editors -> new inode; in-place editors -> mtime/size
+    change). The full-content comparison is a backstop for the rare case where
+    all three collide (e.g., sed -i on a filesystem with coarse mtime
+    resolution, writing the same byte count).
     """
     try:
         st = os.stat(cfg_path)
@@ -6353,17 +6355,20 @@ def _read_profile_config_cached(profile_name: str, cfg_path: str) -> dict | None
     with _PROFILE_CONFIG_CACHE_LOCK:
         cached = _PROFILE_CONFIG_CACHE.get(key)
         if cached is not None:
-            cached_at, cached_prefix, cached_dict = cached
+            cached_at, cached_content, cached_dict = cached
             if (now - cached_at) <= _PROFILE_CONFIG_CACHE_TTL_SECONDS:
-                # Cheap content verification: read first 128 chars to catch
-                # in-place rewrites that inode+mtime+size don't detect.
-                _current_prefix = None
+                # Full content comparison catches any in-place rewrite where
+                # inode+mtime+size are identical but the file content changed.
+                # Reading and comparing the full file (~1-10KB) is cheaper than
+                # yaml.safe_load(). Unlike a fixed-length prefix, this detects
+                # edits anywhere in the file. Greptile P1 (PR#5803).
+                _current_content = None
                 try:
                     with open(cfg_path, "r", encoding="utf-8") as _f:
-                        _current_prefix = _f.read(128)
+                        _current_content = _f.read()
                 except Exception:
                     pass
-                if _current_prefix == cached_prefix:
+                if _current_content == cached_content:
                     return cached_dict
                 # Content changed while key collided — fall through to re-parse
     import yaml
@@ -6375,9 +6380,8 @@ def _read_profile_config_cached(profile_name: str, cfg_path: str) -> dict | None
         return None
     if not isinstance(parsed, dict):
         return None
-    content_prefix = content[:128]  # first 128 chars for change detection
     with _PROFILE_CONFIG_CACHE_LOCK:
-        _PROFILE_CONFIG_CACHE[key] = (now, content_prefix, parsed)
+        _PROFILE_CONFIG_CACHE[key] = (now, content, parsed)
         # Cap the cache at 32 entries; profiles are bounded in practice
         # and unbounded growth would be a leak.
         if len(_PROFILE_CONFIG_CACHE) > 32:
