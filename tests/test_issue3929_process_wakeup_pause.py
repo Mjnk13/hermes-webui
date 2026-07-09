@@ -1394,6 +1394,100 @@ def test_gateway_cancel_during_completion_save_restores_process_wakeup_pause(tmp
     assert "done" not in queued_events
 
 
+def test_gateway_late_cancel_preserves_completed_webui_turn(tmp_path, monkeypatch):
+    stream_id = "gateway-webui-late-cancel-stream"
+    session_id = "gateway_webui_late_cancel"
+    stream_queue = queue.Queue()
+    config.STREAMS[stream_id] = stream_queue
+    monkeypatch.setattr(gateway_chat, "RunJournalWriter", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(gateway_chat, "gateway_approval_unavailable_reason", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(config, "get_config", lambda: {"webui_gateway_base_url": "http://gateway.test"})
+
+    class _GatewayResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+        def __iter__(self):
+            payload = {"choices": [{"delta": {"content": "Gateway reply"}}]}
+            return iter([
+                ("data: " + json.dumps(payload) + "\n").encode("utf-8"),
+                b"data: [DONE]\n",
+            ])
+
+    monkeypatch.setattr(
+        gateway_chat.urllib.request,
+        "urlopen",
+        lambda *_args, **_kwargs: _GatewayResponse(),
+    )
+
+    previous_messages = [{"role": "user", "content": "before", "timestamp": 1.0}]
+    session = Session(
+        session_id=session_id,
+        workspace=str(tmp_path),
+        model="claude-sonnet-test",
+        model_provider="test-provider",
+        messages=list(previous_messages),
+        context_messages=list(previous_messages),
+        active_stream_id=stream_id,
+        pending_user_message="hello",
+        pending_user_source="webui",
+    )
+    session.save()
+    models.SESSIONS[session_id] = session
+
+    original_save = Session.save
+    save_calls = {"completed": 0}
+
+    def _save_and_cancel_after_completed_webui_turn(self, *args, **kwargs):
+        result = original_save(self, *args, **kwargs)
+        if (
+            getattr(self, "session_id", None) == session_id
+            and save_calls["completed"] == 0
+            and getattr(self, "active_stream_id", None) is None
+            and getattr(self, "pending_user_message", None) is None
+            and any(
+                msg.get("role") == "assistant" and msg.get("content") == "Gateway reply"
+                for msg in (getattr(self, "messages", None) or [])
+            )
+        ):
+            save_calls["completed"] += 1
+            config.CANCEL_FLAGS[stream_id].set()
+        return result
+
+    monkeypatch.setattr(Session, "save", _save_and_cancel_after_completed_webui_turn)
+
+    gateway_chat._run_gateway_chat_streaming(
+        session_id,
+        "hello",
+        "claude-sonnet-test",
+        str(tmp_path),
+        stream_id,
+        model_provider="test-provider",
+    )
+
+    assert save_calls["completed"] == 1
+    saved = Session.load(session_id)
+    assert saved is not None
+    assert saved.active_stream_id is None
+    assert saved.pending_user_message is None
+    assert [msg.get("content") for msg in saved.messages] == [
+        "before",
+        "hello",
+        "Gateway reply",
+    ]
+    assert [msg.get("content") for msg in saved.context_messages] == [
+        "before",
+        "hello",
+        "Gateway reply",
+    ]
+    queued_events = [item[0] for item in list(stream_queue.queue)]
+    assert "cancel" in queued_events
+    assert "done" not in queued_events
+
+
 def test_stale_credential_empty_process_wakeup_still_records_pause(tmp_path):
     session = Session(
         session_id="wakeup_pause_stale",
@@ -1525,8 +1619,12 @@ def test_gateway_success_path_checks_cancel_before_clearing_process_wakeup_pause
     current_idx = src.index("if not _stream_writeback_is_current(s, stream_id):")
     early_cancel_idx = src.index("if cancel_event.is_set():", current_idx)
     pending_clear_idx = src.index("s.pending_user_source = None")
-    pause_clear_idx = src.index('clear_process_wakeup_pause(s, reason="run_completed")')
-    final_cancel_idx = src.rindex("if cancel_event.is_set():", current_idx, pause_clear_idx)
+    pre_clear_comment_idx = src.index("# Recheck immediately before clearing", pending_clear_idx)
+    final_cancel_idx = src.index("if cancel_event.is_set():", pre_clear_comment_idx)
+    pause_clear_idx = src.index(
+        'clear_process_wakeup_pause(s, reason="run_completed")',
+        final_cancel_idx,
+    )
     save_idx = src.index("s.save()", pause_clear_idx)
 
     assert current_idx < early_cancel_idx < pending_clear_idx < final_cancel_idx < pause_clear_idx < save_idx
