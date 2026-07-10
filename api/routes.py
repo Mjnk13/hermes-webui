@@ -9259,6 +9259,7 @@ from api.run_journal import (
     find_run_summary,
     read_run_events,
     read_session_run_events,
+    session_journal_fingerprint,
     stale_interrupted_event,
 )
 from api.todo_state import attach_todo_state
@@ -16937,10 +16938,24 @@ def _handle_session_run_journal_stream_for_session(handler, parsed, session_id):
         if subscriber is None:
             if replay_ok:
                 emit_replay(replay_events, active_stream_id, None)
+            # Baseline the journal so we can detect a run that starts AND finishes
+            # inside a single keepalive tick while we wait for a live stream. Such a
+            # run updates the journal but never materializes an in-memory STREAMS
+            # entry to attach, so without this an idle subscriber (esp. a no-cursor
+            # client) would silently miss that run's transcript until manual refresh.
+            _idle_journal_fp = session_journal_fingerprint(session_id)
             while True:
                 subscriber, subscriber_stream, stream_snapshot, active_stream_id = attach_active_stream()
                 if subscriber is not None:
                     break
+                # Journal advanced with no live stream to attach → a run completed
+                # entirely within the wait. Re-sync via a snapshot boundary (the
+                # same honest-recovery contract used for a failed reconciliation),
+                # then re-baseline so we only re-sync on genuinely new advances.
+                _current_journal_fp = session_journal_fingerprint(session_id)
+                if _current_journal_fp != _idle_journal_fp:
+                    _idle_journal_fp = _current_journal_fp
+                    emit_session_snapshot(active_stream_id)
                 handler.wfile.write(b": keepalive\n\n")
                 handler.wfile.flush()
                 time.sleep(_SSE_HEARTBEAT_INTERVAL_SECONDS)

@@ -357,6 +357,78 @@ def test_session_route_emits_snapshot_without_id_for_missing_cursor_and_keepaliv
     assert stop["count"] == 1
 
 
+def test_session_route_resyncs_when_run_completes_inside_idle_wait(monkeypatch):
+    """Idle no-cursor subscriber: a run that starts+finishes inside one keepalive
+    tick advances the journal with no live stream to attach. The handler must emit
+    a session_snapshot re-sync so the client catches that run instead of silently
+    missing it until manual refresh (Fable gate finding on #5677)."""
+    import api.routes as routes
+
+    stop = _stop_after_first_heartbeat(monkeypatch)
+    monkeypatch.setattr(routes, "_session_id_visible_to_request_profile", lambda *_a, **_k: True)
+    monkeypatch.setattr(
+        routes,
+        "get_session",
+        lambda sid, metadata_only=False: SimpleNamespace(
+            session_id=sid,
+            compact=lambda **_kwargs: {"session_id": sid, "title": "Session"},
+        ),
+    )
+    # No live stream ever attaches (the run completed before we could subscribe).
+    monkeypatch.setattr(routes, "_active_run_stream_for_session", lambda *_a, **_k: None)
+    # No cursor → no replay; the missing-cursor path returns ok/empty.
+    monkeypatch.setattr(routes, "read_session_run_events", lambda *_a, **_k: {"status": "ok", "events": []})
+    # Fingerprint advances between the pre-loop baseline and the in-loop check,
+    # simulating a run completing during the wait.
+    fps = iter([(0, 0.0, 0), (1, 123.0, 42)])
+    monkeypatch.setattr(routes, "session_journal_fingerprint", lambda *_a, **_k: next(fps, (1, 123.0, 42)))
+
+    handler = _FakeHandler()
+    routes._handle_session_sse_stream_for_session(
+        handler,
+        urlparse("/api/sessions/session_1/events"),
+        "session_1",
+    )
+
+    body = handler.wfile.getvalue().decode("utf-8")
+    assert "event: session_snapshot\n" in body, "idle journal advance must emit a snapshot re-sync"
+    assert ": keepalive\n\n" in body
+    assert stop["count"] == 1
+
+
+def test_session_route_no_resync_when_idle_journal_unchanged(monkeypatch):
+    """The idle-wait re-sync must fire ONLY on a genuine journal advance — a quiet
+    idle connection (fingerprint unchanged) must NOT spam snapshots every tick."""
+    import api.routes as routes
+
+    stop = _stop_after_first_heartbeat(monkeypatch)
+    monkeypatch.setattr(routes, "_session_id_visible_to_request_profile", lambda *_a, **_k: True)
+    monkeypatch.setattr(
+        routes,
+        "get_session",
+        lambda sid, metadata_only=False: SimpleNamespace(
+            session_id=sid,
+            compact=lambda **_kwargs: {"session_id": sid, "title": "Session"},
+        ),
+    )
+    monkeypatch.setattr(routes, "_active_run_stream_for_session", lambda *_a, **_k: None)
+    monkeypatch.setattr(routes, "read_session_run_events", lambda *_a, **_k: {"status": "ok", "events": []})
+    # Fingerprint never changes → no re-sync.
+    monkeypatch.setattr(routes, "session_journal_fingerprint", lambda *_a, **_k: (2, 99.0, 77))
+
+    handler = _FakeHandler()
+    routes._handle_session_sse_stream_for_session(
+        handler,
+        urlparse("/api/sessions/session_1/events"),
+        "session_1",
+    )
+
+    body = handler.wfile.getvalue().decode("utf-8")
+    assert "event: session_snapshot\n" not in body, "quiet idle wait must not emit a snapshot"
+    assert ": keepalive\n\n" in body
+    assert stop["count"] == 1
+
+
 def test_session_route_blocks_hidden_sessions_before_replay_or_live_attach(monkeypatch):
     import api.routes as routes
 

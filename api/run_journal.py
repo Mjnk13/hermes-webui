@@ -367,6 +367,40 @@ def latest_run_summary(session_id: str, run_id: str, *, session_dir: Path | None
     return _summary_from_events(session_id, run_id, journal.get("events") or [])
 
 
+def session_journal_fingerprint(session_id: str, *, session_dir: Path | None = None) -> tuple[int, float, int]:
+    """Cheap, bounded fingerprint of a session's run journal: (file_count, max_mtime, total_size).
+
+    Reads only directory + per-file stat metadata (never parses journal bodies), so it stays
+    O(runs) and cannot be tipped over by a large ``done`` row. Used to detect that the journal
+    advanced during an idle live-subscribe wait — a run that starts AND finishes inside a single
+    keepalive tick leaves the journal changed but never materializes a live in-memory stream, so a
+    no-cursor idle subscriber would otherwise miss it until a manual refresh. Returns (0, 0.0, 0)
+    when the session has no journal yet. Invalid ids resolve to the empty fingerprint rather than
+    raising so callers can probe unconditionally.
+    """
+    try:
+        sid = _validate_id(session_id, "session_id")
+    except ValueError:
+        return (0, 0.0, 0)
+    root = Path(session_dir) if session_dir is not None else _default_session_dir()
+    session_root = root / RUN_JOURNAL_DIR_NAME / sid
+    if not session_root.exists():
+        return (0, 0.0, 0)
+    count = 0
+    max_mtime = 0.0
+    total_size = 0
+    for path in session_root.glob("*.jsonl"):
+        try:
+            st = path.stat()
+        except OSError:
+            continue
+        count += 1
+        total_size += st.st_size
+        if st.st_mtime > max_mtime:
+            max_mtime = st.st_mtime
+    return (count, max_mtime, total_size)
+
+
 def find_run_summary(run_id: str, *, session_dir: Path | None = None) -> dict | None:
     rid = _validate_id(run_id, "run_id")
     root = Path(session_dir) if session_dir is not None else _default_session_dir()
