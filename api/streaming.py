@@ -9573,7 +9573,7 @@ def _run_agent_streaming(
                             logger.debug("Failed to append cancelled turn journal event", exc_info=True)
                         put('cancel', _cancel_event_payload('Cancelled by user'))
                         return
-                    _success_writeback_committed = True
+                _success_writeback_committed = True
             usage = {
                 'input_tokens': input_tokens,
                 'output_tokens': output_tokens,

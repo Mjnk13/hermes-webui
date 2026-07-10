@@ -2398,6 +2398,66 @@ def test_streaming_post_save_cancel_after_success_commit_emits_done(tmp_path, mo
     assert "cancel" not in queued_events
 
 
+def test_streaming_no_pause_post_save_cancel_after_success_commit_emits_done(tmp_path, monkeypatch):
+    stream_id = "streaming-no-pause-post-save-cancel"
+    session_id = "streaming_no_pause_post_save_cancel"
+    stream_queue = queue.Queue()
+    config.STREAMS[stream_id] = stream_queue
+
+    previous_messages = [{"role": "user", "content": "before", "timestamp": 1.0}]
+    session = Session(
+        session_id=session_id,
+        workspace=str(tmp_path),
+        model="test-model",
+        model_provider="test-provider",
+        messages=list(previous_messages),
+        context_messages=list(previous_messages),
+        active_stream_id=stream_id,
+        pending_user_message="hello",
+        pending_user_source="webui",
+    )
+    session.save()
+    models.SESSIONS[session_id] = session
+
+    original_payload = streaming._session_payload_with_full_messages
+    payload_calls = {"count": 0}
+
+    def _payload_and_cancel_after_success_commit(*args, **kwargs):
+        payload_calls["count"] += 1
+        config.CANCEL_FLAGS[stream_id].set()
+        return original_payload(*args, **kwargs)
+
+    monkeypatch.setattr(streaming, "_session_payload_with_full_messages", _payload_and_cancel_after_success_commit)
+
+    with mock.patch.object(streaming, "_get_ai_agent", return_value=_SuccessfulAgent), \
+         mock.patch.object(streaming, "resolve_model_provider", return_value=("test-model", "test-provider", None)), \
+         mock.patch("api.config._resolve_cli_toolsets", return_value=[]):
+        streaming._run_agent_streaming(
+            session_id=session.session_id,
+            msg_text=session.pending_user_message,
+            model="test-model",
+            model_provider="test-provider",
+            workspace=str(tmp_path),
+            stream_id=stream_id,
+        )
+
+    assert payload_calls["count"] >= 1
+    saved = Session.load(session_id)
+    assert saved is not None
+    assert saved.process_wakeup_pause == {}
+    assert saved.active_stream_id is None
+    assert saved.pending_user_message is None
+    assert [msg.get("content") for msg in saved.messages] == [
+        "before",
+        "hello",
+        "Stream reply",
+    ]
+    queued_events = [item[0] for item in list(stream_queue.queue)]
+    assert "done" in queued_events
+    assert "stream_end" in queued_events
+    assert "cancel" not in queued_events
+
+
 def test_stale_credential_empty_process_wakeup_still_records_pause(tmp_path):
     session = Session(
         session_id="wakeup_pause_stale",
