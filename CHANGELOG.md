@@ -5,6 +5,8 @@
 
 ### Fixed
 
+- **Stale "unread" dot no longer lingers on a session after you open it.** Visiting a session now clears its sidebar unread indicator across the paths that previously left it stuck — the same-session reselect, the metadata-arrival ack, and the post-message-load re-sync — while a completion that lands in a genuinely hidden/background tab correctly stays unread. It also stops a phantom unread/streaming indicator from appearing when you switch from a busy session to an idle one (the idle session's streaming flags are now reset from its own metadata before the sidebar repaint, instead of inheriting the previous session's busy state). Thanks @neaucode-bot. (#5917, #4946)
+
 - **Plugin-provided model providers route correctly when set as the default.** A model from a plugin-only provider (e.g. a `@plugin:model` route) was surfaced in the catalog but, when that plugin provider was also the configured default, the request dropped the `@plugin:` routing hint and went to the wrong backend. Provider-hint resolution now applies plugin routing before the configured-provider bare-passthrough. Thanks @alexfoxtm. (#5909, #5461)
 
 - **Composer no longer double-sends or re-uploads on a fast second send.** The message text + its attachments are now captured and the textarea cleared immediately on send, before the async upload round-trip, so a re-entrant / interrupt-mode send can't re-read stale composer text and submit the same message twice or inherit the previous send's attachment. A clipboard-copy failure after a successful send no longer shows a false "failed", and a draft typed during the upload window is no longer clobbered. Thanks @harryazj. (#5912, #4750)
