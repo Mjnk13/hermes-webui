@@ -32,7 +32,6 @@ import urllib.request
 from urllib.parse import parse_qs, quote, unquote, urljoin, urlsplit, urlunsplit
 from xml.sax.saxutils import escape as _xml_escape
 
-from api.config import load_settings
 from api.helpers import bad, j
 
 _FULL_BACKEND_CAPABILITIES = {
@@ -608,7 +607,7 @@ def handle_browser_workbench_chii_request(handler, parsed) -> bool:
         handler.end_headers()
         handler.wfile.write(body)
         return True
-    except Exception as exc:
+    except Exception:
         return bad(handler, "DevTools are unavailable.", status=503) or True
 
 
@@ -1283,8 +1282,8 @@ def _browser_proxy_read_request_body(handler) -> bytes:
     raw_length = handler.headers.get("Content-Length", "0") if hasattr(handler, "headers") else "0"
     try:
         length = int(raw_length or 0)
-    except (TypeError, ValueError):
-        raise ValueError("Invalid Content-Length")
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Invalid Content-Length") from exc
     if length < 0 or length > _BROWSER_PROXY_MAX_BODY_BYTES:
         raise ValueError("Browser proxy request body is too large")
     if length <= 0:
@@ -1810,7 +1809,7 @@ class SessionShellBrowserWorkbenchBackend:
             return payload, 409
         try:
             payload["devtools_url"] = _chii_devtools_url(session_id)
-        except Exception as exc:
+        except Exception:
             payload["devtools_url"] = ""
             payload["message"] = "DevTools are unavailable."
             return payload, 503
