@@ -44,6 +44,9 @@ from api.config import (
     parse_reasoning_effort,
     parse_service_tier_config,
     coerce_reasoning_effort_for_model,
+    resolve_model_reasoning_efforts,
+    resolve_fast_mode_capability,
+    REASONING_EFFORT_LABELS,
     _main_model_request_overrides,
 )
 from api.helpers import redact_session_data, _redact_text
@@ -8979,13 +8982,7 @@ def _run_agent_streaming(
             _prefill_context = _load_webui_prefill_context(_cfg)
             _prefill_messages = _prefill_messages_with_webui_context(_prefill_context, _cfg)
             _prefill_messages = _normalize_prefill_messages_before_user_turn(_prefill_messages)
-            _main_request_overrides = _main_model_request_overrides(
-                _cfg,
-                effective_model=resolved_model,
-                effective_provider=resolved_provider,
-            )
             _agent_cfg = (_cfg.get('agent') or {}) if isinstance(_cfg, dict) else {}
-            _service_tier = parse_service_tier_config(_agent_cfg.get('service_tier') if isinstance(_agent_cfg, dict) else None)
             put('context_status', {
                 'session_id': session_id,
                 'prefill': _public_prefill_context_status(_prefill_context),
@@ -9001,6 +8998,32 @@ def _run_agent_streaming(
                 resolved_base_url,
                 account_config=_cfg,
             )
+            _main_request_overrides = _main_model_request_overrides(
+                _cfg,
+                effective_model=resolved_model,
+                effective_provider=resolved_provider,
+            )
+            _configured_service_tier = parse_service_tier_config(
+                _agent_cfg.get('service_tier') if isinstance(_agent_cfg, dict) else None
+            )
+            _fast_capability = resolve_fast_mode_capability(
+                resolved_model,
+                resolved_provider,
+                resolved_base_url,
+                _cfg,
+            )
+            _service_tier = (
+                _configured_service_tier
+                if _configured_service_tier == 'priority' and _fast_capability.get('supported')
+                else None
+            )
+            if _configured_service_tier == 'priority' and _service_tier is None:
+                logger.warning(
+                    '[webui-capability] Fast Mode suppressed model=%s provider=%s reason=%s',
+                    resolved_model,
+                    resolved_provider,
+                    _fast_capability.get('reason') or 'unsupported',
+                )
 
             # Per-profile toolsets — use _resolve_cli_toolsets() so MCP
             # server toolsets are included, matching native CLI behaviour.
@@ -9135,7 +9158,41 @@ def _run_agent_streaming(
                 )
                 _reasoning_config = parse_reasoning_effort(_effort)
             except Exception:
+                _effort = ""
                 _reasoning_config = None
+
+            try:
+                _supported_reasoning = resolve_model_reasoning_efforts(
+                    resolved_model,
+                    provider_id=resolved_provider,
+                    base_url=resolved_base_url,
+                )
+            except Exception:
+                _supported_reasoning = []
+            _provider_reasoning_payload = (
+                "max"
+                if _effort == "ultra" and "gpt-5.6" in str(resolved_model or "").lower()
+                else _effort
+            )
+            logger.info(
+                '[webui-capability] request model=%s provider=%s '
+                'reasoning_supported=%s reasoning_ui_label=%s '
+                'reasoning_backend_payload=%s reasoning_provider_payload=%s '
+                'fast_supported=%s fast_parameter=%s final_fast_override=%s',
+                resolved_model,
+                resolved_provider,
+                _supported_reasoning,
+                REASONING_EFFORT_LABELS.get(_effort, 'Default' if not _effort else _effort),
+                _effort,
+                _provider_reasoning_payload,
+                bool(_fast_capability.get('supported')),
+                _fast_capability.get('parameter') or '',
+                {
+                    key: _main_request_overrides[key]
+                    for key in ('service_tier', 'speed')
+                    if key in _main_request_overrides
+                },
+            )
 
             _agent_kwargs = dict(
                 model=resolved_model,

@@ -24,9 +24,9 @@ def test_models_dev_true_returns_full_efforts(monkeypatch):
 
     import api.config as cfg
 
-    assert cfg._models_dev_reasoning_efforts("grok-4.3", "xai-oauth") == list(
-        cfg.VALID_REASONING_EFFORTS
-    )
+    assert cfg._models_dev_reasoning_efforts("grok-4.3", "xai-oauth") == [
+        effort for effort in cfg.VALID_REASONING_EFFORTS if effort != "ultra"
+    ]
 
 
 def test_models_dev_false_returns_authoritative_empty(monkeypatch):
@@ -47,7 +47,7 @@ def test_models_dev_unknown_allows_compatibility_fallback(monkeypatch):
 
     assert cfg.resolve_model_reasoning_efforts(
         "x-ai/grok-4", provider_id="openrouter"
-    ) == list(cfg.VALID_REASONING_EFFORTS)
+    ) == [effort for effort in cfg.VALID_REASONING_EFFORTS if effort != "ultra"]
 
 
 def test_xai_oauth_grok_uses_agent_metadata(monkeypatch):
@@ -63,7 +63,7 @@ def test_xai_oauth_grok_uses_agent_metadata(monkeypatch):
 
     assert cfg.resolve_model_reasoning_efforts(
         "@xai-oauth:grok-4.3", provider_id="xai-oauth"
-    ) == list(cfg.VALID_REASONING_EFFORTS)
+    ) == [effort for effort in cfg.VALID_REASONING_EFFORTS if effort != "ultra"]
     assert seen == [("xai-oauth", "grok-4.3")]
 
 
@@ -150,5 +150,7 @@ display:
     status = cfg.get_reasoning_status()
 
     assert status["reasoning_effort"] == "medium"
-    assert status["supported_efforts"] == list(cfg.VALID_REASONING_EFFORTS)
+    assert status["supported_efforts"] == [
+        effort for effort in cfg.VALID_REASONING_EFFORTS if effort != "ultra"
+    ]
     assert status["supports_reasoning_effort"] is True

@@ -229,8 +229,10 @@ def _truncate_raw_text(value, limit: int = _MAX_CONTEXT_TEXT_LENGTH) -> str:
 
 
 def _sanitize_html_tag_name(value) -> str:
-    tag = _truncate_text(value, 64).lower()
-    return tag if tag and tag != "unknown" else ""
+    tag = str(value or "").strip()[:64]
+    if not tag or tag.lower() == "unknown" or any(char.isspace() or char in '<>"\'' for char in tag):
+        return ""
+    return tag
 
 
 def _browser_element_display_label(component: object, tag: object, fallback: object = "") -> str:
@@ -239,7 +241,8 @@ def _browser_element_display_label(component: object, tag: object, fallback: obj
         component_name = ""
     tag_name = _sanitize_html_tag_name(tag)
     if component_name and tag_name:
-        return _truncate_text(f"{component_name} • {tag_name}", 120)
+        suffix = f" · {tag_name}"
+        return f"{_truncate_text(component_name, max(1, 120 - len(suffix)))}{suffix}"
     return _truncate_text(component_name or tag_name or fallback or "Browser element", 120)
 
 
@@ -322,7 +325,7 @@ def _normalize_browser_context_items(raw_items) -> list[dict]:
         tag = _sanitize_html_tag_name(merged.get("tag") or merged.get("tagName") or merged.get("htmlTag") or merged.get("nodeName"))
         component = _truncate_text(merged.get("component") or merged.get("componentName"), 160)
         requested_display_label = _truncate_text(merged.get("displayLabel") or merged.get("display_label"), 120)
-        if tag and (not requested_display_label or " • " not in requested_display_label):
+        if tag and (not requested_display_label or not any(separator in requested_display_label for separator in (" · ", " • "))):
             display_label = _browser_element_display_label(component, tag, requested_display_label or selector or url)
         else:
             display_label = requested_display_label or _browser_element_display_label(component, tag, selector or url)
@@ -971,7 +974,7 @@ def _browser_proxy_bridge_script(target_url: str, *, session_id: str = "", frame
       selector: selectorFor(node),
       text: node && node.innerText ? String(node.innerText).replace(/\s+/g,' ').trim().slice(0,240) : '',
       component: node && (node.getAttribute('data-component') || node.getAttribute('data-testid') || node.getAttribute('aria-label') || node.tagName) || 'unknown',
-      tag: node && node.tagName ? node.tagName.toLowerCase() : '',
+      tag: node ? String(node.localName || node.tagName || '') : '',
       className,
       classes: className ? className.split(/\s+/).filter(Boolean).slice(0, 12) : [],
       attributes: node ? attrsFor(node) : {},
@@ -2552,7 +2555,7 @@ class CdpBrowserWorkbenchBackend(SessionShellBrowserWorkbenchBackend):
   }});
   return {{
     selector: selectorFor(el),
-    tag: (el.localName || el.tagName || '').toLowerCase(),
+    tag: String(el.localName || el.tagName || ''),
     text: clip(el.innerText || el.textContent || el.getAttribute('aria-label') || '', 500),
     component: fiber.component || 'unknown',
     source: fiber.source || 'unknown',

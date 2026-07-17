@@ -1,3 +1,5 @@
+import json
+import subprocess
 from pathlib import Path
 
 
@@ -6,6 +8,31 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def _read(relative: str) -> str:
     return (ROOT / relative).read_text(encoding="utf-8")
+
+
+def _js_function(source: str, name: str) -> str:
+    start = source.index(f"function {name}")
+    brace = source.index("{", start)
+    depth = 0
+    for index in range(brace, len(source)):
+        if source[index] == "{":
+            depth += 1
+        elif source[index] == "}":
+            depth -= 1
+            if depth == 0:
+                return source[start : index + 1]
+    raise AssertionError(f"unterminated JavaScript function: {name}")
+
+
+def _run_node_json(program: str):
+    result = subprocess.run(
+        ["node", "-e", program],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return json.loads(result.stdout)
 
 
 def test_restored_suspended_tab_reload_materializes_from_saved_url():
@@ -27,6 +54,86 @@ def test_navigation_entry_points_clear_error_and_share_navigation_lifecycle():
     assert "beginBrowserWorkbenchNavigation(target,requested" in js
     assert "void navigateBrowserWorkbenchToUrl(undefined,suggestion.url)" in js
     assert "if(requestId!==target.navigationRequestId)return null" in js
+
+
+def test_restored_navigation_content_states_are_mutually_exclusive():
+    js = _read("static/browser_workbench.js")
+    transition_program = "\n".join(
+        [
+            "const BROWSER_WORKBENCH_CONTENT_STATES=new Set(['restored','idle','loading','loaded','error']);",
+            _js_function(js, "normalizeBrowserWorkbenchLoadStatus"),
+            _js_function(js, "normalizeBrowserWorkbenchContentState"),
+            _js_function(js, "nextBrowserWorkbenchContentState"),
+            "const restored={contentState:'restored',hasStartedLoad:false,hasCommittedNavigation:false,navigationError:null};",
+            "const failed={contentState:'error',hasStartedLoad:true,hasCommittedNavigation:false,navigationError:{chromium_error:'ERR_CONNECTION_REFUSED'}};",
+            "console.log(JSON.stringify({restored:nextBrowserWorkbenchContentState(restored,'idle'),loading:nextBrowserWorkbenchContentState(restored,'loading'),error:nextBrowserWorkbenchContentState(restored,'error'),retry:nextBrowserWorkbenchContentState(failed,'loading'),loaded:nextBrowserWorkbenchContentState(failed,'success'),errorIdle:nextBrowserWorkbenchContentState(failed,'idle')}));",
+        ]
+    )
+
+    assert _run_node_json(transition_program) == {
+        "restored": "restored",
+        "loading": "loading",
+        "error": "error",
+        "retry": "loading",
+        "loaded": "loaded",
+        "errorIdle": "error",
+    }
+
+
+def test_restored_placeholder_is_only_rendered_by_restored_content_state():
+    js = _read("static/browser_workbench.js")
+    restore = js[js.index("function restoreBrowserWorkbenchTabs") : js.index("function handleBrowserWorkbenchShortcut")]
+    create = js[js.index("function createBrowserWorkbenchTabRecord") : js.index("function reorderBrowserWorkbenchTab")]
+    begin = _js_function(js, "beginBrowserWorkbenchNavigation")
+    render = _js_function(js, "renderActiveBrowserWorkbenchView")
+
+    assert "contentState:browserWorkbenchIsBlankUrl(tab.url)?'idle':'restored'" in restore
+    assert "Restored history URL" not in create
+    assert js.count("Restored history URL:") == 1
+    assert "if(state==='restored')" in js
+    assert begin.index("setBrowserWorkbenchContentState(target,'loading')") < begin.index("markBrowserWorkbenchLoadStarted")
+    assert "contentState==='error'&&active.navigationError" in render
+    assert "contentState==='restored'||contentState==='error'" in render
+    restored_branch = "else if(active&&(contentState==='restored'||contentState==='error'))"
+    native_render_branch = "else if(active&&active.renderer==='electron-native'&&active.sessionId)"
+    assert render.index(restored_branch) < render.index(native_render_branch)
+
+
+def test_element_highlight_label_formatter_preserves_complete_tag_names():
+    js = _read("static/browser_workbench.js")
+    css = _read("static/style.css")
+    desktop_main = _read("desktop/src/main/index.cjs")
+    tags = ["section", "span", "div", "button", "input", "article", "header", "main", "svg", "path", "linearGradient"]
+    formatter_program = "\n".join(
+        [
+            _js_function(js, "browserWorkbenchHtmlTagName"),
+            _js_function(js, "browserWorkbenchElementLabel"),
+            f"const tags={json.dumps(tags)};",
+            "console.log(JSON.stringify(tags.map((tag)=>({tag,normalized:browserWorkbenchHtmlTagName(tag),label:browserWorkbenchElementLabel('ReactComponentName',tag,'fallback')}))));",
+        ]
+    )
+
+    formatted = _run_node_json(formatter_program)
+    assert formatted == [
+        {"tag": tag, "normalized": tag, "label": f"ReactComponentName · {tag}"}
+        for tag in tags
+    ]
+
+    long_component_program = "\n".join(
+        [
+            _js_function(js, "browserWorkbenchHtmlTagName"),
+            _js_function(js, "browserWorkbenchElementLabel"),
+            "console.log(JSON.stringify(browserWorkbenchElementLabel('Component'.repeat(30),'section','fallback')));",
+        ]
+    )
+    assert _run_node_json(long_component_program).endswith(" · section")
+
+    overlay_render = _js_function(js, "renderBrowserWorkbenchOverlay")
+    assert ".slice(0,96)" not in overlay_render
+    assert overlay_render.index("tag.append(componentPart,separatorPart,tagPart)") < overlay_render.index("positionBrowserWorkbenchOverlayLabel")
+    assert ".browser-workbench-selection-overlay-tag{flex:0 0 auto" in css
+    assert "componentPart.style.cssText = 'flex:1 1 auto;min-width:0;overflow:hidden" in desktop_main
+    assert desktop_main.index("renderElementLabel(state.label, selection)") < desktop_main.index("positionSelectionLabel(state.label, rect)")
 
 
 def test_electron_main_frame_failures_publish_structured_error_without_error_url_history():

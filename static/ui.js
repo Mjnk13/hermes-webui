@@ -6306,6 +6306,7 @@ if(document.readyState==='loading'){
 // ── Reasoning effort chip ────────────────────────────────────────────────────
 let _currentReasoningEffort=null;
 let _currentReasoningEffortsSupported=null;
+let _currentReasoningOptions=null;
 let _profileTransitionReasoningContext=null;
 
 function _normalizeReasoningEffort(eff){
@@ -6319,8 +6320,9 @@ function _formatReasoningEffortLabel(effort){
   if(effort==='low') return 'Low';
   if(effort==='medium') return 'Medium';
   if(effort==='high') return 'High';
-  if(effort==='xhigh') return 'XHigh';
+  if(effort==='xhigh') return 'Extra High';
   if(effort==='max') return 'Max';
+  if(effort==='ultra') return 'Ultra';
   return effort.charAt(0).toUpperCase()+effort.slice(1);
 }
 
@@ -6351,21 +6353,36 @@ function _reasoningEffortQuery(){
   return qs?('?'+qs):'';
 }
 
-function _applyReasoningOptions(supportedEfforts){
+function _applyReasoningOptions(supportedEfforts,options){
   const dd=$('composerReasoningDropdown');
   if(!dd) return;
   const supported=new Set(Array.isArray(supportedEfforts)?supportedEfforts:[]);
-  dd.querySelectorAll('.reasoning-option').forEach(function(opt){
-    const effort=opt.dataset.effort;
-    if(effort==='none'){
-      opt.style.display='';
-      return;
-    }
-    if(!supported.size){
-      opt.style.display='none';
-      return;
-    }
-    opt.style.display=supported.has(effort)?'':'none';
+  const backendOptions=Array.isArray(options)?options.filter(function(opt){
+    return opt&&typeof opt.value==='string'&&typeof opt.label==='string';
+  }):[];
+  // The backend owns both capability filtering and label -> payload mapping.
+  // A tiny fallback keeps older standalone backends usable without reviving a
+  // permanently hard-coded final dropdown.
+  const rendered=backendOptions.length?backendOptions:[
+    {value:'none',label:'None'},
+    ...Array.from(supported).map(function(value){
+      return {value:value,label:_formatReasoningEffortLabel(value)};
+    }),
+  ];
+  const renderKey=JSON.stringify(rendered.map(function(item){
+    return [item.value,item.label,item.backend_value||item.value,item.provider_value||item.value];
+  }));
+  if(dd.dataset.reasoningOptionsKey===renderKey) return;
+  dd.dataset.reasoningOptionsKey=renderKey;
+  dd.replaceChildren();
+  rendered.forEach(function(item){
+    const opt=document.createElement('div');
+    opt.className='reasoning-option';
+    opt.dataset.effort=item.value;
+    opt.dataset.backendValue=item.backend_value||item.value;
+    opt.dataset.providerValue=item.provider_value||item.backend_value||item.value;
+    opt.textContent=item.label;
+    dd.appendChild(opt);
   });
 }
 
@@ -6376,6 +6393,13 @@ function _applyReasoningChip(eff){
   if(meta&&Array.isArray(meta.supported_efforts)){
     _currentReasoningEffortsSupported=meta.supported_efforts;
   }
+  if(meta&&Array.isArray(meta.options)){
+    _currentReasoningOptions=meta.options;
+  }
+  const currentSupported=(typeof _currentReasoningEffortsSupported==='undefined')
+    ?null:_currentReasoningEffortsSupported;
+  window.__HERMES_REASONING_SUPPORTED_EFFORTS__=Array.isArray(currentSupported)
+    ?currentSupported.slice():[];
   const wrap=$('composerReasoningWrap');
   const label=$('composerReasoningLabel');
   const chip=$('composerReasoningChip');
@@ -6395,7 +6419,9 @@ function _applyReasoningChip(eff){
   }
   wrap.style.display='';
   if(mobileAction) mobileAction.style.display='';
-  if(typeof _applyReasoningOptions==='function') _applyReasoningOptions(supportedEfforts);
+  if(typeof _applyReasoningOptions==='function'){
+    _applyReasoningOptions(supportedEfforts,_currentReasoningOptions);
+  }
   const text=_formatReasoningEffortLabel(effort);
   label.textContent=text;
   if(mobileLabel) mobileLabel.textContent=text;
@@ -6448,6 +6474,7 @@ function refreshProfileTransitionReasoningChip(model, provider){
   _profileTransitionReasoningContext={profile:(S&&S.activeProfile)||'default',model,provider};
   _currentReasoningEffort=null;
   _currentReasoningEffortsSupported=null;
+  _currentReasoningOptions=null;
   _lastReasoningFetchKey=null;
   ++_reasoningFetchSeq;
   _applyReasoningChip('', {supported_efforts:[]});
@@ -6546,13 +6573,15 @@ document.addEventListener('click',function(e){
   ) closeReasoningDropdown();
   if(e.target.closest('.reasoning-option')){
     const opt=e.target.closest('.reasoning-option');
-    const effort=opt&&opt.dataset.effort;
+    const effort=opt&&(opt.dataset.backendValue||opt.dataset.effort);
     if(effort){
       const payload=Object.assign({effort:effort},_reasoningEffortContext());
       api('/api/reasoning',{method:'POST',body:JSON.stringify(payload)})
         .then(function(st){
           _applyReasoningChip((st&&st.reasoning_effort)||effort, st||{});
-          showToast('🧠 Reasoning effort set to '+((st&&st.reasoning_effort)||effort));
+          const selected=(st&&st.reasoning_effort)||effort;
+          const diagnosticLabel=st&&st.diagnostics&&st.diagnostics.ui_label;
+          showToast('🧠 Reasoning effort set to '+(diagnosticLabel||_formatReasoningEffortLabel(selected)));
         })
         .catch(function(){showToast('🧠 Failed to set effort');});
       closeReasoningDropdown();
@@ -6563,6 +6592,7 @@ document.addEventListener('click',function(e){
 // ── Fast mode chip ───────────────────────────────────────────────────────────
 let _currentFastMode=null;
 let _currentFastSupported=null;
+let _currentFastUnsupportedReason='';
 let _lastFastFetchKey=null;
 let _fastFetchSeq=0;
 
@@ -6611,6 +6641,9 @@ function _applyFastChip(mode){
   const normalized=_normalizeFastMode(mode);
   _currentFastMode=normalized;
   if(meta&&typeof meta.supports_fast_mode==='boolean') _currentFastSupported=meta.supports_fast_mode;
+  if(meta&&typeof meta.unsupported_reason==='string'){
+    _currentFastUnsupportedReason=meta.unsupported_reason;
+  }
   const wrap=$('composerFastWrap');
   const label=$('composerFastLabel');
   const chip=$('composerFastChip');
@@ -6618,23 +6651,25 @@ function _applyFastChip(mode){
   const mobileAction=$('composerMobileFastAction');
   if(!wrap||!label) return;
   const supported=_currentFastSupported!==false;
-  if(!supported&&normalized!=='fast'){
-    wrap.style.display='none';
-    if(mobileAction) mobileAction.style.display='none';
-    closeFastDropdown();
-    return;
-  }
   wrap.style.display='';
   if(mobileAction) mobileAction.style.display='';
   _applyFastOptions(supported);
-  const text=_formatFastLabel(normalized);
+  const text=supported?_formatFastLabel(normalized):'Fast unavailable';
   label.textContent=text;
   if(mobileLabel) mobileLabel.textContent=text;
   if(chip){
     chip.classList.toggle('inactive',normalized!=='fast');
-    chip.title='Fast mode: '+text;
+    chip.classList.toggle('disabled',!supported);
+    chip.setAttribute('aria-disabled',supported?'false':'true');
+    chip.title=supported
+      ?'Fast mode: '+text
+      :(_currentFastUnsupportedReason||'Fast Mode is not supported by this provider');
   }
-  if(mobileAction) mobileAction.classList.toggle('inactive',normalized!=='fast');
+  if(mobileAction){
+    mobileAction.classList.toggle('inactive',normalized!=='fast');
+    mobileAction.classList.toggle('disabled',!supported);
+    mobileAction.setAttribute('aria-disabled',supported?'false':'true');
+  }
   _highlightFastOption(normalized);
 }
 
@@ -6674,6 +6709,11 @@ function toggleFastDropdown(){
   const dd=$('composerFastDropdown');
   const chip=$('composerFastChip');
   if(!dd||!chip) return;
+  if(_currentFastSupported===false){
+    showToast('⚡ '+(_currentFastUnsupportedReason||'Fast Mode is not supported by this provider'));
+    closeFastDropdown();
+    return;
+  }
   const open=dd.classList.contains('open');
   if(open){closeFastDropdown();return;}
   if(typeof closeProfileDropdown==='function') closeProfileDropdown();

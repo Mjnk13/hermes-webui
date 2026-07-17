@@ -3195,7 +3195,84 @@ def get_effective_default_model(config_data: dict | None = None) -> str:
 # importing from the agent tree (which may not be installed).  Any drift here
 # will show up in the shared test suite since both sides accept the same set.
 # Keep this WebUI-visible set aligned with hermes-agent#29248.
-VALID_REASONING_EFFORTS = ("minimal", "low", "medium", "high", "xhigh", "max")
+VALID_REASONING_EFFORTS = (
+    "minimal",
+    "low",
+    "medium",
+    "high",
+    "xhigh",
+    "max",
+    "ultra",
+)
+
+# Canonical UI label -> backend payload mapping.  Keep the payload values in
+# lock-step with hermes_constants.VALID_REASONING_EFFORTS; in particular,
+# Extra High is only a human label for ``xhigh`` while ``max`` and ``ultra``
+# remain separate Hermes values.
+REASONING_EFFORT_LABELS = {
+    "none": "None",
+    "minimal": "Minimal",
+    "low": "Low",
+    "medium": "Medium",
+    "high": "High",
+    "xhigh": "Extra High",
+    "max": "Max",
+    "ultra": "Ultra",
+}
+
+
+def _reasoning_provider_payload_value(
+    effort: str,
+    model_id: str = "",
+    provider_id: str = "",
+) -> str:
+    """Return the adapter-facing value for diagnostics/UI mapping metadata."""
+    value = str(effort or "").strip().lower()
+    if value == "ultra" and _supports_native_ultra_reasoning(model_id, provider_id):
+        return "max"
+    return value
+
+
+def _reasoning_effort_options(
+    efforts: list[str],
+    model_id: str = "",
+    provider_id: str = "",
+) -> list[dict]:
+    """Return capability-filtered selector options with explicit mappings."""
+    values = ["none", *[str(value).strip().lower() for value in efforts]]
+    values = list(dict.fromkeys(value for value in values if value in REASONING_EFFORT_LABELS))
+    return [
+        {
+            "value": value,
+            "label": REASONING_EFFORT_LABELS[value],
+            "backend_value": value,
+            "provider_value": _reasoning_provider_payload_value(
+                value, model_id, provider_id
+            ),
+        }
+        for value in values
+    ]
+
+
+def _supports_native_ultra_reasoning(model_id: str, provider_id: str) -> bool:
+    """Whether Hermes has an explicit adapter mapping for canonical ``ultra``.
+
+    Provider allowlists remain authoritative and can opt other models in.  The
+    heuristic path is deliberately narrow: GPT-5.6 maps Hermes ``ultra`` to the
+    Responses/Chat wire value ``max``.  We must not infer Ultra merely from a
+    generic ``supports_reasoning`` boolean returned by an arbitrary endpoint.
+    """
+    model = _strip_provider_hint_for_reasoning(model_id, provider_id).lower()
+    bare = model.rsplit("/", 1)[-1]
+    return "gpt-5.6" in bare
+
+
+def _heuristic_reasoning_ladder(model_id: str, provider_id: str) -> list[str]:
+    """Canonical heuristic ladder, excluding Ultra unless explicitly mapped."""
+    levels = list(VALID_REASONING_EFFORTS)
+    if not _supports_native_ultra_reasoning(model_id, provider_id):
+        levels.remove("ultra")
+    return levels
 
 
 def parse_reasoning_effort(effort):
@@ -3420,20 +3497,23 @@ def _filter_reasoning_efforts_for_provider(
     normalized = list(dict.fromkeys(normalized))
     provider = _resolve_provider_alias(str(provider_id or "").strip().lower())
     bare = _strip_provider_hint_for_reasoning(model_id).lower().rsplit("/", 1)[-1]
-    # OpenAI-family lanes (Codex, direct OpenAI, Azure Foundry) cap GPT-5 at xhigh
-    # and o-series at high — 'max' is a WebUI-only level none of them accept.
+    # OpenAI-family lanes cap o-series at high and pre-5.6 GPT-5 at xhigh.
+    # GPT-5.6 is the explicit exception: Hermes maps canonical ``ultra`` to the
+    # provider wire value ``max`` in both Responses and Chat transports.
     if provider in {"openai-codex", "openai", "openai-api", "azure-foundry", "azure-openai", "azure"}:
         if bare.startswith(("o1", "o3", "o4")):
             return [eff for eff in normalized if eff in {"low", "medium", "high"}]
         if bare.startswith("gpt-5"):
-            return [eff for eff in normalized if eff != "max"]
+            if "gpt-5.6" in bare:
+                return normalized
+            return [eff for eff in normalized if eff not in {"max", "ultra"}]
     # 'max' is a WebUI-level ceiling; providers whose native ladder tops out lower
     # must NOT advertise it, otherwise a stored/CLI 'max' degrades WORSE than the
     # prior max->xhigh coercion (Gemini's adapter treats unknown 'max' as medium;
     # pre-adaptive Anthropic manual-thinking lacks a 'max' budget and falls to 8k).
     # Dropping 'max' here lets the existing downgrade ladder land on xhigh/high.
     if provider in {"gemini", "google", "google-gemini", "google-vertex", "vertex"}:
-        return [eff for eff in normalized if eff != "max"]
+        return [eff for eff in normalized if eff not in {"max", "ultra"}]
     # Legacy Claude is pre-adaptive whether served natively OR via Azure Foundry /
     # Bedrock / Vertex — the ceiling follows the MODEL, not just the provider name.
     _anthropic_lanes = {
@@ -3442,7 +3522,7 @@ def _filter_reasoning_efforts_for_provider(
         "vertex", "google-vertex",
     }
     if provider in _anthropic_lanes and "claude" in bare and _is_pre_adaptive_anthropic(bare):
-        return [eff for eff in normalized if eff != "max"]
+        return [eff for eff in normalized if eff not in {"max", "ultra"}]
     return normalized
 
 
@@ -3516,13 +3596,13 @@ def _heuristic_reasoning_efforts(model_id: str, provider_id: str) -> list[str]:
         if bare.startswith(("o1", "o3", "o4")):
             return ["low", "medium", "high"]
         return _filter_reasoning_efforts_for_provider(
-            list(VALID_REASONING_EFFORTS), model, provider
+            _heuristic_reasoning_ladder(model, provider), model, provider
         )
     if provider in {"copilot", "github-copilot"}:
         if bare.startswith(("gpt-5", "o1", "o3", "o4")):
             if bare.startswith(("o1", "o3", "o4")):
                 return ["low", "medium", "high"]
-            return list(VALID_REASONING_EFFORTS)
+            return _heuristic_reasoning_ladder(model, provider)
     prefixes = (
         "deepseek/",
         "anthropic/",
@@ -3535,15 +3615,15 @@ def _heuristic_reasoning_efforts(model_id: str, provider_id: str) -> list[str]:
         "xiaomi/",
     )
     if any(model.startswith(prefix) for prefix in prefixes):
-        return list(VALID_REASONING_EFFORTS)
+        return _heuristic_reasoning_ladder(model, provider)
     if _nested_gateway_route_reasoning(model):
-        return list(VALID_REASONING_EFFORTS)
+        return _heuristic_reasoning_ladder(model, provider)
     # Named custom providers often rewrite model ids with dots, underscores, or
     # extra vendor namespaces. Normalize those shapes before applying family-level
     # reasoning heuristics so "deepseek.v3.2", "deepseek_v4_flash", and
     # "vendor.deepseek.v3.2" are treated consistently.
     if any(_candidate_supports_reasoning(candidate) for candidate in _reasoning_name_candidates(bare)):
-        return list(VALID_REASONING_EFFORTS)
+        return _heuristic_reasoning_ladder(model, provider)
     return []
 
 
@@ -3574,7 +3654,7 @@ def _models_dev_reasoning_efforts(model_id: str, provider_id: str) -> list[str] 
     supports_reasoning = getattr(capabilities, "supports_reasoning", None)
     if supports_reasoning is True:
         return _filter_reasoning_efforts_for_provider(
-            list(VALID_REASONING_EFFORTS), model, provider
+            _heuristic_reasoning_ladder(model, provider), model, provider
         )
     if supports_reasoning is False:
         return []
@@ -3808,6 +3888,15 @@ def _resolve_model_reasoning_efforts_impl(
 
     provider = _resolve_provider_alias(provider)
 
+    for entry in _custom_provider_entries():
+        custom_slug = _custom_provider_slug_from_name(entry.get("name"))
+        custom_name = str(entry.get("name") or "").strip().lower()
+        if provider in {custom_name, custom_slug}:
+            provider = custom_slug
+            if not resolved_base_url:
+                resolved_base_url = str(entry.get("base_url") or "").strip() or None
+            break
+
     # IDE-copilot providers never expose reasoning effort options.
     # Guard early so a stray config entry can't override this.
     if provider in {"cursor-acp", "copilot-acp"}:
@@ -3954,18 +4043,17 @@ def coerce_reasoning_effort_for_model(
     # "unknown", so preserve the user's configured effort verbatim where it is
     # still valid. (#3505 review)
     #
-    # EXCEPTION for 'max' (the #3505 default-deny refinement, maintainer call
-    # 2026-07-11): 'max' is a WebUI-only level ABOVE the universally-safe ceiling
-    # 'xhigh'. A genuinely unknown/custom provider will 400 on it. So when the
+    # EXCEPTION for 'max' / 'ultra': both sit above the universally-safe ceiling
+    # 'xhigh'. A genuinely unknown/custom provider may 400 on them. So when the
     # capability list is empty AND the provider is not one we recognize as
-    # reasoning-capable, degrade 'max' -> 'xhigh' rather than send an unsupported
+    # reasoning-capable, degrade to 'xhigh' rather than send an unsupported
     # supra-ceiling level. But do NOT degrade for a RECOGNIZED reasoning provider
     # whose specific model id we simply couldn't resolve (e.g. claude-opus-latest,
     # a brand-new adaptive id) — those genuinely support 'max', and the ceiling
     # filter above already stripped it for any KNOWN-capped model. All other
     # levels (minimal..xhigh) keep the conservative preserve-verbatim behavior.
     if not supported:
-        if raw == "max" and not _provider_known_reasoning_capable(provider_id):
+        if raw in {"max", "ultra"} and not _provider_known_reasoning_capable(provider_id):
             return "xhigh"
         return raw
     if raw in supported:
@@ -3973,7 +4061,7 @@ def coerce_reasoning_effort_for_model(
     # Degrade to the closest *lower* supported level instead of silently
     # disabling reasoning. e.g. max -> xhigh -> high, or xhigh -> high when the
     # target model caps below the configured effort. Never escalate.
-    ladder = list(VALID_REASONING_EFFORTS)  # ascending: minimal..xhigh..max
+    ladder = list(VALID_REASONING_EFFORTS)  # ascending: minimal..xhigh..max..ultra
     try:
         raw_idx = ladder.index(raw)
     except ValueError:
@@ -4018,24 +4106,54 @@ def get_reasoning_status(
             if not resolve_base_url and model_cfg.get("base_url"):
                 resolve_base_url = str(model_cfg["base_url"]).strip()
 
+    for entry in _custom_provider_entries(config_data):
+        custom_slug = _custom_provider_slug_from_name(entry.get("name"))
+        custom_name = str(entry.get("name") or "").strip().lower()
+        if str(resolve_provider or "").strip().lower() in {custom_name, custom_slug}:
+            resolve_provider = custom_slug
+            if not resolve_base_url:
+                resolve_base_url = str(entry.get("base_url") or "").strip() or None
+            break
+
     supported_efforts = resolve_model_reasoning_efforts(
         resolve_model,
         provider_id=resolve_provider,
         base_url=resolve_base_url,
+    )
+    final_effort = coerce_reasoning_effort_for_model(
+        str(effort_raw or "").strip().lower(),
+        resolve_model,
+        provider_id=resolve_provider,
+        base_url=resolve_base_url,
+    )
+    provider_payload = _reasoning_provider_payload_value(
+        final_effort, str(resolve_model or ""), str(resolve_provider or "")
+    )
+    selected_label = REASONING_EFFORT_LABELS.get(
+        final_effort, "Default" if not final_effort else final_effort
+    )
+    options = _reasoning_effort_options(
+        supported_efforts,
+        str(resolve_model or ""),
+        str(resolve_provider or ""),
     )
     return {
         # Match CLI default (True if unset in config.yaml)
         "show_reasoning": bool(show_raw) if isinstance(show_raw, bool) else True,
         # Report the COERCED effort so boot/status/chip read paths agree with
         # what streaming actually sends. (Codex review of the drop-max alignment.)
-        "reasoning_effort": coerce_reasoning_effort_for_model(
-            str(effort_raw or "").strip().lower(),
-            resolve_model,
-            provider_id=resolve_provider,
-            base_url=resolve_base_url,
-        ),
+        "reasoning_effort": final_effort,
         "supported_efforts": supported_efforts,
         "supports_reasoning_effort": bool(supported_efforts),
+        "options": options,
+        "diagnostics": {
+            "selected_model": resolve_model or "",
+            "selected_provider": resolve_provider or "",
+            "supported_reasoning_efforts": supported_efforts,
+            "ui_label": selected_label,
+            "backend_payload_value": final_effort,
+            "provider_payload_value": provider_payload,
+        },
     }
 
 
@@ -4146,7 +4264,8 @@ def set_reasoning_effort(
     """Persist ``agent.reasoning_effort`` to the active profile's config.yaml.
 
     Mirrors CLI ``/reasoning <level>``: same key, same valid values
-    (``none`` | ``minimal`` | ``low`` | ``medium`` | ``high`` | ``xhigh`` | ``max``).
+    (``none`` | ``minimal`` | ``low`` | ``medium`` | ``high`` | ``xhigh`` |
+    ``max`` | ``ultra``).
     Raises ``ValueError`` on an unrecognised level so callers can return 400.
     """
     raw = str(effort or "").strip().lower()
@@ -4157,6 +4276,24 @@ def set_reasoning_effort(
             f"Unknown reasoning effort '{effort}'. "
             f"Valid: none, {', '.join(VALID_REASONING_EFFORTS)}."
         )
+    if raw != "none":
+        capability_status = get_reasoning_status(
+            model_id=model_id,
+            provider_id=provider_id,
+            base_url=base_url,
+        )
+        supported = capability_status.get("supported_efforts") or []
+        target = capability_status.get("diagnostics", {})
+        # With no model context there is nothing to validate against; preserve
+        # CLI behavior and store the canonical value for the next model. Once a
+        # model is known, fail closed instead of persisting a value that would
+        # immediately be coerced to something different.
+        if target.get("selected_model") and raw not in supported:
+            raise ValueError(
+                f"Reasoning effort '{raw}' is not supported by "
+                f"{target.get('selected_provider') or 'this provider'} / "
+                f"{target.get('selected_model') or 'this model'}."
+            )
     config_path = _get_config_path()
     with _cfg_lock:
         config_data = _load_yaml_config_file(config_path)
@@ -4187,37 +4324,200 @@ def parse_service_tier_config(raw: str | None) -> str | None:
     return None
 
 
-def _model_supports_fast_mode(model_id: str | None) -> bool:
-    """Return whether the selected model should expose the Fast-mode control."""
-    try:
-        from hermes_cli.models import model_supports_fast_mode  # type: ignore[import-not-found]
+def _configured_custom_fast_mode(
+    provider_id: str,
+    model_id: str,
+    config_data: dict,
+) -> tuple[dict, str]:
+    """Return an explicitly declared custom-provider Fast override.
 
-        return bool(model_supports_fast_mode(model_id))
-    except Exception:
-        raw = _strip_provider_hint_for_reasoning(str(model_id or "")).strip().lower()
-        base = raw.rsplit("/", 1)[-1].split(":", 1)[0]
-        if not base or "codex" in base:
-            return False
-        if base.startswith(("gpt-", "o1", "o3", "o4")):
-            return True
-        return base.startswith("claude-") and ("opus-4-6" in base or "opus-4.6" in base)
+    Arbitrary OpenAI-compatible endpoints do not have a standard capability
+    field for Priority Processing.  They therefore fail closed unless their
+    provider or per-model config explicitly declares the wire parameter, e.g.::
+
+        fast_mode: {parameter: service_tier, value: priority}
+
+    ``supports_fast_mode: true`` alone is intentionally insufficient because it
+    cannot tell Hermes which request field the endpoint accepts.
+    """
+    provider = str(provider_id or "").strip().lower()
+    entry = None
+    for candidate in _custom_provider_entries(config_data):
+        if _custom_provider_slug_from_name(candidate.get("name")) == provider:
+            entry = candidate
+            break
+    if not isinstance(entry, dict):
+        return {}, "custom provider has no Fast Mode capability declaration"
+
+    bare_model = _strip_provider_hint_for_reasoning(model_id, provider)
+    model_cfg = (entry.get("models") or {}).get(bare_model)
+    declarations = [model_cfg, entry] if isinstance(model_cfg, dict) else [entry]
+    for declaration in declarations:
+        if not isinstance(declaration, dict):
+            continue
+        raw = declaration.get("fast_mode")
+        parameter = ""
+        value = ""
+        if isinstance(raw, dict):
+            if raw.get("supported") is False or raw.get("enabled") is False:
+                return {}, "Fast Mode is disabled by provider configuration"
+            parameter = str(raw.get("parameter") or raw.get("field") or "").strip()
+            value = str(raw.get("value") or "").strip()
+        elif isinstance(raw, str):
+            normalized = raw.strip().lower()
+            if normalized in {"service_tier", "priority", "openai"}:
+                parameter, value = "service_tier", "priority"
+            elif normalized in {"speed", "anthropic"}:
+                parameter, value = "speed", "fast"
+        if not parameter and declaration.get("supports_fast_mode") is True:
+            parameter = str(declaration.get("fast_mode_parameter") or "").strip()
+            value = str(declaration.get("fast_mode_value") or "").strip()
+        parameter = parameter.lower()
+        if parameter == "service_tier":
+            return {"service_tier": value or "priority"}, "custom provider configuration"
+        if parameter == "speed":
+            return {"speed": value or "fast"}, "custom provider configuration"
+    return {}, "custom provider did not advertise a Fast Mode request parameter"
 
 
-def _fast_mode_overrides_for_model(model_id: str | None) -> dict:
-    """Return request overrides for fast mode; empty dict means unsupported."""
-    try:
-        from hermes_cli.models import resolve_fast_mode_overrides  # type: ignore[import-not-found]
+def resolve_fast_mode_capability(
+    model_id: str | None,
+    provider_id: str | None = None,
+    base_url: str | None = None,
+    config_data: dict | None = None,
+) -> dict:
+    """Resolve Fast Mode against both model *and provider* capabilities."""
+    data = config_data if isinstance(config_data, dict) else _load_yaml_config_file(_get_config_path())
+    model = str(model_id or "").strip()
+    provider = str(provider_id or "").strip().lower()
+    resolved_base_url = str(base_url or "").strip()
 
-        overrides = resolve_fast_mode_overrides(model_id)
-        return dict(overrides or {})
-    except Exception:
-        if not _model_supports_fast_mode(model_id):
-            return {}
-        raw = _strip_provider_hint_for_reasoning(str(model_id or "")).strip().lower()
-        base = raw.rsplit("/", 1)[-1].split(":", 1)[0]
-        if base.startswith("claude-"):
-            return {"speed": "fast"}
-        return {"service_tier": "priority"}
+    # A bare custom-provider name (the shape stored in config.yaml) must be
+    # canonicalized before any model-name heuristic runs.
+    for entry in _custom_provider_entries(data):
+        slug = _custom_provider_slug_from_name(entry.get("name"))
+        name = str(entry.get("name") or "").strip().lower()
+        if provider in {name, slug}:
+            provider = slug
+            if not resolved_base_url:
+                resolved_base_url = str(entry.get("base_url") or "").strip()
+            break
+
+    if provider and not resolved_base_url:
+        provider_cfg = (data.get("providers") or {}).get(provider)
+        if isinstance(provider_cfg, dict):
+            resolved_base_url = str(provider_cfg.get("base_url") or "").strip()
+        model_cfg = data.get("model") or {}
+        if isinstance(model_cfg, dict):
+            configured_provider = _resolve_provider_alias(
+                str(model_cfg.get("provider") or "").strip().lower()
+            )
+            configured_model = str(
+                model_cfg.get("default") or model_cfg.get("name") or ""
+            ).strip()
+            if (
+                not resolved_base_url
+                and configured_provider == _resolve_provider_alias(provider)
+                and (not configured_model or not model or configured_model == model)
+            ):
+                resolved_base_url = str(model_cfg.get("base_url") or "").strip()
+
+    if model and not provider:
+        try:
+            resolved_model, discovered_provider, discovered_base = resolve_model_provider(model)
+            model = resolved_model or model
+            if discovered_provider:
+                provider = str(discovered_provider).strip().lower()
+            if not resolved_base_url and discovered_base:
+                resolved_base_url = str(discovered_base).strip()
+        except Exception:
+            pass
+    provider = _resolve_provider_alias(provider)
+    normalized_model = _strip_provider_hint_for_reasoning(model, provider)
+
+    overrides: dict = {}
+    source = ""
+    reason = ""
+    if provider.startswith("custom:"):
+        overrides, source_or_reason = _configured_custom_fast_mode(
+            provider, normalized_model, data
+        )
+        if overrides:
+            source = source_or_reason
+        else:
+            reason = source_or_reason
+    elif provider in {"openai", "openai-api", "openai-codex"}:
+        # A provider-labelled third-party base URL is still a custom endpoint;
+        # model-name matching alone cannot prove it forwards service_tier.
+        endpoint_host = (urlparse(resolved_base_url).hostname or "").lower() if resolved_base_url else ""
+        official_hosts = ("api.openai.com", "chatgpt.com", "openai.com")
+        is_official_endpoint = any(
+            endpoint_host == host or endpoint_host.endswith(f".{host}")
+            for host in official_hosts
+        )
+        if resolved_base_url and not is_official_endpoint:
+            reason = "the configured endpoint does not advertise OpenAI Priority Processing"
+        else:
+            overrides = _resolve_main_model_fast_mode_overrides(normalized_model, provider)
+            source = "Hermes OpenAI model capability" if overrides else ""
+            reason = "this OpenAI model does not accept Priority Processing" if not overrides else ""
+    elif provider in {"anthropic", "claude", "anthropic-claude"}:
+        endpoint_host = (urlparse(resolved_base_url).hostname or "").lower() if resolved_base_url else ""
+        if resolved_base_url and not (
+            endpoint_host == "api.anthropic.com" or endpoint_host.endswith(".api.anthropic.com")
+        ):
+            reason = "the configured endpoint does not advertise Anthropic Fast Mode"
+        else:
+            try:
+                from hermes_cli.models import resolve_fast_mode_overrides  # type: ignore[import-not-found]
+                overrides = dict(resolve_fast_mode_overrides(normalized_model) or {})
+            except Exception:
+                raw = normalized_model.lower()
+                if raw.startswith("claude-") and ("opus-4-6" in raw or "opus-4.6" in raw):
+                    overrides = {"speed": "fast"}
+            source = "Hermes Anthropic model capability" if overrides else ""
+            reason = "this Anthropic model does not accept the Fast Mode parameter" if not overrides else ""
+    else:
+        reason = "Fast Mode is not supported by this provider"
+
+    parameter = next(iter(overrides), "")
+    return {
+        "supported": bool(overrides),
+        "model": normalized_model or model,
+        "provider": provider,
+        "request_overrides": overrides,
+        "parameter": parameter,
+        "value": overrides.get(parameter, "") if parameter else "",
+        "source": source,
+        "reason": reason,
+    }
+
+
+def _model_supports_fast_mode(
+    model_id: str | None,
+    provider_id: str | None = None,
+    base_url: str | None = None,
+    config_data: dict | None = None,
+) -> bool:
+    """Compatibility boolean wrapper around provider-aware capability data."""
+    return bool(
+        resolve_fast_mode_capability(
+            model_id, provider_id, base_url, config_data
+        ).get("supported")
+    )
+
+
+def _fast_mode_overrides_for_model(
+    model_id: str | None,
+    provider_id: str | None = None,
+    base_url: str | None = None,
+    config_data: dict | None = None,
+) -> dict:
+    """Return verified provider-aware request overrides, or an empty dict."""
+    capability = resolve_fast_mode_capability(
+        model_id, provider_id, base_url, config_data
+    )
+    return dict(capability.get("request_overrides") or {})
 
 
 def _resolve_fast_mode_model_context(
@@ -4261,19 +4561,53 @@ def get_fast_mode_status(
         base_url,
     )
     service_tier = parse_service_tier_config(raw)
-    supported = _model_supports_fast_mode(resolve_model)
+    capability = resolve_fast_mode_capability(
+        resolve_model,
+        resolve_provider,
+        resolve_base_url,
+        config_data,
+    )
+    supported = bool(capability["supported"])
+    configured_mode = "fast" if service_tier == "priority" else "normal"
+    effective_mode = "fast" if configured_mode == "fast" and supported else "normal"
     return {
-        "fast_mode": "fast" if service_tier == "priority" else "normal",
-        "service_tier": service_tier or "",
+        # ``fast_mode`` is the effective request state, never a badge-only copy
+        # of a saved setting that the current provider cannot honor.
+        "fast_mode": effective_mode,
+        "configured_fast_mode": configured_mode,
+        "service_tier": "priority" if effective_mode == "fast" else "",
         "supports_fast_mode": bool(supported),
+        "unsupported_reason": capability.get("reason", "") if not supported else "",
         "supported_options": ["normal", "fast"] if supported else ["normal"],
         "options": [
             {"value": "normal", "label": "Normal"},
             {"value": "fast", "label": "Fast", "disabled": not supported},
         ],
         "model": resolve_model or "",
-        "provider": resolve_provider or "",
+        "provider": capability.get("provider") or resolve_provider or "",
         "base_url": resolve_base_url or "",
+        "capability": capability,
+        "diagnostics": {
+            "selected_model": capability.get("model") or resolve_model or "",
+            "selected_provider": capability.get("provider") or resolve_provider or "",
+            "fast_mode_capability": bool(supported),
+            "fast_mode_capability_source": capability.get("source", ""),
+            "configured_fast_mode": configured_mode,
+            "effective_fast_mode": effective_mode,
+            "final_request_service_tier": (
+                capability.get("request_overrides", {}).get("service_tier", "")
+                if effective_mode == "fast"
+                else ""
+            ),
+            "final_request_fast_parameter": (
+                capability.get("request_overrides", {}) if effective_mode == "fast" else {}
+            ),
+            "fallback": (
+                capability.get("reason", "")
+                if configured_mode == "fast" and effective_mode != "fast"
+                else ""
+            ),
+        },
     }
 
 
@@ -4302,8 +4636,18 @@ def set_fast_mode(
             provider_id,
             base_url,
         )
-        if next_mode == "fast" and not _model_supports_fast_mode(resolve_model):
-            raise ValueError("fast mode is not available for this model")
+        if next_mode == "fast":
+            capability = resolve_fast_mode_capability(
+                resolve_model,
+                _resolve_provider,
+                _resolve_base_url,
+                config_data,
+            )
+            if not capability.get("supported"):
+                raise ValueError(
+                    capability.get("reason")
+                    or "Fast Mode is not supported by this provider"
+                )
         agent_cfg = config_data.get("agent")
         if not isinstance(agent_cfg, dict):
             agent_cfg = {}
@@ -4502,7 +4846,10 @@ def _main_model_request_overrides(
     agent_cfg = config_data.get("agent", {})
     if isinstance(agent_cfg, dict) and parse_service_tier_config(agent_cfg.get("service_tier")) == "priority":
         fast_overrides = _fast_mode_overrides_for_model(
-            gate_model or str(model_cfg.get("default") or "").strip() or None
+            gate_model or str(model_cfg.get("default") or "").strip() or None,
+            gate_provider,
+            str(model_cfg.get("base_url") or "").strip() or None,
+            config_data,
         )
         if fast_overrides:
             fast_extra_body = fast_overrides.pop("extra_body", None)
