@@ -287,13 +287,32 @@ def test_alignment_matches_old_matcher_for_non_reflexive_hashable_object():
     assert actual == expected == []
 
 
+def test_shorter_context_reverse_fallback_prefers_ambiguous_kept_boundary():
+    exact_row = {"role": "assistant", "content": "exact", "id": "exact"}
+    context = [
+        exact_row,
+        {"role": "assistant", "content": "x"},
+        {"role": "assistant", "content": "x"},
+    ]
+    display = [
+        {"role": "assistant", "content": "exact", "id": "exact"},
+        {"role": "assistant", "content": "x"},
+        {"role": "assistant", "content": "unmatched boundary"},
+        {"role": "assistant", "content": "extra unmatched"},
+    ]
+
+    expected = _old_matcher(copy.deepcopy(context), copy.deepcopy(display), 2)
+    actual = session_ops.truncate_context_for_display_keep(context, display, 2)
+    assert actual == expected == context[:2]
+
+
 def test_alignment_differential_randomized_against_origin_matcher():
     rng = random.Random(5096)
     roles = ["user", "assistant", "tool", None]
     collision_values = [True, False, 0, 0.0, 1, 1.0]
-    for _ in range(150):
-        context_len = rng.randrange(0, 9)
-        display_len = rng.randrange(0, 9)
+    for _ in range(500):
+        context_len = rng.randrange(0, 30)
+        display_len = rng.randrange(0, 30)
         def make_row(index):
             if rng.random() < 0.15:
                 return rng.choice([None, "malformed", 17])
