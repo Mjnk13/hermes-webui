@@ -31,12 +31,14 @@ const COMMANDS=[
   {name:'status',    desc:t('cmd_status'),   fn:cmdStatus},
   {name:'voice',     desc:t('cmd_voice'),    fn:cmdVoice,     noEcho:true},
   {name:'reasoning', desc:t('cmd_reasoning'), fn:cmdReasoning, arg:'show|hide|none|minimal|low|medium|high|xhigh|max', subArgs:['show','hide','none','minimal','low','medium','high','xhigh','max'], noEcho:true},
+  {name:'fast', desc:t('cmd_fast'), fn:cmdFast, arg:'status|fast|normal|on|off', subArgs:['status','fast','normal','on','off'], noEcho:true},
   {name:'yolo', desc:t('cmd_yolo'), fn:cmdYolo, noEcho:true},
   {name:'branch', desc:t('cmd_branch'), fn:cmdBranch, arg:'[name]', noEcho:true},
 ];
 
 const SLASH_SUBARG_SOURCES={
   model:{desc:t('cmd_model'), subArgs:'models'},
+  account:{desc:t('cmd_account'), subArgs:'accounts'},
   personality:{desc:t('cmd_personality'), subArgs:'personalities'},
 };
 
@@ -238,6 +240,8 @@ function getMatchingCommands(prefix){
 let _forcedSkillDirectivePending=null;
 let _slashModelCache=null;
 let _slashModelCachePromise=null;
+let _slashAccountCache=null;
+let _slashAccountCachePromise=null;
 let _slashPersonalityCache=null;
 let _slashPersonalityCachePromise=null;
 let _bundleCommandCache=[];
@@ -344,6 +348,30 @@ async function _loadSlashPersonalitySubArgs(force=false){
   return _slashPersonalityCachePromise;
 }
 
+async function _loadSlashAccountSubArgs(force=false){
+  if(_slashAccountCache&&!force) return _slashAccountCache;
+  if(_slashAccountCachePromise&&!force) return _slashAccountCachePromise;
+  _slashAccountCachePromise=(async()=>{
+    try{
+      const data=await api('/api/accounts');
+      const values=['use'];
+      for(const account of (data&&data.accounts)||[]){
+        const name=_normalizeSlashSubArg(account&&account.name);
+        if(name) values.push('use '+name);
+      }
+      const deduped=Array.from(new Set(values)).sort((a,b)=>a.localeCompare(b));
+      _slashAccountCache=deduped;
+      return deduped;
+    }catch(_){
+      _slashAccountCache=['use'];
+      return _slashAccountCache;
+    }finally{
+      _slashAccountCachePromise=null;
+    }
+  })();
+  return _slashAccountCachePromise;
+}
+
 async function _loadSlashSkillSubArgs(force=false){
   if(_slashSkillCache&&!force) return _slashSkillCache;
   if(_slashSkillCachePromise&&!force) return _slashSkillCachePromise;
@@ -379,6 +407,7 @@ function invalidateSlashSkillCaches(){
 function _getSlashSubArgOptions(spec){
   if(Array.isArray(spec)) return Promise.resolve(spec.slice());
   if(spec==='models') return _loadSlashModelSubArgs();
+  if(spec==='accounts') return _loadSlashAccountSubArgs();
   if(spec==='personalities') return _loadSlashPersonalitySubArgs();
   if(spec==='skills') return _loadSlashSkillSubArgs();
   return Promise.resolve([]);
@@ -432,6 +461,60 @@ async function executeAgentPluginCommand(text,_meta){
   return _runAgentCommandTransport(text,_meta);
 }
 
+function _accountSwitchNameFromCommand(command){
+  const m=String(command||'').trim().match(/^\/?account\s+use\s+([a-z0-9_-]+)\s*$/i);
+  return m?m[1]:'';
+}
+
+async function _syncCurrentSessionAfterAccountSwitch(command){
+  const requested=_accountSwitchNameFromCommand(command);
+  if(!requested) return null;
+  const data=await api('/api/accounts');
+  const active=String(data&&data.active||'').trim();
+  if(active!==requested) return null;
+  const account=((data&&data.accounts)||[]).find(a=>a&&String(a.name||'').trim()===active);
+  if(!account) return null;
+
+  const provider=String(account.provider||'').trim();
+  const accountModel=String(account.model||'').trim();
+  if(provider) window._activeProvider=provider;
+
+  const sel=typeof $==='function' ? $('modelSelect') : null;
+  const currentModel=String(S&&S.session&&S.session.model||sel&&sel.value||'').trim();
+  const nextModel=accountModel||currentModel;
+  const nextProvider=provider||null;
+  if(nextModel&&sel&&typeof _applyModelToDropdown==='function'){
+    _applyModelToDropdown(nextModel,sel,nextProvider);
+  }
+  if(typeof _writePersistedModelState==='function'&&nextModel){
+    _writePersistedModelState(nextModel,nextProvider);
+  }
+
+  if(!S||!S.session||!S.session.session_id) return account;
+  S.session.model=nextModel||S.session.model||'';
+  S.session.model_provider=nextProvider;
+  try{
+    const updated=await api('/api/session/update',{
+      method:'POST',
+      body:JSON.stringify({
+        session_id:S.session.session_id,
+        model:S.session.model,
+        model_provider:nextProvider,
+      }),
+    });
+    if(updated&&updated.session){
+      S.session.model=updated.session.model||S.session.model;
+      S.session.model_provider=updated.session.model_provider||nextProvider;
+    }
+  }catch(e){
+    try{console.warn('[webui] failed to sync current session after account switch', e&&e.message||e);}catch(_){}
+  }
+  if(typeof syncTopbar==='function') syncTopbar();
+  if(typeof renderSessionListFromCache==='function') renderSessionListFromCache();
+  else if(typeof renderSessionList==='function') void renderSessionList();
+  return account;
+}
+
 async function _runAgentCommandTransport(text,_meta){
   const command=String(text||'').trim();
   if(!command) throw new Error('command is required');
@@ -439,7 +522,12 @@ async function _runAgentCommandTransport(text,_meta){
     method:'POST',
     body:JSON.stringify({command})
   });
-  return String(data&&data.output||'(no output)');
+  const output=String(data&&data.output||'(no output)');
+  if(_accountSwitchNameFromCommand(command)){
+    try{await _syncCurrentSessionAfterAccountSwitch(command);}
+    catch(e){try{console.warn('[webui] account switch session sync failed', e&&e.message||e);}catch(_){} }
+  }
+  return output;
 }
 
 async function resolveBundleCommand(text,_meta){
@@ -870,6 +958,19 @@ async function _applyManualCompressionResult(data, focusTopic, visibleCount, com
       renderMessages();
       await renderSessionList();
       updateQueueBadge(S.session.session_id);
+      if(typeof _syncCtxIndicator==='function'){
+        const compactUsage={
+          context_length:S.session.context_length||0,
+          threshold_tokens:S.session.threshold_tokens||0,
+          last_prompt_tokens:S.session.last_prompt_tokens||0,
+          compression_count:S.session.compression_count||0,
+          post_compression_context_tokens_estimate:S.session.post_compression_context_tokens_estimate||null,
+        };
+        S.lastUsage=typeof _mergeUsageForCtxIndicator==='function'
+          ? _mergeUsageForCtxIndicator(compactUsage,S.lastUsage||{})
+          : {...(S.lastUsage||{}),...compactUsage};
+        _syncCtxIndicator(S.lastUsage);
+      }
     }
   }
   const summary=data&&data.summary;
@@ -1282,7 +1383,7 @@ async function cmdGoal(args){
  * /queue <message> — Explicitly queue a message for the next turn.
  * Works regardless of the default message mode setting.
  */
-async function cmdQueue(args){
+async function cmdQueue(args,options){
   const msg=(args||'').trim();
   if(!msg){showToast(t('cmd_queue_no_msg'));return;}
   // If nothing is running, /queue <msg> just sends like a normal message
@@ -1293,9 +1394,10 @@ async function cmdQueue(args){
     return;
   }
   if(!S.session){showToast(t('no_active_session'));return;}
-  queueSessionMessage(S.session.session_id,{text:msg,files:[...S.pendingFiles],model:S.session&&S.session.model||($('modelSelect')&&$('modelSelect').value)||'',profile:S.activeProfile||'default'});
+  const context=_busyCommandContext(options);
+  queueSessionMessage(S.session.session_id,{text:msg,files:[...S.pendingFiles],context_items:context.contextItems,browser_context_parts:context.browserContextParts,parts:context.parts,model:S.session&&S.session.model||($('modelSelect')&&$('modelSelect').value)||'',profile:S.activeProfile||'default'});
   updateQueueBadge(S.session.session_id);
-  S.pendingFiles=[];renderTray();
+  S.pendingFiles=[];_clearDeliveredBusyContext(context.contextItems);renderTray();
   showToast(t('cmd_queue_confirm'),2000);
 }
 
@@ -1303,7 +1405,7 @@ async function cmdQueue(args){
  * /interrupt <message> — Cancel the current turn and send a new message.
  * Calls cancelStream() then queues the message so the drain picks it up.
  */
-async function cmdInterrupt(args){
+async function cmdInterrupt(args,options){
   const msg=(args||'').trim();
   if(!msg){showToast(t('cmd_interrupt_no_msg'));return;}
   // If nothing is running, /interrupt <msg> just sends like a normal message
@@ -1314,10 +1416,11 @@ async function cmdInterrupt(args){
     return;
   }
   if(!S.session){showToast(t('no_active_session'));return;}
+  const context=_busyCommandContext(options);
   // Queue the message first (before cancel sets busy=false and drains)
-  queueSessionMessage(S.session.session_id,{text:msg,files:[...S.pendingFiles],model:S.session&&S.session.model||($('modelSelect')&&$('modelSelect').value)||'',profile:S.activeProfile||'default'});
+  queueSessionMessage(S.session.session_id,{text:msg,files:[...S.pendingFiles],context_items:context.contextItems,browser_context_parts:context.browserContextParts,parts:context.parts,model:S.session&&S.session.model||($('modelSelect')&&$('modelSelect').value)||'',profile:S.activeProfile||'default'});
   updateQueueBadge(S.session.session_id);
-  S.pendingFiles=[];renderTray();
+  S.pendingFiles=[];_clearDeliveredBusyContext(context.contextItems);renderTray();
   // Cancel the active stream; setBusy(false) will drain the queue
   if(typeof cancelStream==='function'){await cancelStream('slash-interrupt');}
   showToast(t('cmd_interrupt_confirm'),2000);
@@ -1336,10 +1439,12 @@ async function cmdInterrupt(args){
  * is restored to the composer so the user can choose Queue or Interrupt
  * explicitly instead of WebUI silently cancelling the current run.
  */
-async function cmdSteer(args){
+async function cmdSteer(args,options){
   const msg=(args||'').trim();
   const hasPendingFiles=typeof S!=='undefined'&&Array.isArray(S.pendingFiles)&&S.pendingFiles.length>0;
-  if(!msg&&!hasPendingFiles){showToast(t('cmd_steer_no_msg'));return;}
+  const context=_busyCommandContext(options);
+  const hasContext=context.contextItems.length>0;
+  if(!msg&&!hasPendingFiles&&!hasContext){showToast(t('cmd_steer_no_msg'));return;}
   // If nothing is running, /steer <msg> just sends like a normal message
   if(!S.busy||!S.activeStreamId){
     const inp=$('msg');
@@ -1348,7 +1453,7 @@ async function cmdSteer(args){
     return;
   }
   if(!S.session){showToast(t('no_active_session'));return;}
-  await _trySteer(msg, /*explicitSteer=*/true);
+  await _trySteer(msg||(hasContext?'Please inspect the selected Browser Workbench element.':''), /*explicitSteer=*/true,context);
 }
 
 function _steerFailureMessageKey(fallback) {
@@ -1358,7 +1463,7 @@ function _steerFailureMessageKey(fallback) {
     ? key : 'steer_fail_unknown';
 }
 
-function _showSteerIndicator(text){
+function _showSteerIndicator(text,contextItems,browserContextParts){
   const inner=document.getElementById('msgInner');
   if(!inner) return;
   // Remove any existing steer indicator
@@ -1370,8 +1475,20 @@ function _showSteerIndicator(text){
   badge.className='steer-badge';
   badge.textContent='Steer';
   const body=document.createElement('span');
-  body.className='steer-body';
-  body.textContent=text.length>120?text.slice(0,117)+'…':text;
+  body.className='steer-body composer-editor steer-message-editor';
+  body.contentEditable='false';
+  const displayText=String(text||'');
+  const clippedText=displayText.length>120?displayText.slice(0,117)+'…':displayText;
+  const elementParts=(Array.isArray(browserContextParts)?browserContextParts:[]).filter(part=>part&&(part.type==='browser_element'||part.type==='browser-element'));
+  const fallbackParts=(Array.isArray(contextItems)?contextItems:[]).map(item=>({type:'browser_element',item}));
+  const displayParts=elementParts.length?elementParts:fallbackParts;
+  const richParts=displayParts.length?[...(clippedText?[{type:'text',content:clippedText+' '}]:[]),...displayParts]:[];
+  if(!richParts.length||typeof window==='undefined'||typeof window._composerSetBrowserContextParts!=='function'||!window._composerSetBrowserContextParts(body,richParts)){
+    body.textContent=clippedText;
+  }else{
+    body.querySelectorAll('.composer-browser-context-remove').forEach(remove=>remove.remove());
+    body.querySelectorAll('.composer-browser-context-pill').forEach(pill=>pill.setAttribute('role','note'));
+  }
   el.appendChild(badge);
   el.appendChild(body);
   inner.appendChild(el);
@@ -1439,6 +1556,24 @@ function _steerUploadedAttachmentPaths(uploaded){
     if(typeof u==='string')return u;
     return u.path||u.name||u.filename||'';
   }).map(v=>String(v||'').trim()).filter(Boolean);
+}
+
+function _busyCommandContext(options){
+  const opts=options&&typeof options==='object'?options:{};
+  const contextItems=Array.isArray(opts.contextItems)?[...opts.contextItems]:(typeof S!=='undefined'&&Array.isArray(S.pendingContextItems)?[...S.pendingContextItems]:[]);
+  let browserContextParts=Array.isArray(opts.browserContextParts)?[...opts.browserContextParts]:(Array.isArray(opts.parts)?[...opts.parts]:[]);
+  if(!browserContextParts.length&&typeof window!=='undefined'&&typeof window._composerBrowserContextPartsForSend==='function')browserContextParts=window._composerBrowserContextPartsForSend();
+  const parts=Array.isArray(opts.parts)&&opts.parts.length?[...opts.parts]:[...browserContextParts];
+  return {contextItems,browserContextParts,parts};
+}
+
+function _clearDeliveredBusyContext(contextItems){
+  if(typeof S==='undefined'||!Array.isArray(S.pendingContextItems)||!Array.isArray(contextItems)||!contextItems.length)return false;
+  const delivered=new Set(contextItems);
+  const remaining=S.pendingContextItems.filter(item=>!delivered.has(item));
+  if(remaining.length===S.pendingContextItems.length)return false;
+  S.pendingContextItems=remaining;
+  return true;
 }
 
 function _steerOwnerIsCurrent(ownerSid){
@@ -1543,12 +1678,16 @@ async function _steerTextWithPendingFiles(msg, ownerSid, filesSnapshot){
   return base?`${base}\n\n${note}`:note;
 }
 
-async function _trySteer(msg, explicitSteer){
+async function _trySteer(msg, explicitSteer, options){
   let result=null;
   const originalMsg=String(msg||'').trim();
   const ownerSid=(typeof S!=='undefined'&&S.session&&S.session.session_id)||null;
   const ownerStreamId=(typeof S!=='undefined'&&(S.activeStreamId||(S.session&&S.session.active_stream_id)))||null;
   const pendingFilesSnapshot=typeof S!=='undefined'&&Array.isArray(S.pendingFiles)?[...S.pendingFiles]:[];
+  const context=_busyCommandContext(options);
+  const pendingContextItemsSnapshot=context.contextItems;
+  const pendingBrowserContextPartsSnapshot=context.browserContextParts;
+  const pendingMessagePartsSnapshot=context.parts;
   const ownerProfile=typeof S!=='undefined'&&(S.activeProfile||'default');
   const ownerModelState=typeof _chatPayloadModelState==='function'
     ? _chatPayloadModelState()
@@ -1589,7 +1728,7 @@ async function _trySteer(msg, explicitSteer){
   try{
     result=await api('/api/chat/steer',{
       method:'POST',
-      body:JSON.stringify({session_id:ownerSid,text:steerText}),
+      body:JSON.stringify({session_id:ownerSid,text:steerText,context_items:pendingContextItemsSnapshot.length?pendingContextItemsSnapshot:undefined,browser_context_parts:pendingBrowserContextPartsSnapshot.length?pendingBrowserContextPartsSnapshot:undefined,parts:pendingMessagePartsSnapshot.length?pendingMessagePartsSnapshot:undefined}),
     });
   }catch(e){
     // Network or server error — keep the active stream running and restore the draft.
@@ -1614,7 +1753,8 @@ async function _trySteer(msg, explicitSteer){
         const _remaining=S.pendingFiles.filter(f=>!_delivered.has(f));
         if(_remaining.length!==S.pendingFiles.length){S.pendingFiles=_remaining;if(typeof renderTray==='function')renderTray();}
       }
-      _showSteerIndicator(_steerIndicatorText(originalMsg,pendingFilesSnapshot));
+      if(_clearDeliveredBusyContext(pendingContextItemsSnapshot)&&typeof renderTray==='function')renderTray();
+      _showSteerIndicator(_steerIndicatorText(originalMsg,pendingFilesSnapshot),pendingContextItemsSnapshot,pendingBrowserContextPartsSnapshot);
     }
     showToast(t('cmd_steer_delivered'),2500);
     return true;
@@ -1624,6 +1764,9 @@ async function _trySteer(msg, explicitSteer){
     queueSessionMessage(ownerSid,{
       text:originalMsg,
       files:pendingFilesSnapshot,
+      context_items:pendingContextItemsSnapshot,
+      browser_context_parts:pendingBrowserContextPartsSnapshot,
+      parts:pendingMessagePartsSnapshot,
       model:ownerModelState.model,
       model_provider:ownerModelState.model_provider,
       profile:ownerProfile,
@@ -1634,6 +1777,9 @@ async function _trySteer(msg, explicitSteer){
       const _queued=new Set(pendingFilesSnapshot);
       const _remaining=S.pendingFiles.filter(f=>!_queued.has(f));
       if(_remaining.length!==S.pendingFiles.length){S.pendingFiles=_remaining;if(typeof renderTray==='function')renderTray();}
+    }
+    if(_steerOwnerIsCurrent(ownerSid)){
+      if(_clearDeliveredBusyContext(pendingContextItemsSnapshot)&&typeof renderTray==='function')renderTray();
     }
     showToast(t('steer_leftover_queued'),3000);
     return true;
@@ -1867,6 +2013,38 @@ function cmdReasoning(args){
     return true;
   }
   showToast('Unknown argument: '+arg+' \u2014 use show|hide|'+EFFORTS.join('|'));
+  return true;
+}
+
+function cmdFast(args){
+  const arg=(args||'').trim().toLowerCase();
+  const FAST='⚡';
+  function _fmtStatus(st){
+    const mode=(st&&st.fast_mode)==='fast'?'fast':'normal';
+    const supported=st&&st.supports_fast_mode===false?' · not available for this model':'';
+    return FAST+' Fast mode: '+mode+supported+'  |  /fast fast|normal|on|off';
+  }
+  if(!arg||arg==='status'){
+    const q=(typeof _fastModeQuery==='function')?_fastModeQuery():'';
+    api('/api/fast'+q).then(function(st){showToast(_fmtStatus(st));})
+      .catch(function(){showToast(FAST+' /fast — status unavailable');});
+    return true;
+  }
+  if(['fast','on','priority','normal','off','default','standard'].includes(arg)){
+    const payload=Object.assign(
+      {mode:(arg==='on'||arg==='priority')?'fast':(arg==='off'||arg==='default'||arg==='standard')?'normal':arg},
+      (typeof _fastModeContext==='function')?_fastModeContext():{}
+    );
+    api('/api/fast',{method:'POST',body:JSON.stringify(payload)})
+      .then(function(st){
+        const mode=(st&&st.fast_mode)||payload.mode;
+        showToast(FAST+' Fast mode: '+mode+' (saved; applies to next turn)');
+        if(typeof _applyFastChip==='function') _applyFastChip(mode, st||{});
+      })
+      .catch(function(e){showToast(FAST+' Failed to set fast mode: '+(e&&e.message?e.message:arg));});
+    return true;
+  }
+  showToast('Unknown argument: '+arg+' \u2014 use fast|normal|on|off');
   return true;
 }
 function cmdVoice(){

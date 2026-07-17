@@ -444,19 +444,26 @@ function _artifactCandidatesFromText(text){
   const seen = new Set();
   const add = (path) => {
     path = _normalizeArtifactPath(path);
-    if(!path || seen.has(path)) return;
+    if(!path || path==='/dev/null' || seen.has(path)) return;
     seen.add(path); out.push({path, kind:'diff'});
   };
-  // Fallback text mining is intentionally narrow: only diff/patch fences imply
-  // the session changed a file. Prose mentions such as "edited package.json" are
-  // too noisy for an Artifacts list that should track write/edit outputs.
-  const fenced = /```(?:diff|patch)\s*\n[\s\S]*?```/gi;
+  const scanDiffLikeBlock = (block) => {
+    if(!block) return;
+    let m;
+    const fileHeader = /(?:^|\n)(?:\+\+\+|---)\s+(?:[ab]\/)?([^\n\t]+)/g;
+    while((m = fileHeader.exec(block))) add(m[1].trim());
+    const v4aHeader = /(?:^|\n)\*\*\*\s+(?:Update|Add|Delete) File:\s*([^\n]+)/g;
+    while((m = v4aHeader.exec(block))) add(m[1].trim());
+  };
+  // Fallback text mining is intentionally narrow: only diff/patch-looking
+  // output implies the session changed a file. This includes fenced diffs,
+  // raw unified diffs from CLI/restored tool rows, and raw V4A patches from
+  // Hermes mutation tools. Prose mentions such as "edited package.json" remain
+  // too noisy for an Artifacts / Modified Files list.
+  const fenced = /```(?:diff|patch)\s*\n([\s\S]*?)```/gi;
   let m;
-  while((m = fenced.exec(text))){
-    const block = m[0];
-    const fm = block.match(/(?:^|\n)(?:\+\+\+|---)\s+(?:[ab]\/)?([^\n\t]+)/);
-    if(fm) add(fm[1].trim());
-  }
+  while((m = fenced.exec(text))) scanDiffLikeBlock(m[1] || m[0]);
+  if(_workspaceDiffLooksUseful(text)) scanDiffLikeBlock(text);
   return out;
 }
 
@@ -464,16 +471,23 @@ function _artifactCandidatesFromToolCall(tc){
   if(!tc) return [];
   const name = String(tc.name || '').replace(/^functions\./,'');
   const args = tc.arguments || tc.args || tc.input || {};
+  const preview = tc.mutation_preview || tc.mutationPreview || {};
   const result = tc.result || tc.output || tc.snippet || '';
   const out = [];
   const add = (path, source=name || 'tool') => {
     path = _normalizeArtifactPath(path);
     if(path) out.push({path, kind:source});
   };
+  if(preview && Array.isArray(preview.files)){
+    preview.files.forEach(file=>add(file && file.path, file && (file.source || preview.source) || name || 'tool'));
+  }
   if(ARTIFACT_MUTATION_TOOLS.has(name) && args && typeof args === 'object'){
     for(const key of ['path','file_path','source','destination']) add(args[key]);
     if(Array.isArray(args.paths)) args.paths.forEach(p=>add(p));
     if(Array.isArray(args.edits)) args.edits.forEach(e=>add(e&&e.path));
+    for(const key of ['patch','diff']){
+      if(typeof args[key]==='string') for(const a of _artifactCandidatesFromText(args[key])) out.push(a);
+    }
   }
   const resultText = typeof result === 'string' ? result : (result ? JSON.stringify(result) : '');
   // Tool results may include unified diffs from patch-style tools; scan those
@@ -487,21 +501,727 @@ function _artifactCandidatesFromToolCall(tc){
 }
 
 const _turnMutatedPreviewPaths = new Set();
+const _changedThisTurnItems = new Map();
+
+function _workspaceDisplayPath(path){
+  path = _normalizeArtifactPath(path);
+  if(!path) return '';
+  const ws = S.session && S.session.workspace;
+  const normWs = ws ? ws.replace(/\/+$/,'') + '/' : '';
+  if(normWs && path.startsWith(normWs)) return path.slice(normWs.length);
+  return path;
+}
+
+function _changedTurnKindForSource(source){
+  const name = String(source || '').replace(/^functions\./,'').toLowerCase();
+  if(name.includes('create')) return 'Created';
+  if(name.includes('delete') || name.includes('remove')) return 'Deleted';
+  if(name.includes('patch') || name.includes('edit')) return 'Edited';
+  if(name.includes('write')) return 'Written';
+  if(name === 'diff') return 'Edited';
+  return 'Changed';
+}
+
+function _workspaceDiffLineStats(diff){
+  const stats={added:0,removed:0};
+  if(!diff) return stats;
+  for(const line of String(diff).replace(/\r\n/g,'\n').split('\n')){
+    if(line.startsWith('+++')||line.startsWith('---')) continue;
+    if(line.startsWith('+')) stats.added++;
+    else if(line.startsWith('-')) stats.removed++;
+  }
+  return stats;
+}
+
+function _workspaceDiffStatsLabel(stats){
+  if(!stats) return '';
+  const added=Number(stats.added||0);
+  const removed=Number(stats.removed||0);
+  if(!added&&!removed) return '';
+  return `+${added} -${removed}`;
+}
+
+function assistantModifiedDiffStatsText(item){
+  if(!item) return '';
+  if(item.stats) return _workspaceDiffStatsLabel(item.stats);
+  if(item.added!==undefined||item.removed!==undefined) return _workspaceDiffStatsLabel(item);
+  if(item.diff) return _workspaceDiffStatsLabel(_workspaceDiffLineStats(item.diff));
+  return '';
+}
+
+function _workspaceDiffTextCandidate(value){
+  if(!value) return '';
+  if(typeof value === 'string') return value;
+  try{ return JSON.stringify(value,null,2); }catch(_){ return String(value); }
+}
+
+function _workspaceEmbeddedDiffTextCandidate(value, depth){
+  depth=Number(depth||0);
+  if(value==null||depth>4) return '';
+  if(typeof value==='object'){
+    for(const key of ['diff','patch']){
+      if(value[key]){
+        const candidate=_workspaceEmbeddedDiffTextCandidate(value[key],depth+1);
+        if(candidate&&_workspaceDiffLooksUseful(candidate)) return candidate;
+      }
+    }
+    for(const key of ['result','data','output']){
+      if(value[key]&&typeof value[key]==='object'){
+        const candidate=_workspaceEmbeddedDiffTextCandidate(value[key],depth+1);
+        if(candidate) return candidate;
+      }
+    }
+    return '';
+  }
+  const text=String(value||'');
+  const trimmed=text.trim();
+  if(trimmed.startsWith('{')||trimmed.startsWith('[')){
+    try{
+      const candidate=_workspaceEmbeddedDiffTextCandidate(JSON.parse(trimmed),depth+1);
+      if(candidate) return candidate;
+    }catch(_){}
+  }
+  return _workspaceDiffLooksUseful(text)?text:'';
+}
+
+function _workspaceDiffLooksUseful(text){
+  const lines=String(text||'').replace(/\r\n/g,'\n').split('\n');
+  if(!lines.some(line=>String(line||'').trim())) return false;
+  const hasGitHeader=lines.some(line=>/^diff --git\s+\S+\s+\S+/.test(line));
+  const hasBinaryMarker=lines.some(line=>/^(?:Binary files .* differ|GIT binary patch)$/.test(line));
+  const hasV4aAction=lines.some(line=>/^\*\*\*\s+(?:Update|Add|Delete) File:\s*\S/.test(line));
+  const hasNumericHunk=lines.some(line=>/^@@\s+-\d+(?:,\d+)?\s+\+\d+(?:,\d+)?\s+@@/.test(line));
+  const hasBareHunk=lines.some(line=>/^@@\s*$/.test(line));
+  const hasBareV4aHunk=hasV4aAction&&lines.some(line=>/^@@(?:\s.*)?$/.test(line));
+  const hasChangeLine=lines.some(line=>/^[+-](?![+-])/.test(line));
+  let hasFileHeaderPair=false;
+  for(let i=0;i<lines.length;i++){
+    if(!/^---\s+\S/.test(lines[i])) continue;
+    let j=i+1;
+    while(j<lines.length&&!String(lines[j]||'').trim()) j++;
+    if(j<lines.length&&/^\+\+\+\s+\S/.test(lines[j])){hasFileHeaderPair=true;break;}
+  }
+  // Section separators such as "--- Ahead/Behind ---" are not diffs. Require
+  // corroborating patch structure rather than accepting one prefix in isolation.
+  if(hasV4aAction) return hasChangeLine||hasBareV4aHunk||hasNumericHunk;
+  if(hasGitHeader&&hasBinaryMarker) return true;
+  if(hasGitHeader||hasFileHeaderPair) return (hasNumericHunk||hasBareHunk)&&hasChangeLine;
+  return hasNumericHunk&&hasChangeLine;
+}
+
+function _workspaceDiffPositionQuality(diff){
+  const text=String(diff||'');
+  if(!text.trim()) return 0;
+  if(/^@@\s+-\d+(?:,\d+)?\s+\+\d+(?:,\d+)?\s+@@/m.test(text)) return 2;
+  return 1;
+}
+
+function _workspaceV4aPatchBlocks(text){
+  const lines=String(text||'').replace(/\r\n/g,'\n').split('\n');
+  const blocks=[];
+  let current=null;
+  const flush=()=>{
+    if(!current) return;
+    const path=_normalizeArtifactPath(current.path);
+    if(path){
+      const display=_workspaceDisplayPath(path)||path;
+      const header=current.action==='Add'
+        ? [`--- /dev/null`,`+++ ${display}`]
+        : current.action==='Delete'
+          ? [`--- ${display}`,`+++ /dev/null`]
+          : [`--- ${display}`,`+++ ${display}`];
+      const body=current.lines.filter(line=>!/^\*\*\* End Patch\s*$/.test(line));
+      blocks.push({path,display,action:current.action,text:[...header,...body].join('\n').slice(0,50000)});
+    }
+    current=null;
+  };
+  for(const line of lines){
+    const match=String(line||'').match(/^\*\*\*\s+(Update|Add|Delete) File:\s*(.+?)\s*$/);
+    if(match){
+      flush();
+      current={action:match[1],path:match[2],lines:[]};
+      continue;
+    }
+    if(/^\*\*\* Begin Patch\s*$/.test(String(line||''))) continue;
+    if(current) current.lines.push(String(line||''));
+  }
+  flush();
+  return blocks;
+}
+
+function _workspaceDiffForPath(diffText, path){
+  const text=String(diffText||'');
+  if(!text||!_workspaceDiffLooksUseful(text)) return '';
+  const cleanPath=_workspaceDisplayPath(path||'');
+  const wantedPath=_normalizeArtifactPath(path||'');
+  const v4aBlocks=_workspaceV4aPatchBlocks(text);
+  if(v4aBlocks.length){
+    if(wantedPath){
+      const block=v4aBlocks.find(part => part.path===wantedPath || part.display===cleanPath || part.text.includes(cleanPath));
+      if(block) return block.text;
+    }
+    return v4aBlocks.map(block=>block.text).join('\n').slice(0,50000);
+  }
+  if(!cleanPath) return text.slice(0,50000);
+  const escaped=cleanPath.replace(/[.*+?^${}()|[\]\\]/g,'\\$&');
+  const gitBlocks=text.split(/(?=^diff --git\s+)/m).filter(Boolean);
+  if(gitBlocks.length>1){
+    const block=gitBlocks.find(part => new RegExp(`(?:^|\\s)(?:a/|b/)?${escaped}(?:\\s|$)`).test(part));
+    if(block) return block.slice(0,50000);
+  }
+  return text.slice(0,50000);
+}
+
+function _workspaceToolCallDiffText(fakeTc, path){
+  if(!fakeTc) return '';
+  const preview=fakeTc.mutation_preview || fakeTc.mutationPreview || {};
+  const candidates=[];
+  // tool.completed results often contain a structured, full-file diff with
+  // authoritative hunk coordinates. Prefer it over the provisional live
+  // preview, which may have been generated from positionless snippets.
+  const completedResult=fakeTc.result || fakeTc.output || fakeTc.snippet || '';
+  const completedDiff=_workspaceEmbeddedDiffTextCandidate(completedResult);
+  if(completedDiff) candidates.push(completedDiff);
+  if(preview && Array.isArray(preview.files)){
+    const wanted=_normalizeArtifactPath(path);
+    const match=preview.files.find(file=>file && _normalizeArtifactPath(file.path)===wanted) || preview.files[0];
+    if(match && match.diff) candidates.push(_workspaceDiffTextCandidate(match.diff));
+  }
+  const args=(fakeTc.args&&typeof fakeTc.args==='object')?fakeTc.args:{};
+  for(const key of ['diff','patch']){
+    if(args[key]) candidates.push(_workspaceDiffTextCandidate(args[key]));
+  }
+  const resultText=_workspaceDiffTextCandidate(completedResult);
+  if(resultText&&!completedDiff) candidates.push(resultText);
+  if(args.old_string!==undefined&&args.new_string!==undefined){
+    const file=_workspaceDisplayPath(path||args.path||args.file_path||'file');
+    candidates.push(`--- ${file}\n+++ ${file}\n@@\n${String(args.old_string).split('\n').map(line=>'-'+line).join('\n')}\n${String(args.new_string).split('\n').map(line=>'+'+line).join('\n')}`);
+  }
+  const toolName=String(fakeTc.name||'').replace(/^functions\./,'').toLowerCase();
+  const contentValue=args.content!==undefined?args.content:(args.newContent!==undefined?args.newContent:args.new_content);
+  if(contentValue!==undefined && (toolName.includes('write')||toolName.includes('create'))){
+    candidates.push(_workspaceUnifiedDiffFromContent(path||args.path||args.file_path||'file', contentValue));
+  }
+  for(const candidate of candidates){
+    const diff=_workspaceDiffForPath(candidate,path);
+    if(diff) return diff;
+  }
+  return '';
+}
+
+function _assistantDiffHunkParts(line){
+  const match=String(line||'').match(/^(@@\s+-(\d+)(?:,(\d+))?\s+\+(\d+)(?:,(\d+))?\s+@@)(?:\s+(.*))?$/);
+  if(match) return {
+    header:match[1],
+    oldLine:Number(match[2]),
+    oldCount:match[3]===undefined?null:Number(match[3]),
+    newLine:Number(match[4]),
+    newCount:match[5]===undefined?null:Number(match[5]),
+    section:String(match[6]||'').trim(),
+  };
+  return null;
+}
+function _workspaceUnifiedDiffFromContent(path, content){
+  const file=_workspaceDisplayPath(path||'file')||String(path||'file');
+  const lines=String(content||'').replace(/\r\n/g,'\n').split('\n');
+  if(lines.length&&lines[lines.length-1]==='') lines.pop();
+  const count=Math.max(1,lines.length);
+  const body=lines.length?lines.map(line=>'+'+line).join('\n'):'+';
+  return `--- ${file}\n+++ ${file}\n@@ -0,0 +1,${count} @@\n${body}`;
+}
+
+function _assistantUnifiedDiffLines(diff){
+  const lines=String(diff||'').replace(/\r\n/g,'\n').split('\n');
+  const useful=lines.filter(line=>String(line||'').trim());
+  if(!useful.length) return lines;
+  const commonIndent=useful.reduce((min,line)=>{
+    const match=String(line||'').match(/^\s*/);
+    const indent=match?match[0].length:0;
+    return Math.min(min,indent);
+  },Infinity);
+  if(Number.isFinite(commonIndent)&&commonIndent>0){
+    return lines.map(line=>{
+      const text=String(line||'');
+      const match=text.match(/^\s*/);
+      const indent=match?match[0].length:0;
+      return text.slice(Math.min(commonIndent,indent));
+    });
+  }
+  return lines;
+}
+function _assistantDiffLineNumberRows(diff, maxLines, opts){
+  opts=opts||{};
+  const lines=_assistantUnifiedDiffLines(diff);
+  const limit=Number.isFinite(Number(maxLines))?Number(maxLines):lines.length;
+  const visible=lines.slice(0,limit);
+  const gapThreshold=Number.isFinite(Number(opts.gapThreshold))?Number(opts.gapThreshold):3;
+  let oldLine=null;
+  let newLine=null;
+  const rows=[];
+  for(const line of visible){
+    const raw=String(line||'');
+    const probe=raw.trimStart();
+    let cls='assistant-code-diff-line';
+    let oldNo='';
+    let newNo='';
+    let marker='';
+    let code=raw || ' ';
+    const hunk=_assistantDiffHunkParts(probe);
+    let hunkSection='';
+    if(hunk){
+      const oldGap=Number.isFinite(oldLine)?Math.max(0,hunk.oldLine-oldLine):0;
+      const newGap=Number.isFinite(newLine)?Math.max(0,hunk.newLine-newLine):0;
+      const gap=Math.max(oldGap,newGap);
+      if(rows.length&&gap>gapThreshold){
+        rows.push({
+          cls:'assistant-code-diff-line assistant-code-diff-gap',
+          oldNo:'',newNo:'',marker:'',
+          code:`${gap} unmodified line${gap===1?'':'s'}`,
+          separator:true,
+        });
+      }
+      oldLine=hunk.oldLine;
+      newLine=hunk.newLine;
+      code=hunk.header;
+      hunkSection=hunk.section;
+      cls+=' assistant-code-diff-hunk';
+    }else if(probe.startsWith('@@')){
+      oldLine=null;
+      newLine=null;
+      code=probe;
+      cls+=' assistant-code-diff-hunk';
+    }else if(probe.startsWith('diff --git')||probe.startsWith('---')||probe.startsWith('+++')){
+      oldLine=null;
+      newLine=null;
+      code=probe;
+      cls+=' assistant-code-diff-meta';
+    }else if(probe.startsWith('index ')){
+      code=probe;
+      cls+=' assistant-code-diff-meta';
+    }else if(raw.startsWith('+')){
+      cls+=' assistant-code-diff-added';
+      oldNo='';
+      newNo=Number.isFinite(newLine)?String(newLine):'';
+      marker='+';
+      code=raw.slice(1)||' ';
+      if(Number.isFinite(newLine)) newLine+=1;
+    }else if(raw.startsWith('-')){
+      cls+=' assistant-code-diff-removed';
+      oldNo=Number.isFinite(oldLine)?String(oldLine):'';
+      newNo='';
+      marker='-';
+      code=raw.slice(1)||' ';
+      if(Number.isFinite(oldLine)) oldLine+=1;
+    }else{
+      oldNo=Number.isFinite(oldLine)?String(oldLine):'';
+      newNo=Number.isFinite(newLine)?String(newLine):'';
+      marker=raw.startsWith(' ')?' ':'';
+      code=raw.startsWith(' ')?(raw.slice(1)||' '):(raw||' ');
+      if(Number.isFinite(oldLine)) oldLine+=1;
+      if(Number.isFinite(newLine)) newLine+=1;
+    }
+    rows.push({cls,oldNo,newNo,marker,code});
+    if(hunkSection){
+      rows.push({
+        cls:'assistant-code-diff-line assistant-code-diff-hunk-context',
+        oldNo:'',newNo:'',marker:'',code:hunkSection,
+        hunkContext:true,
+      });
+    }
+  }
+  return {total:lines.length,visible:visible.length,rows};
+}
+function _assistantModifiedDiffRowsHtml(rows){
+  return (rows||[]).map(row=>{
+    return `<span class="${row.cls}">`+
+      `<span class="assistant-code-diff-gutter assistant-code-diff-old" aria-label="old line ${_escHtml(row.oldNo)}">${_escHtml(row.oldNo)}</span>`+
+      `<span class="assistant-code-diff-gutter assistant-code-diff-new" aria-label="new line ${_escHtml(row.newNo)}">${_escHtml(row.newNo)}</span>`+
+      `<span class="assistant-code-diff-marker" aria-hidden="true">${_escHtml(row.marker||' ')}</span>`+
+      `<span class="assistant-code-diff-code">${_escHtml(row.code)}</span>`+
+      `</span>`;
+  }).join('');
+}
+function _assistantDiffGutterAttributes(rows){
+  let oldDigits=3;
+  let newDigits=3;
+  for(const row of (rows||[])){
+    oldDigits=Math.max(oldDigits,String(row&&row.oldNo||'').length);
+    newDigits=Math.max(newDigits,String(row&&row.newNo||'').length);
+  }
+  return ` data-diff-old-digits="${oldDigits}" data-diff-new-digits="${newDigits}"`+
+    ` style="--diff-old-gutter-width:calc(${oldDigits}ch + 15px);--diff-new-gutter-width:calc(${newDigits}ch + 15px)"`;
+}
+function toggleAssistantModifiedDiff(button, expand){
+  const wrap=button&&button.closest?button.closest('.assistant-modified-diff-wrap'):null;
+  if(!wrap) return;
+  const expanded=!!expand;
+  wrap.setAttribute('data-expanded',expanded?'1':'0');
+  const shortPre=wrap.querySelector('.assistant-code-diff.is-truncated');
+  const fullPre=wrap.querySelector('.assistant-code-diff.is-full');
+  const more=wrap.querySelector('[data-diff-action="more"]');
+  const less=wrap.querySelector('[data-diff-action="less"]');
+  if(shortPre) shortPre.hidden=expanded;
+  if(fullPre) fullPre.hidden=!expanded;
+  if(more) more.hidden=expanded;
+  if(less) less.hidden=!expanded;
+}
+
+function assistantModifiedDiffHtml(diff, opts){
+  const text=String(diff||'');
+  if(!text.trim()) return '<div class="assistant-modified-diff-empty">No inline diff is available for this file yet.</div>';
+  opts=opts||{};
+  const maxLines=opts.maxLines||180;
+  const parsed=_assistantDiffLineNumberRows(text,maxLines,opts);
+  const rows=_assistantModifiedDiffRowsHtml(parsed.rows);
+  // A live card starts with only the minimum gutter width. The stream
+  // controller expands each column when a mounted row introduces a wider line
+  // number. Settled cards still size themselves from the complete diff.
+  const gutterAttrs=_assistantDiffGutterAttributes(opts.simulateStream?[]:parsed.rows);
+  const streamAttr=opts.simulateStream?' data-diff-stream="1"':'';
+  const clipped=parsed.total>parsed.visible;
+  if(clipped&&opts.allowExpand){
+    const fullParsed=_assistantDiffLineNumberRows(text,text.split(/\r?\n/).length,opts);
+    const fullRows=_assistantModifiedDiffRowsHtml(fullParsed.rows);
+    const fullGutterAttrs=_assistantDiffGutterAttributes(fullParsed.rows);
+    return `<div class="assistant-modified-diff-wrap" data-expanded="0">`+
+      `<pre class="assistant-code-diff is-truncated"${streamAttr} data-diff-lines="${parsed.visible}"${gutterAttrs}><code>${rows}</code></pre>`+
+      `<pre class="assistant-code-diff is-full" data-diff-lines="${fullParsed.visible}"${fullGutterAttrs} hidden><code>${fullRows}</code></pre>`+
+      `<div class="assistant-modified-diff-clipped">Diff truncated after ${parsed.visible} lines. <button type="button" class="assistant-modified-diff-toggle" data-diff-action="more" onclick="toggleAssistantModifiedDiff(this,true)">view_more</button><button type="button" class="assistant-modified-diff-toggle" data-diff-action="less" onclick="toggleAssistantModifiedDiff(this,false)" hidden>view_less</button></div>`+
+      `</div>`;
+  }
+  const message=clipped?`<div class="assistant-modified-diff-clipped">Diff truncated after ${parsed.visible} lines.</div>`:'';
+  return `<pre class="assistant-code-diff"${streamAttr} data-diff-lines="${parsed.visible}"${gutterAttrs}><code>${rows}</code></pre>${message}`;
+}
+
+function _isChangedTurnActive(){
+  return !!(S && (S.busy || S.activeStreamId));
+}
+
+function _changedTurnItems(){
+  return Array.from(_changedThisTurnItems.values()).slice(0, 24);
+}
+
+function renderChangedThisTurn(){
+  const panel = $('changedTurnPanel');
+  const list = $('changedTurnList');
+  const count = $('changedTurnCount');
+  if(!panel || !list) return;
+  const items = _changedTurnItems();
+  const active = _isChangedTurnActive();
+  panel.hidden = !items.length && !active;
+  if(count) count.textContent = String(items.length);
+  if(!items.length){
+    list.innerHTML = '<div class="changed-turn-empty">No file edits detected yet.</div>';
+    return;
+  }
+  list.innerHTML = items.map(item => {
+    const path = _normalizeArtifactPath(item.path);
+    const display = _workspaceDisplayPath(path);
+    const kind = _changedTurnKindForSource(item.source);
+    return `<div class="changed-turn-row" data-changed-turn-path="${_escHtml(path)}">`+
+      `<button type="button" class="changed-turn-file" onclick="openChangedTurnPath(this.closest('.changed-turn-row').dataset.changedTurnPath)">`+
+      `<span class="changed-turn-icon" aria-hidden="true">◇</span>`+
+      `<span class="changed-turn-path" title="${_escHtml(display)}">${_escHtml(display)}</span>`+
+      `</button>`+
+      `<span class="changed-turn-actions">`+
+      `<span class="changed-turn-kind">${_escHtml(kind)}</span>`+
+      `<button type="button" class="changed-turn-diff" title="View current git diff vs HEAD" onclick="openWorkspaceGitDiff(this.closest('.changed-turn-row').dataset.changedTurnPath)">Git diff</button>`+
+      `</span>`+
+      `</div>`;
+  }).join('');
+}
+
+function openChangedTurnPath(path){
+  if(!path) return;
+  openArtifactPath(path);
+}
+
+function _workspaceGitDiffModal(){
+  let modal=document.getElementById('workspaceGitDiffModal');
+  if(modal) return modal;
+  modal=document.createElement('div');
+  modal.id='workspaceGitDiffModal';
+  modal.className='workspace-diff-modal';
+  modal.hidden=true;
+  modal.innerHTML=`<div class="workspace-diff-backdrop" onclick="closeWorkspaceGitDiff()"></div>`+
+    `<section class="workspace-diff-dialog" role="dialog" aria-modal="true" aria-labelledby="workspaceGitDiffTitle">`+
+    `<div class="workspace-diff-head">`+
+    `<div><div id="workspaceGitDiffTitle" class="workspace-diff-title">Git diff</div>`+
+    `<div class="workspace-diff-baseline"></div></div>`+
+    `<button type="button" class="workspace-diff-close" onclick="closeWorkspaceGitDiff()" aria-label="Close git diff">×</button>`+
+    `</div>`+
+    `<pre class="workspace-diff-body"></pre>`+
+    `</section>`;
+  document.body.appendChild(modal);
+  return modal;
+}
+
+function closeWorkspaceGitDiff(){
+  const modal=document.getElementById('workspaceGitDiffModal');
+  if(modal) modal.hidden=true;
+}
+
+function _renderWorkspaceGitDiff(data){
+  const modal=_workspaceGitDiffModal();
+  const title=modal.querySelector('.workspace-diff-title');
+  const baseline=modal.querySelector('.workspace-diff-baseline');
+  const body=modal.querySelector('.workspace-diff-body');
+  const file=data&&data.path?String(data.path):'selected file';
+  const label=data&&data.baseline_label?String(data.baseline_label):'Current workspace git diff vs HEAD';
+  if(title) title.textContent=`Git diff · ${file}`;
+  if(baseline) baseline.textContent=`Baseline: ${label}. This is repository state, not a per-turn checkpoint diff.`;
+  if(body) body.textContent=(data&&data.diff&&String(data.diff).trim())?String(data.diff):'No git diff for this file relative to HEAD.';
+  modal.hidden=false;
+}
+
+function _setAssistantModifiedDiffPanel(card, data, sourceLabel){
+  if(!card) return;
+  const panel=card.querySelector('.assistant-modified-diff-panel');
+  if(!panel) return;
+  const diff=data&&data.diff?String(data.diff):'';
+  const stats=_workspaceDiffLineStats(diff);
+  const statsEl=card.querySelector('.assistant-modified-file-stats');
+  if(statsEl){
+    const label=_workspaceDiffStatsLabel(stats);
+    if(typeof _assistantModifiedFileStatsHtml==='function') statsEl.outerHTML=_assistantModifiedFileStatsHtml({stats},label);
+    else{
+      statsEl.textContent=label||'No diff';
+      statsEl.classList.toggle('is-empty',!label);
+    }
+  }
+  const baseline=data&&data.baseline_label?String(data.baseline_label):(sourceLabel||'Current workspace git diff vs HEAD');
+  const note=data&&data.baseline==='git:HEAD'
+    ? `<div class="assistant-modified-diff-note">${_escHtml(baseline)} · Current repository state, not a per-turn checkpoint diff.</div>`
+    : '';
+  panel.innerHTML=`${note}${assistantModifiedDiffHtml(diff,{allowExpand:true})}`;
+  card.setAttribute('data-diff-loaded','1');
+}
+
+async function loadAssistantModifiedDiff(card){
+  if(!card || !card.open || card.getAttribute('data-diff-loaded')==='1') return;
+  const panel=card.querySelector('.assistant-modified-diff-panel');
+  const path=card.getAttribute('data-modified-file-path')||'';
+  if(!panel || !path) return;
+  const workspace=S&&S.session&&S.session.workspace;
+  if(!workspace){
+    panel.innerHTML='<div class="assistant-modified-diff-empty">No workspace selected for loading the current Git diff.</div>';
+    card.setAttribute('data-diff-loaded','1');
+    return;
+  }
+  panel.innerHTML='<div class="assistant-modified-diff-empty">Loading current Git diff…</div>';
+  try{
+    const qs=new URLSearchParams({workspace,path});
+    const data=await api('/api/workspace/git-diff?'+qs.toString());
+    _setAssistantModifiedDiffPanel(card,data||{},'Current workspace git diff vs HEAD');
+  }catch(e){
+    panel.innerHTML=`<div class="assistant-modified-diff-empty">Git diff unavailable: ${_escHtml(e&&e.message?e.message:e)}</div>`;
+    card.setAttribute('data-diff-loaded','1');
+  }
+}
+
+async function openWorkspaceGitDiff(path){
+  if(!path) return;
+  const workspace=S&&S.session&&S.session.workspace;
+  if(!workspace){
+    if(typeof showToast==='function') showToast('No workspace selected for git diff.',2600,'warning');
+    return;
+  }
+  try{
+    const qs=new URLSearchParams({workspace,path});
+    const data=await api('/api/workspace/git-diff?'+qs.toString());
+    _renderWorkspaceGitDiff(data||{});
+  }catch(e){
+    if(typeof showToast==='function') showToast('Git diff unavailable: '+(e&&e.message?e.message:e),4200,'error');
+  }
+}
 
 function resetTurnWorkspaceMutations(){
   _turnMutatedPreviewPaths.clear();
+  _changedThisTurnItems.clear();
+  renderChangedThisTurn();
 }
 
 function noteWorkspaceMutationsFromToolCall(tc){
   for(const a of _artifactCandidatesFromToolCall(tc)){
     const path=_normalizeArtifactPath(a.path);
-    if(path) _turnMutatedPreviewPaths.add(path);
+    if(path){
+      _turnMutatedPreviewPaths.add(path);
+      _changedThisTurnItems.set(path,{path,source:a.kind||tc.name||'tool'});
+    }
   }
+  renderChangedThisTurn();
 }
 
 function noteWorkspaceMutationsFromToolCalls(toolCalls){
   if(!Array.isArray(toolCalls)) return;
   for(const tc of toolCalls) noteWorkspaceMutationsFromToolCall(tc);
+}
+
+function _coerceArtifactToolCall(tc){
+  if(!tc || typeof tc !== 'object') return null;
+  const fn = (tc.function && typeof tc.function === 'object') ? tc.function : tc;
+  const name = fn.name || tc.name || '';
+  let args = fn.arguments || tc.arguments || tc.args || tc.input || {};
+  if(typeof args === 'string'){
+    try{ args = JSON.parse(args); }catch(_){}
+  }
+  return {
+    name,
+    args,
+    result: tc.result || tc.output || tc.snippet || '',
+    output: tc.output || '',
+    snippet: tc.snippet || tc.preview || '',
+    mutation_preview:tc.mutation_preview || tc.mutationPreview || null,
+    mutationPreview:tc.mutationPreview || tc.mutation_preview || null,
+    done:tc.done,
+    is_error:tc.is_error,
+  };
+}
+
+function _workspaceMutationFailureDetails(fakeTc){
+  if(!fakeTc||typeof fakeTc!=='object') return '';
+  const preview=fakeTc.mutation_preview||fakeTc.mutationPreview||{};
+  if(preview&&Array.isArray(preview.files)){
+    const failedFile=preview.files.find(file=>file&&file.failed);
+    if(failedFile){
+      return String(
+        failedFile.failure_details||failedFile.failureDetails||failedFile.error||
+        failedFile.message||failedFile.status||'The patch tool reported a failure.'
+      ).trim();
+    }
+  }
+  const inspect=(value,depth)=>{
+    if(value==null||depth>4) return '';
+    if(Array.isArray(value)){
+      for(const item of value){const found=inspect(item,depth+1);if(found)return found;}
+      return '';
+    }
+    if(typeof value==='object'){
+      const status=String(value.status||'').trim().toLowerCase();
+      const failed=value.success===false||value.ok===false||['error','failed','failure','invalid'].includes(status)||!!value.error;
+      if(failed){
+        return String(value.error||value.message||value.detail||value.details||'The patch tool reported a failure.').trim();
+      }
+      for(const key of ['result','data','output']){
+        const found=inspect(value[key],depth+1);
+        if(found)return found;
+      }
+      return '';
+    }
+    const text=String(value||'').trim();
+    if(!text) return '';
+    if(text.startsWith('{')||text.startsWith('[')){
+      try{const found=inspect(JSON.parse(text),depth+1);if(found)return found;}catch(_){}
+    }
+    if(/patch validation failed|patch (?:could not|couldn.t) be applied|failed to apply (?:the )?patch|invalid context/i.test(text)) return text;
+    return '';
+  };
+  for(const value of [fakeTc.result,fakeTc.output,fakeTc.snippet]){
+    const found=inspect(value,0);
+    if(found) return found.slice(0,20000);
+  }
+  if(fakeTc.is_error){
+    const fallback=_workspaceDiffTextCandidate(fakeTc.result||fakeTc.output||fakeTc.snippet||'');
+    return (fallback.trim()||'The patch tool reported a failure.').slice(0,20000);
+  }
+  return '';
+}
+
+function assistantMessageModifiedFiles(msg, rawIdx){
+  const items=[];
+  const byPath=new Map();
+  const push=(path, source, fakeTc)=>{
+    path=_normalizeArtifactPath(path);
+    if(!path) return;
+    const failureDetails=_workspaceMutationFailureDetails(fakeTc);
+    const failed=!!failureDetails;
+    const completed=!!(fakeTc&&fakeTc.done===true);
+    const diff=failed?'':_workspaceToolCallDiffText(fakeTc,path);
+    const stats=_workspaceDiffLineStats(diff);
+    const existing=byPath.get(path);
+    if(existing){
+      if(failed){
+        existing.failed=true;
+        existing.failure_details=failureDetails;
+        existing.status='Patch could not be applied';
+        existing.pending=false;
+        existing.diff='';
+        existing.stats=null;
+        existing.raw_output='';
+        existing.succeeded=false;
+        return;
+      }
+      if(completed){
+        existing.failed=false;
+        existing.failure_details='';
+        existing.status='';
+        existing.pending=false;
+        existing.succeeded=true;
+      }
+      if(diff&&_workspaceDiffPositionQuality(diff)>_workspaceDiffPositionQuality(existing.diff)){
+        existing.diff=diff;
+        existing.stats=stats;
+      }
+      const rawOutput=_workspaceDiffTextCandidate(fakeTc&&(fakeTc.result || fakeTc.output || fakeTc.snippet || ''));
+      if(rawOutput&&!existing.raw_output) existing.raw_output=rawOutput;
+      return;
+    }
+    const item={
+      path,
+      source:source||'tool',
+      failed,
+      failure_details:failureDetails,
+      succeeded:completed&&!failed,
+    };
+    if(failed){
+      item.status='Patch could not be applied';
+      byPath.set(path,item);
+      items.push(item);
+      return;
+    }
+    const rawOutput=_workspaceDiffTextCandidate(fakeTc&&(fakeTc.result || fakeTc.output || fakeTc.snippet || ''));
+    if(rawOutput) item.raw_output=rawOutput;
+    if(diff){
+      item.diff=diff;
+      item.stats=stats;
+    }else if(fakeTc&&(fakeTc.done===false || (fakeTc.mutation_preview&&Array.isArray(fakeTc.mutation_preview.files)&&fakeTc.mutation_preview.files.some(f=>f&&f.pending)))){
+      item.pending=true;
+      const pendingFile=fakeTc.mutation_preview&&Array.isArray(fakeTc.mutation_preview.files)?fakeTc.mutation_preview.files.find(f=>f&&f.pending):null;
+      item.status=(pendingFile&&pendingFile.status)||'Writing file…';
+    }
+    byPath.set(path,item);
+    items.push(item);
+  };
+  const pushToolCall=(tc)=>{
+    const fakeTc=_coerceArtifactToolCall(tc);
+    if(!fakeTc) return;
+    const preview=fakeTc.mutation_preview || fakeTc.mutationPreview || {};
+    if(preview && Array.isArray(preview.files)){
+      for(const file of preview.files){
+        if(!file || !file.path) continue;
+        const itemTc={...fakeTc, mutation_preview:{files:[file], source:preview.source || fakeTc.name || 'tool'}};
+        push(file.path, file.source || preview.source || fakeTc.name || 'tool', itemTc);
+      }
+      return;
+    }
+    for(const a of _artifactCandidatesFromToolCall(fakeTc)) push(a.path, a.kind || fakeTc.name || 'tool', fakeTc);
+  };
+  if(msg&&Array.isArray(msg.tool_calls)){
+    for(const tc of msg.tool_calls) pushToolCall(tc);
+  }
+  if(msg&&Array.isArray(msg.content)){
+    for(const block of msg.content){
+      if(!block || block.type !== 'tool_use') continue;
+      pushToolCall({name:block.name||'', args:block.input||{}, result:block.result||''});
+    }
+  }
+  if(typeof rawIdx === 'number' && Array.isArray(S.toolCalls)){
+    for(const tc of S.toolCalls){
+      if(!tc || Number(tc.assistant_msg_idx)!==rawIdx) continue;
+      pushToolCall(tc);
+    }
+  }
+  return items.slice(0, 24);
 }
 
 function _isOpenPreviewPathMutated(){
@@ -598,29 +1318,64 @@ async function _workspacePathExists(path){
   const data=await api(`/api/list?session_id=${encodeURIComponent(S.session.session_id)}&path=${encodeURIComponent(dir)}`);
   return (data.entries||[]).some(entry=>entry&&((entry.path===path)||entry.name===name));
 }
+function _workspaceOpenFileDiagnostic(attemptedPath, reason){
+  const workspace=S&&S.session&&S.session.workspace?String(S.session.workspace):'';
+  const parts=['Could not open this file.'];
+  parts.push('It may be outside the current workspace, the workspace path may be different, or the file may have been deleted.');
+  const details=[];
+  if(attemptedPath) details.push(`attempted path: ${attemptedPath}`);
+  details.push(`active workspace root: ${workspace||'none selected'}`);
+  if(reason) details.push(`reason: ${reason}`);
+  return `${parts.join(' ')} ${details.join(' · ')}`;
+}
+function _workspaceNormalizeOpenArtifactPath(path){
+  const attempted=String(path||'').trim();
+  const ws=S&&S.session&&S.session.workspace?String(S.session.workspace).replace(/\/+$/,''):'';
+  if(!S.session) return {attempted,rel:'',reason:'workspace not selected'};
+  if(!ws) return {attempted,rel:'',reason:'workspace not selected'};
+  let rel=attempted.replace(/^~\//,'').replace(/^\.\/+/,'');
+  const absolute=/^(?:\/|[A-Za-z]:[\/])/.test(rel);
+  if(absolute){
+    const normWs=ws+'/';
+    if(rel===ws) rel='.';
+    else if(rel.startsWith(normWs)) rel=rel.slice(normWs.length);
+    else return {attempted,rel:'',reason:'outside workspace'};
+  }
+  rel=rel.replace(/^\/+/, '');
+  if(!rel) rel='.';
+  if(rel==='..'||rel.startsWith('../')||rel.includes('/../')) return {attempted,rel:'',reason:'outside workspace'};
+  return {attempted,rel,reason:''};
+}
+function _showWorkspaceOpenFileDiagnostic(attemptedPath, reason){
+  const message=_workspaceOpenFileDiagnostic(attemptedPath,reason);
+  if(typeof setStatus==='function') setStatus(message);
+  if(typeof showToast==='function') showToast(message,6500,'error');
+}
 
 async function openArtifactPath(path){
   if(!path) return;
   switchWorkspacePanelTab('files');
-  let rel = path.replace(/^~\//,'').replace(/^\.\/+/,'');
-  // Strip workspace prefix so /api/list receives a workspace-relative path.
-  const ws = S.session && S.session.workspace;
-  if(ws){
-    const normWs = ws.replace(/\/+$/,'') + '/';
-    if(rel.startsWith(normWs)) rel = rel.slice(normWs.length);
-    else if(rel === ws.replace(/\/+$/,'')) rel = '.';
-  }
-  if(!rel) rel = '.';
-  try{
-    if(!(await _workspacePathExists(rel))){
-      setStatus(t('file_open_failed'));
-      return;
-    }
-  }catch(_){
-    setStatus(t('file_open_failed'));
+  const normalized=_workspaceNormalizeOpenArtifactPath(path);
+  if(normalized.reason){
+    _showWorkspaceOpenFileDiagnostic(normalized.attempted, normalized.reason);
     return;
   }
-  openFile(rel);
+  const rel=normalized.rel;
+  try{
+    if(!(await _workspacePathExists(rel))){
+      _showWorkspaceOpenFileDiagnostic(normalized.attempted||rel, 'file not found');
+      return;
+    }
+  }catch(e){
+    const msg=String(e&&e.message?e.message:e||'');
+    const reason=/permission|denied|forbidden|unauthorized/i.test(msg)?'permission denied':(msg||'file not found');
+    _showWorkspaceOpenFileDiagnostic(normalized.attempted||rel, reason);
+    return;
+  }
+  await openFile(rel);
+  if(typeof ensureWorkspacePreviewVisible==='function') ensureWorkspacePreviewVisible();
+  else if(typeof openWorkspacePanel==='function') openWorkspacePanel('preview');
+  if(typeof setStatus==='function') setStatus(`Opened ${rel}`);
 }
 
 // ── Workspace file-tree loading skeleton (#4662 Phase 1) ────────────────────

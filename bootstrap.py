@@ -557,6 +557,62 @@ def _detect_supervisor() -> str | None:
     return None
 
 
+def _env_flag_value(name: str) -> str:
+    return os.environ.get(name, "").strip().lower()
+
+
+def _desktop_shell_enabled() -> bool:
+    """Return whether bootstrap should start the optional Electron shell.
+
+    Browser Workbench itself defaults on in WebUI (unless disabled with
+    HERMES_WEBUI_BROWSER_WORKBENCH=0/false).  The Electron desktop shell is an
+    optional native wrapper and is default-off unless explicitly enabled with
+    HERMES_WEBUI_DESKTOP_SHELL=1/true.
+    """
+    explicit = _env_flag_value("HERMES_WEBUI_DESKTOP_SHELL")
+    if explicit in {"1", "true", "yes", "on", "enabled"}:
+        return True
+    return False
+
+
+def _webui_url_for_desktop_shell(host: str, port: int) -> str:
+    connect_host = "127.0.0.1" if host in {"", "0.0.0.0", "::", "[::]"} else host
+    if ":" in connect_host and not connect_host.startswith("["):
+        connect_host = f"[{connect_host}]"
+    return f"http://{connect_host}:{port}"
+
+
+def _start_desktop_shell_sidecar(host: str, port: int, state_dir: Path) -> None:
+    """Best-effort Electron Browser Workbench sidecar for foreground launches."""
+    if not _desktop_shell_enabled():
+        return
+    if sys.platform == "win32":
+        info("Skipping Electron desktop shell autostart on native Windows.")
+        return
+    bash_path = shutil.which("bash") or "/bin/bash"
+    sidecar_script = REPO_ROOT / "scripts" / "start-browser-workbench-desktop.sh"
+    if not sidecar_script.exists():
+        info(f"Electron desktop shell helper not found: {sidecar_script}")
+        return
+    env = os.environ.copy()
+    webui_url = _webui_url_for_desktop_shell(host, port)
+    env["HERMES_WEBUI_URL"] = webui_url
+    env["HERMES_WEBUI_HEALTH_URL"] = f"{webui_url}/health"
+    env["HERMES_WEBUI_PID"] = str(os.getpid())
+    env["HERMES_WEBUI_STATE_DIR"] = str(state_dir)
+    env.setdefault("HERMES_WEBUI_DESKTOP_PID_FILE", str(state_dir / f"desktop-shell-{port}.pid"))
+    try:
+        os.spawnve(
+            os.P_NOWAIT,
+            bash_path,
+            [bash_path, str(sidecar_script)],
+            env,
+        )
+        info(f"Electron desktop Browser shell will open after WebUI is ready: {webui_url}")
+    except OSError as exc:
+        info(f"Could not start Electron desktop shell helper: {exc}")
+
+
 def main() -> int:
     args = parse_args()
     ensure_supported_platform()
@@ -616,6 +672,7 @@ def main() -> int:
                 f"Set HERMES_WEBUI_PYTHON to a working interpreter or fix "
                 f"the agent venv at {agent_dir}."
             )
+        _start_desktop_shell_sidecar(args.host, args.port, state_dir)
         # os.execv replaces the current process image. On Windows, execv
         # spawns a new process instead of replacing (Python calls CreateProcess),
         # orphaning it from any supervisor. Use Popen + exit there instead.

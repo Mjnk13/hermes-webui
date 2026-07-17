@@ -863,6 +863,16 @@ def _append_recovered_pending_turn(session, *, timestamp: int | None = None) -> 
         recovered['_source'] = pending_source
     if session.pending_attachments:
         recovered['attachments'] = list(session.pending_attachments)
+    pending_context_items = getattr(session, 'pending_context_items', None)
+    if pending_context_items:
+        recovered['context_items'] = list(pending_context_items)
+    pending_browser_context_parts = getattr(session, 'pending_browser_context_parts', None)
+    if pending_browser_context_parts:
+        recovered['browser_context_parts'] = list(pending_browser_context_parts)
+        recovered['parts'] = list(pending_browser_context_parts)
+    pending_client_message_id = getattr(session, 'pending_client_message_id', None)
+    if pending_client_message_id:
+        recovered['client_message_id'] = pending_client_message_id
     session.messages.append(recovered)
     _append_recovered_turn_to_context(session, recovered)
     # The new user turn is now committed to messages (#3831): advance the
@@ -1138,6 +1148,9 @@ class Session:
                  active_stream_id: str=None,
                  pending_user_message: str=None,
                  pending_attachments=None,
+                 pending_context_items=None,
+                 pending_browser_context_parts=None,
+                 pending_client_message_id: str=None,
                  pending_started_at=None,
                  pending_user_source: str=None,
                  context_messages=None,
@@ -1152,6 +1165,7 @@ class Session:
                  context_engine_state=None,
                  context_length=None, threshold_tokens=None,
                  last_prompt_tokens=None,
+                 compression_count: int=0,
                  post_compression_context_tokens_estimate=None,
                  compression_recovery=None,
                  recommended_recovery_action=None,
@@ -1207,6 +1221,9 @@ class Session:
         self.active_stream_id = active_stream_id
         self.pending_user_message = pending_user_message
         self.pending_attachments = pending_attachments or []
+        self.pending_context_items = pending_context_items if isinstance(pending_context_items, list) else []
+        self.pending_browser_context_parts = pending_browser_context_parts if isinstance(pending_browser_context_parts, list) else []
+        self.pending_client_message_id = str(pending_client_message_id).strip() if pending_client_message_id else None
         self.pending_started_at = pending_started_at
         self.pending_user_source = pending_user_source
         self.context_messages = context_messages if isinstance(context_messages, list) else []
@@ -1222,6 +1239,7 @@ class Session:
         self.context_length = context_length
         self.threshold_tokens = threshold_tokens
         self.last_prompt_tokens = last_prompt_tokens
+        self.compression_count = max(0, _parse_nonnegative_int(compression_count) or 0)
         _post_compression_tokens = _parse_nonnegative_int(post_compression_context_tokens_estimate)
         self.post_compression_context_tokens_estimate = (
             _post_compression_tokens if _post_compression_tokens and _post_compression_tokens > 0 else None
@@ -1314,12 +1332,14 @@ class Session:
             'input_tokens', 'output_tokens', 'estimated_cost',
             'cache_read_tokens', 'cache_write_tokens',
             'personality', 'active_stream_id',
-            'pending_user_message', 'pending_attachments', 'pending_started_at', 'pending_user_source',
+            'pending_user_message', 'pending_attachments', 'pending_context_items',
+            'pending_browser_context_parts', 'pending_client_message_id', 'pending_started_at', 'pending_user_source',
             'compression_anchor_visible_idx', 'compression_anchor_message_key',
             'compression_anchor_summary', 'pre_compression_snapshot',
             'context_engine', 'compression_anchor_engine', 'compression_anchor_mode',
             'compression_anchor_details', 'context_engine_state',
             'context_length', 'threshold_tokens', 'last_prompt_tokens',
+            'compression_count',
             'post_compression_context_tokens_estimate',
             'compression_recovery', 'recommended_recovery_action',
             'compression_recovery_source_session_id', 'compression_recovery_action',
@@ -1682,6 +1702,7 @@ class Session:
             'context_length': self.context_length,
             'threshold_tokens': self.threshold_tokens,
             'last_prompt_tokens': self.last_prompt_tokens,
+            'compression_count': self.compression_count,
             'post_compression_context_tokens_estimate': self.post_compression_context_tokens_estimate,
             'compression_recovery': self.compression_recovery,
             'recommended_recovery_action': self.recommended_recovery_action,
@@ -1704,6 +1725,10 @@ class Session:
             'user_message_count': Session._compute_user_message_count(self.messages),
             'active_stream_id': self.active_stream_id,
             'pending_user_message': self.pending_user_message,
+            'pending_attachments': self.pending_attachments,
+            'pending_context_items': self.pending_context_items,
+            'pending_browser_context_parts': self.pending_browser_context_parts,
+            'pending_client_message_id': self.pending_client_message_id,
             'has_pending_user_message': has_pending_user_message,
             'is_cli_session': self.is_cli_session,
             'source_tag': self.source_tag,
@@ -2978,6 +3003,8 @@ def _apply_core_sync_or_error_marker(
             session.active_stream_id = None
             session.pending_user_message = None
             session.pending_attachments = []
+            session.pending_context_items = []
+            session.pending_browser_context_parts = []
             session.pending_started_at = None
             session.pending_user_source = None
             session.save(touch_updated_at=touch_updated_at)
@@ -3001,6 +3028,11 @@ def _apply_core_sync_or_error_marker(
                 recovered['_source'] = pending_source
             if session.pending_attachments:
                 recovered['attachments'] = list(session.pending_attachments)
+            if getattr(session, 'pending_context_items', None):
+                recovered['context_items'] = list(session.pending_context_items)
+            if getattr(session, 'pending_browser_context_parts', None):
+                recovered['browser_context_parts'] = list(session.pending_browser_context_parts)
+                recovered['parts'] = list(session.pending_browser_context_parts)
             _append_recovered_turn_to_context(session, recovered)
         recovered_output = _append_journaled_partial_output(
             session,
@@ -3009,6 +3041,8 @@ def _apply_core_sync_or_error_marker(
         session.active_stream_id = None
         session.pending_user_message = None
         session.pending_attachments = []
+        session.pending_context_items = []
+        session.pending_browser_context_parts = []
         session.pending_started_at = None
         session.pending_user_source = None
         session.messages.append(
@@ -3068,6 +3102,8 @@ def _apply_core_sync_or_error_marker(
             session.active_stream_id = None
             session.pending_user_message = None
             session.pending_attachments = []
+            session.pending_context_items = []
+            session.pending_browser_context_parts = []
             session.pending_started_at = None
             session.pending_user_source = None
             if recovered_output:
@@ -3116,6 +3152,8 @@ def _apply_core_sync_or_error_marker(
     session.active_stream_id = None
     session.pending_user_message = None
     session.pending_attachments = []
+    session.pending_context_items = []
+    session.pending_browser_context_parts = []
     session.pending_started_at = None
     session.pending_user_source = None
     session.messages.append(

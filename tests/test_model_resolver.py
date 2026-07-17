@@ -109,6 +109,60 @@ def test_openai_prefix_stripped_for_direct_api():
     assert provider == 'openai'
 
 
+def test_active_account_overlays_model_provider_base_url(monkeypatch):
+    """active_account should route the WebUI through the account endpoint."""
+    old_cfg = dict(config.cfg)
+    config.cfg.clear()
+    config.cfg.update({
+        'model': {'default': 'gpt-5.4', 'provider': 'openai-codex'},
+        'accounts': {
+            'codex-lb': {
+                'provider': 'codex-lb',
+                'base_url': 'https://cigro-codex.million.tk/v1',
+                'key_env': 'CODEX_LB_API_KEY',
+                'api_mode': 'codex_responses',
+                'model': 'gpt-5.5',
+            },
+        },
+        'active_account': 'codex-lb',
+    })
+    try:
+        assert config.get_effective_default_model() == 'gpt-5.5'
+        model, provider, base_url = config.resolve_model_provider('gpt-5.5')
+    finally:
+        config.cfg.clear()
+        config.cfg.update(old_cfg)
+
+    assert model == 'gpt-5.5'
+    assert provider == 'codex-lb'
+    assert base_url == 'https://cigro-codex.million.tk/v1'
+
+
+def test_openai_pro_account_routes_through_codex_oauth_provider():
+    """Legacy openai-pro account config must use the existing Codex auth pool."""
+    old_cfg = dict(config.cfg)
+    config.cfg.clear()
+    config.cfg.update({
+        'model': {'default': 'gpt-5.4', 'provider': 'openai-codex'},
+        'accounts': {
+            'openai-pro': {
+                'provider': 'openai',
+                'model': 'gpt-5.4',
+            },
+        },
+        'active_account': 'openai-pro',
+    })
+    try:
+        model, provider, base_url = config.resolve_model_provider('gpt-5.4')
+    finally:
+        config.cfg.clear()
+        config.cfg.update(old_cfg)
+
+    assert model == 'gpt-5.4'
+    assert provider == 'openai-codex'
+    assert base_url is None
+
+
 # ── Cross-provider routing ───────────────────────────────────────────────
 
 def test_cross_provider_routes_through_openrouter():

@@ -94,6 +94,11 @@ that slice.
 - [`docs/UIUX-GUIDE.md`](UIUX-GUIDE.md): contributor-facing synthesis of the
   repository's UI/UX principles, sourced from existing project docs and code
   comments.
+- [`docs/rfcs/browser-workbench.md`](rfcs/browser-workbench.md): proposed
+  Cursor-style embedded Browser Workbench direction for a WebUI-owned browser
+  tab/pane, URL bar, interactive viewport, inspect/ping-to-prompt flow,
+  devtools-lite diagnostics, CDP/security boundaries, and the replacement for
+  the removed Browser Inspector bookmarklet prototype.
 - [`docs/ui-ux/index.html`](ui-ux/index.html): message-area inventory wired to
   the real app stylesheet.
 - [`docs/ui-ux/two-stage-proposal.html`](ui-ux/two-stage-proposal.html):

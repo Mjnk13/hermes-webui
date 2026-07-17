@@ -25,8 +25,9 @@ The drain thread:
        → ``routes.start_session_turn``). This needs NO browser round-trip, so
        the closed-tab case works exactly like CLI / Telegram / gateway
        self-wake. When a turn is already active the wakeup is NOT started here;
-       the ``PENDING_BG_TASK_COMPLETIONS`` marker is left for PR #2279's
-       next-turn drain (``api/streaming._drain_webui_process_notifications``).
+       it is persisted for the teardown drain. Async-delegation completions
+       additionally request a cache-safe handoff from the live parent agent so
+       it closes at the next tool boundary instead of running to its tool limit.
 
 The marker is *not* required for delivery — it's a telemetry-style flag the
 turn handler can read to know "this stream is a process_complete wakeup, not a
@@ -1033,6 +1034,13 @@ def _process_one(evt: dict) -> None:
                 # here cannot cause a double-fire — the atomic claim in
                 # ``claim_deferred_wakeups`` guarantees exactly one delivery.
                 record_deferred_wakeup(session_id, process_id, wakeup_prompt)
+                if str(evt.get("type") or "") == "async_delegation":
+                    # Persist first: even if the agent is between lifecycle
+                    # registries or lacks the new capability, teardown still
+                    # owns a lossless successor-turn delivery. The handoff is
+                    # only a latency/bounded-work improvement for the active
+                    # parent tool loop.
+                    _request_active_async_delegation_handoff(session_id)
                 logger.debug(
                     "server-side wakeup deferred: turn active for session %s "
                     "(persisted for turn-teardown idle-hook redelivery)",
@@ -1231,6 +1239,59 @@ def _session_has_active_turn(session_id: str) -> bool:
                     return True
     except Exception:
         logger.debug("ACTIVE_RUNS active-turn check failed", exc_info=True)
+    return False
+
+
+_ASYNC_DELEGATION_HANDOFF_REASON = (
+    "A background delegation completed while this parent turn was active."
+)
+
+
+def _request_active_async_delegation_handoff(session_id: str) -> bool:
+    """Ask the live local parent agent to close at its next tool boundary.
+
+    The completion payload is deliberately not passed here. ``_process_one``
+    persists it in ``DEFERRED_PROCESS_WAKEUPS`` first, and the ordinary
+    teardown drain owns exactly-once successor-turn delivery. This helper only
+    transports internal control intent, never user-authored conversation text.
+
+    ACTIVE_RUNS and AGENT_INSTANCES have independent locks. Snapshot them in
+    separate critical sections (ACTIVE_RUNS first, matching this module's
+    existing lock order) and invoke agent code only after both locks release.
+    """
+    from api import config as _cfg
+
+    try:
+        with _cfg.ACTIVE_RUNS_LOCK:
+            stream_ids = [
+                str(stream_id)
+                for stream_id, meta in (_cfg.ACTIVE_RUNS or {}).items()
+                if isinstance(meta, dict)
+                and meta.get("session_id") == session_id
+                and meta.get("backend") != "gateway"
+            ]
+        if not stream_ids:
+            return False
+        with _cfg.STREAMS_LOCK:
+            agents = [
+                _cfg.AGENT_INSTANCES.get(stream_id) for stream_id in stream_ids
+            ]
+        for agent in agents:
+            request_handoff = getattr(agent, "request_turn_handoff", None)
+            if not callable(request_handoff):
+                continue
+            if request_handoff(_ASYNC_DELEGATION_HANDOFF_REASON):
+                logger.info(
+                    "requested safe async-delegation handoff for active session %s",
+                    session_id,
+                )
+                return True
+    except Exception:
+        logger.warning(
+            "async-delegation handoff request failed for session %s",
+            session_id,
+            exc_info=True,
+        )
     return False
 
 

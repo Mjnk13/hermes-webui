@@ -152,21 +152,22 @@ class TestSessionNewSlowPathStillFiresWithoutProvider:
         """If the client really has nothing to send, the slow path must work."""
         from api.routes import _session_model_state_from_request
 
-        with patch("api.routes.get_available_models") as mock_catalog:
-            mock_catalog.return_value = {
-                "active_provider": "openai-codex",
-                "default_model": "gpt-5.5",
-                "groups": [
-                    {"provider_id": "openai-codex", "models": [{"id": "gpt-5.5"}]}
-                ],
-            }
-            model, provider = _session_model_state_from_request("gpt-5.5", None)
+        for active_provider in ("openai-codex", "codex-lb"):
+            with patch("api.routes.get_available_models") as mock_catalog:
+                mock_catalog.return_value = {
+                    "active_provider": active_provider,
+                    "default_model": "gpt-5.5",
+                    "groups": [
+                        {"provider_id": active_provider, "models": [{"id": "gpt-5.5"}]}
+                    ],
+                }
+                model, provider = _session_model_state_from_request("gpt-5.5", None)
 
-        # Slow path was taken because no provider was supplied.
-        assert mock_catalog.call_count == 1
-        # The slow path still returns a sane (model, provider) tuple.
-        assert model
-        assert provider
+            # Slow path was taken because no provider was supplied.
+            assert mock_catalog.call_count == 1
+            # The slow path still returns a sane (model, provider) tuple.
+            assert model == "gpt-5.5"
+            assert provider == active_provider
 
 
 # ---------------------------------------------------------------------------
@@ -441,7 +442,7 @@ class TestIssue2518FollowupSlashSlugGuard:
 
         def _norm_prov(p):
             s = (p or "").lower()
-            if s.startswith("openai"):
+            if s.startswith("openai") or s == "codex-lb":
                 return "openai"
             if s.startswith("anthropic") or s.startswith("claude"):
                 return "anthropic"
@@ -464,8 +465,9 @@ class TestIssue2518FollowupSlashSlugGuard:
         assert _wire_provider("claude-opus-4.8", None, "openrouter", None) is None
         # gemini-family bare model + anthropic active → MISMATCH → null
         assert _wire_provider("gemini-2.5-pro", None, "anthropic", None) is None
-        # gpt-family bare model + openai-codex active → MATCH → fast path
+        # gpt-family bare model + Codex active → MATCH → fast path
         assert _wire_provider("gpt-5.5", None, "openai-codex", None) == "openai-codex"
+        assert _wire_provider("gpt-5.5", None, "codex-lb", None) == "codex-lb"
         # claude-family bare model + anthropic active → MATCH → fast path
         assert _wire_provider("claude-opus-4.8", None, "anthropic", None) == "anthropic"
         # unknown-family bare model (e.g. a custom/local id) + any provider → attaches (no family signal)

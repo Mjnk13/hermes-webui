@@ -56,9 +56,9 @@ def test_composer_captured_and_cleared_before_upload_await():
     """The fix: capture + textarea wipe must run before uploadPendingFiles()."""
     body = _function_body(MESSAGES_JS, "send")
 
-    capture_idx = body.index("const _submittedDraftTextForClear=$('msg').value||'';")
+    capture_idx = body.index("const _submittedDraftTextForClear=queueDrain?'':($('msg').value||'');")
     # The wipe sits immediately after the capture.
-    wipe_rel = body.index("$('msg').value='';autoResize();", capture_idx)
+    wipe_rel = body.index("if(!queueDrain){$('msg').value='';autoResize();}", capture_idx)
     assert wipe_rel - capture_idx < 120, "the textarea wipe must sit immediately after the capture"
 
     upload_idx = body.index("uploaded=await uploadPendingFiles(")
@@ -128,6 +128,7 @@ def _run_reentrant_guard_in_node(composer_value: str):
         const state = { input: { value: %(composer_value)s } };
         const $ = (id) => (id === 'msg' ? state.input : null);
         global.document = { getElementById: (id) => $(id) };
+        global.window = {};
         // No pending inline selections in this scenario.
         const _pendingSelections = [];
         function _formatSelectedTextReplyQuote(t){ return t; }
@@ -137,7 +138,10 @@ def _run_reentrant_guard_in_node(composer_value: str):
         // Minimal in-flight state: a send is already running for sid-1.
         let _sendInProgress = true;
         let _sendInProgressSid = 'sid-1';
-        const S = { session: { session_id: 'sid-1' }, pendingFiles: [], activeProfile: 'default' };
+        const options = {};
+        const queuedMessage = null;
+        const queueDrain = false;
+        const S = { session: { session_id: 'sid-1' }, pendingFiles: [], pendingContextItems: [], activeProfile: 'default' };
 
         // Stubs the guard branch touches.
         function _chatPayloadModelState(){ return { model: 'm', model_provider: 'p' }; }

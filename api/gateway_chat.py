@@ -21,6 +21,7 @@ from api.config import (
     STREAM_PARTIAL_TEXT,
     STREAM_REASONING_TEXT,
     _get_session_agent_lock,
+    _main_model_request_overrides,
     coerce_reasoning_effort_for_model,
     gateway_approval_unavailable_reason,
     gateway_supports_approval,
@@ -270,11 +271,24 @@ def _gateway_stream_usage(payload: dict) -> dict:
     usage = payload.get("usage") if isinstance(payload, dict) else None
     if not isinstance(usage, dict):
         return {}
-    return {
+    normalized = {
         "input_tokens": int(usage.get("prompt_tokens") or usage.get("input_tokens") or 0),
         "output_tokens": int(usage.get("completion_tokens") or usage.get("output_tokens") or 0),
         "estimated_cost": usage.get("estimated_cost") or usage.get("estimated_cost_usd") or 0,
     }
+    optional = {
+        "context_length": usage.get("context_max") or usage.get("context_length"),
+        "last_prompt_tokens": usage.get("context_used") or usage.get("last_prompt_tokens"),
+        "compression_count": usage.get("compressions") or usage.get("compression_count"),
+    }
+    for field, value in optional.items():
+        try:
+            parsed = int(value or 0)
+        except (TypeError, ValueError):
+            parsed = 0
+        if parsed > 0:
+            normalized[field] = parsed
+    return normalized
 
 
 def _gateway_reasoning_delta(payload: dict) -> str:
@@ -613,6 +627,9 @@ def _clear_gateway_pending_state(session: Any, stream_id: str) -> None:
     session.active_stream_id = None
     session.pending_user_message = None
     session.pending_attachments = None
+    session.pending_context_items = []
+    session.pending_browser_context_parts = []
+    session.pending_client_message_id = None
     session.pending_started_at = None
     session.pending_user_source = None
     session.save()
@@ -779,8 +796,8 @@ def _run_gateway_chat_streaming(
                 body_extras["provider"] = model_provider
             if reasoning_effort is not None:
                 body_extras["reasoning_effort"] = reasoning_effort
-            if _gw_overrides.get("service_tier"):
-                body_extras["service_tier"] = _gw_overrides["service_tier"]
+            if _gw_overrides:
+                body_extras.update(_gw_overrides)
             try:
                 final_text, usage = _run_gateway_runs_api_streaming(
                     session_id, msg_text, model, workspace, stream_id,
@@ -854,8 +871,8 @@ def _run_gateway_chat_streaming(
                 body["provider"] = model_provider
             if reasoning_effort is not None:
                 body["reasoning_effort"] = reasoning_effort
-            if _gw_overrides.get("service_tier"):
-                body["service_tier"] = _gw_overrides["service_tier"]
+            if _gw_overrides:
+                body.update(_gw_overrides)
             req = urllib.request.Request(
                 url,
                 data=json.dumps(body).encode("utf-8"),
@@ -1005,8 +1022,18 @@ def _run_gateway_chat_streaming(
             pending_source = getattr(s, "pending_user_source", None) or "webui"
             if pending_source != "webui":
                 user_msg["_source"] = pending_source
+            pending_context_items = list(getattr(s, "pending_context_items", []) or [])
+            pending_browser_context_parts = list(getattr(s, "pending_browser_context_parts", []) or [])
+            pending_client_message_id = getattr(s, "pending_client_message_id", None)
             if attachments:
                 user_msg["attachments"] = list(attachments)
+            if pending_context_items:
+                user_msg["context_items"] = pending_context_items
+            if pending_browser_context_parts:
+                user_msg["browser_context_parts"] = pending_browser_context_parts
+                user_msg["parts"] = pending_browser_context_parts
+            if pending_client_message_id:
+                user_msg["client_message_id"] = pending_client_message_id
             assistant_msg = {"role": "assistant", "content": assistant_text, "timestamp": assistant_ts}
             saved_reasoning = STREAM_REASONING_TEXT.get(stream_id, "")
             if saved_reasoning:
@@ -1051,6 +1078,9 @@ def _run_gateway_chat_streaming(
                     previous_context,
                     s.context_messages,
                     str(msg_text or ""),
+                    current_context_items=pending_context_items,
+                    current_browser_context_parts=pending_browser_context_parts,
+                    current_client_message_id=pending_client_message_id,
                     source=pending_source,
                 )
             except Exception:
@@ -1067,11 +1097,21 @@ def _run_gateway_chat_streaming(
             s.active_stream_id = None
             s.pending_user_message = None
             s.pending_attachments = None
+            s.pending_context_items = []
+            s.pending_browser_context_parts = []
+            s.pending_client_message_id = None
             s.pending_started_at = None
             s.pending_user_source = None
             s.workspace = str(workspace)
             s.model = model
             s.model_provider = model_provider
+            try:
+                s.compression_count = max(
+                    int(getattr(s, "compression_count", 0) or 0),
+                    int(usage.get("compression_count") or 0),
+                )
+            except (TypeError, ValueError):
+                pass
 
             def _restore_cancelled_success_writeback():
                 if pending_source == "process_wakeup":
