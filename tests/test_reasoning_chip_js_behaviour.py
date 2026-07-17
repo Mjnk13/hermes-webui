@@ -162,6 +162,15 @@ class TestChipAlwaysVisible:
         assert out["label"] == "High"
         assert out["inactive"] is False
 
+    def test_xhigh_uses_human_extra_high_label(self, driver_path):
+        out = _apply(driver_path, "xhigh")
+        assert out["label"] == "Extra High"
+
+    def test_ultra_shows_distinct_label(self, driver_path):
+        out = _apply(driver_path, "ultra")
+        assert out["label"] == "Ultra"
+        assert out["inactive"] is False
+
 
 class TestNormalizationEdgeCases:
     """Pin the input-normalisation contract so it can't silently shift."""

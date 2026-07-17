@@ -462,8 +462,8 @@ def test_electron_native_backend_delegates_to_bridge_and_sanitizes_payload(monke
     assert inspect_handler.status == 200
     assert inspect_body["selection"]["selector"] == "#save"
     assert inspect_body["selection"]["component"] == "SaveButton"
-    assert inspect_body["selection"]["tag"] == "button"
-    assert inspect_body["selection"]["display_label"] == "SaveButton • button"
+    assert inspect_body["selection"]["tag"] == "BUTTON"
+    assert inspect_body["selection"]["display_label"] == "SaveButton · BUTTON"
     assert "cdp_endpoint" not in json.dumps(inspect_body)
     assert "debugger_url" not in json.dumps(inspect_body)
 
@@ -1256,7 +1256,9 @@ def test_browser_workbench_static_shell_is_wired_default_off_and_safe():
     assert "const renderElementLabel = (target, selection) =>" in desktop_main
     assert "display:inline-flex;align-items:center;gap:4px" in desktop_main
     assert "tagPart.textContent = tag" in desktop_main
-    assert "safeComponent + ' • ' + tag" in desktop_main
+    assert "const suffix = ' · ' + tag" in desktop_main
+    assert "componentPart.style.cssText = 'flex:1 1 auto;min-width:0;overflow:hidden" in desktop_main
+    assert "separatorPart.textContent = '·'" in desktop_main
     assert "renderElementLabel(state.label, selection)" in desktop_main
     assert "const frameMetaFor = (frame, sameOrigin)" in desktop_main
     assert "const inspectInDocument = (doc, x, y, topPoint, frames, depth)" in desktop_main
@@ -1819,8 +1821,8 @@ def test_browser_workbench_inspect_action_returns_sanitized_selection(monkeypatc
     assert inspect_handler.status == 200
     assert body["selection"]["selector"] == "#submit"
     assert body["selection"]["component"] == "SubmitButton"
-    assert body["selection"]["tag"] == "button"
-    assert body["selection"]["display_label"] == "SubmitButton • button"
+    assert body["selection"]["tag"] == "BUTTON"
+    assert body["selection"]["display_label"] == "SubmitButton · BUTTON"
     assert "cdp_endpoint" not in json.dumps(body)
 
 
@@ -1924,12 +1926,12 @@ def test_browser_context_items_are_normalized_and_formatted_for_prompt():
         {
             "type": "browser_element",
             "kind": "browser-element",
-            "display_label": "SubmitButton • button",
+            "display_label": "SubmitButton · BUTTON",
             "tab": "Browser 1",
             "url": "http://localhost:3000",
             "selector": "#submit",
             "component": "SubmitButton",
-            "tag": "button",
+            "tag": "BUTTON",
             "source": "src/App.jsx:12:4",
             "text": "Save <changes>",
             "rect": {"left": 10.12, "top": 5.0, "width": 40.0, "height": 20.0},
@@ -1943,8 +1945,8 @@ def test_browser_context_items_are_normalized_and_formatted_for_prompt():
     assert "<browser_workbench_context>" in block
     assert '<selected_browser_element index="1">' in block
     assert "<selector>#submit</selector>" in block
-    assert "<label>SubmitButton • button</label>" in block
-    assert "<tag>button</tag>" in block
+    assert "<label>SubmitButton · BUTTON</label>" in block
+    assert "<tag>BUTTON</tag>" in block
     assert "<frame>{&quot;sameOrigin&quot;: true, &quot;selector&quot;: &quot;iframe#storybook-preview-iframe&quot;" in block
     assert "<frames>[{&quot;sameOrigin&quot;: true, &quot;selector&quot;: &quot;iframe#storybook-preview-iframe&quot;" in block
     assert "Save &lt;changes&gt;" in block
@@ -1952,7 +1954,7 @@ def test_browser_context_items_are_normalized_and_formatted_for_prompt():
     assert "cdp_endpoint" not in block
 
 
-def test_browser_context_label_falls_back_to_lowercase_tag_without_component():
+def test_browser_context_label_preserves_detected_tag_without_component():
     normalized = browser_workbench._normalize_browser_context_items(
         [
             {
@@ -1966,8 +1968,16 @@ def test_browser_context_label_falls_back_to_lowercase_tag_without_component():
         ]
     )
 
-    assert normalized[0]["tag"] == "h1"
-    assert normalized[0]["display_label"] == "h1"
+    assert normalized[0]["tag"] == "H1"
+    assert normalized[0]["display_label"] == "H1"
+
+
+def test_browser_element_label_formatter_preserves_detected_html_and_svg_tags():
+    tags = ["section", "span", "div", "button", "input", "article", "header", "main", "svg", "path", "linearGradient"]
+
+    for tag in tags:
+        assert browser_workbench._sanitize_html_tag_name(tag) == tag
+        assert browser_workbench._browser_element_display_label("ReactComponentName", tag) == f"ReactComponentName · {tag}"
 
 
 def test_browser_workbench_boot_settings_drive_launcher_visibility():

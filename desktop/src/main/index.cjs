@@ -955,7 +955,7 @@ function nativeSelectionScript(sessionId, enabled) {
       }
       const frameList = Array.isArray(frames) ? frames.filter(Boolean) : [];
       const ownRect = { x: rect.x, y: rect.y, top: rect.top, left: rect.left, width: rect.width, height: rect.height };
-      return { type: 'browser_element', selector: selectorFor(el), tag: (el.localName || el.tagName || '').toLowerCase(), text: clip(el.innerText || el.textContent || el.getAttribute('aria-label') || '', 500), component: info.component, source: info.source, attributes: attrs, rect: ownRect, point: { x: topPoint.x, y: topPoint.y }, url: doc && doc.location ? doc.location.href : location.href, session_id: sessionId, frame: frameList.length ? frameList[frameList.length - 1] : null, frames: frameList.length ? frameList : null };
+      return { type: 'browser_element', selector: selectorFor(el), tag: String(el.localName || el.tagName || ''), text: clip(el.innerText || el.textContent || el.getAttribute('aria-label') || '', 500), component: info.component, source: info.source, attributes: attrs, rect: ownRect, point: { x: topPoint.x, y: topPoint.y }, url: doc && doc.location ? doc.location.href : location.href, session_id: sessionId, frame: frameList.length ? frameList[frameList.length - 1] : null, frames: frameList.length ? frameList : null };
     };
     const inspectInDocument = (doc, x, y, topPoint, frames, depth) => {
       if (!doc || depth > 5) return null;
@@ -1002,18 +1002,23 @@ function nativeSelectionScript(sessionId, enabled) {
     const elementLabel = (selection) => {
       const component = clip(selection && selection.component, 80);
       const safeComponent = component && component.toLowerCase() !== 'unknown' ? component : '';
-      const rawTag = clip(selection && (selection.tag || selection.tagName || selection.htmlTag || selection.nodeName), 64).toLowerCase();
-      const tag = rawTag && rawTag !== 'unknown' ? rawTag : '';
+      const rawTag = String(selection && (selection.tag || selection.tagName || selection.htmlTag || selection.nodeName) || '').trim().slice(0, 64);
+      const tag = rawTag && rawTag.toLowerCase() !== 'unknown' && !/[\s<>"']/.test(rawTag) ? rawTag : '';
       const fallback = clip(selection && (selection.selector || selection.url || 'Browser element'), 80);
-      if (safeComponent && tag) return (safeComponent + ' • ' + tag).slice(0, 96);
+      if (safeComponent && tag) {
+        const suffix = ' · ' + tag;
+        const available = Math.max(1, 96 - suffix.length);
+        const shownComponent = safeComponent.length <= available ? safeComponent : available === 1 ? '…' : safeComponent.slice(0, available - 1) + '…';
+        return shownComponent + suffix;
+      }
       return (safeComponent || tag || fallback || 'Browser element').slice(0, 96);
     };
     const renderElementLabel = (target, selection) => {
       if (!target) return;
       const component = clip(selection && selection.component, 80);
       const safeComponent = component && component.toLowerCase() !== 'unknown' ? component : '';
-      const rawTag = clip(selection && (selection.tag || selection.tagName || selection.htmlTag || selection.nodeName), 64).toLowerCase();
-      const tag = rawTag && rawTag !== 'unknown' ? rawTag : '';
+      const rawTag = String(selection && (selection.tag || selection.tagName || selection.htmlTag || selection.nodeName) || '').trim().slice(0, 64);
+      const tag = rawTag && rawTag.toLowerCase() !== 'unknown' && !/[\s<>"']/.test(rawTag) ? rawTag : '';
       const label = elementLabel(selection);
       target.title = label;
       target.replaceChildren();
@@ -1023,9 +1028,9 @@ function nativeSelectionScript(sessionId, enabled) {
       }
       const componentPart = document.createElement('span');
       componentPart.textContent = safeComponent;
-      componentPart.style.cssText = 'display:inline-block;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;';
+      componentPart.style.cssText = 'flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;';
       const separatorPart = document.createElement('span');
-      separatorPart.textContent = '•';
+      separatorPart.textContent = '·';
       separatorPart.style.cssText = 'flex:0 0 auto;opacity:.82;';
       const tagPart = document.createElement('span');
       tagPart.textContent = tag;
@@ -1160,7 +1165,7 @@ function nativeSelectionScript(sessionId, enabled) {
     const box = document.createElement('div');
     box.style.cssText = 'position:fixed;display:none;box-sizing:border-box;border:2px solid #7c3aed;background:rgba(124,58,237,.12);box-shadow:0 0 0 1px rgba(255,255,255,.85),0 10px 30px rgba(0,0,0,.28);border-radius:6px;pointer-events:none;z-index:2147483647;';
     const label = document.createElement('span');
-    label.style.cssText = 'position:fixed;left:8px;top:8px;display:inline-flex;align-items:center;gap:4px;visibility:hidden;box-sizing:border-box;max-width:min(360px,calc(100vw - 16px));overflow:hidden;text-overflow:ellipsis;white-space:nowrap;padding:3px 7px;border-radius:999px;background:#7c3aed;color:#fff;font:600 12px/16px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;box-shadow:0 6px 20px rgba(0,0,0,.25);pointer-events:none;z-index:2147483647;';
+    label.style.cssText = 'position:fixed;left:8px;top:8px;display:inline-flex;align-items:center;gap:4px;visibility:hidden;box-sizing:border-box;max-width:min(360px,calc(100vw - 16px));min-width:0;overflow:visible;direction:ltr;unicode-bidi:isolate;white-space:nowrap;padding:3px 7px;border-radius:999px;background:#7c3aed;color:#fff;font:600 12px/16px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;box-shadow:0 6px 20px rgba(0,0,0,.25);pointer-events:none;z-index:2147483647;';
     overlay.appendChild(box);
     overlay.appendChild(label);
     (document.body || document.documentElement).appendChild(overlay);
@@ -1502,7 +1507,7 @@ async function inspectAt(record, payload) {
     return {
       type: 'browser_element',
       selector: selectorFor(el),
-      tag: (el.localName || el.tagName || '').toLowerCase(),
+      tag: String(el.localName || el.tagName || ''),
       text: clip(el.innerText || el.textContent || el.getAttribute('aria-label') || '', 500),
       component: fiber.component,
       source: fiber.source,

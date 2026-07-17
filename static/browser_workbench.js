@@ -87,6 +87,7 @@
   // entries have a safety timeout, temporary feedback expires, and errors stay
   // visible until a retry or successful replacement clears their owner.
   const BROWSER_WORKBENCH_STATUS_PRIORITY={info:10,persistent:20,temporary:30,progress:40,error:50};
+  const BROWSER_WORKBENCH_CONTENT_STATES=new Set(['restored','idle','loading','loaded','error']);
   let browserWorkbenchStatusSequence=0;
 
   function delayBrowserWorkbench(ms){
@@ -760,6 +761,7 @@
           faviconUrl:tab.faviconUrl,
           zoom:tab.zoom,
           loadStatus:'idle',
+          contentState:browserWorkbenchIsBlankUrl(tab.url)?'idle':'restored',
           currentUrl:tab.currentUrl,
           requestedUrl:tab.requestedUrl,
           lastLoadedUrl:tab.lastLoadedUrl,
@@ -1177,7 +1179,10 @@
     }
     if(!target)return false;
     if(sessionId&&target.sessionId&&sessionId!==target.sessionId)return false;
-    if(Object.prototype.hasOwnProperty.call(detail,'navigation_error'))target.navigationError=normalizeBrowserWorkbenchNavigationError(detail.navigation_error);
+    if(Object.prototype.hasOwnProperty.call(detail,'navigation_error')){
+      target.navigationError=normalizeBrowserWorkbenchNavigationError(detail.navigation_error);
+      if(target.navigationError)setBrowserWorkbenchContentState(target,'error');
+    }
     if(detail.url)syncBrowserWorkbenchTabLocation(target,detail.url,{committed:detail.load_status==='success',updateBridge:false});
     if(detail.title!==undefined)target.title=String(detail.title||'');
     if(detail.favicon_url!==undefined||detail.faviconUrl!==undefined)target.faviconUrl=String(detail.favicon_url||detail.faviconUrl||target.faviconUrl||'');
@@ -1203,6 +1208,39 @@
     return ['idle','loading','success','error'].indexOf(status)!==-1?status:'idle';
   }
 
+  function normalizeBrowserWorkbenchContentState(value){
+    const state=String(value||'idle').toLowerCase();
+    return BROWSER_WORKBENCH_CONTENT_STATES.has(state)?state:'idle';
+  }
+
+  function nextBrowserWorkbenchContentState(tab,loadStatus){
+    const status=normalizeBrowserWorkbenchLoadStatus(loadStatus);
+    if(status==='loading')return 'loading';
+    if(status==='success')return 'loaded';
+    if(status==='error')return 'error';
+    if(tab&&tab.contentState==='restored'&&tab.hasStartedLoad!==true)return 'restored';
+    if(tab&&tab.navigationError)return 'error';
+    if(tab&&tab.hasCommittedNavigation===true)return 'loaded';
+    return 'idle';
+  }
+
+  function setBrowserWorkbenchContentState(tab,state){
+    if(!tab)return 'idle';
+    tab.contentState=normalizeBrowserWorkbenchContentState(state);
+    return tab.contentState;
+  }
+
+  function browserWorkbenchContentPlaceholder(tab){
+    if(!tab)return 'Click + Browser to open a Browser Workbench tab.';
+    const state=normalizeBrowserWorkbenchContentState(tab.contentState);
+    const url=String(tab.requestedUrl||tab.url||tab.currentUrl||'').trim();
+    if(state==='restored')return url?`Restored history URL: ${url}`:'Enter an address to open a page.';
+    if(state==='loading')return url?`Opening ${url}…`:'Opening page…';
+    if(state==='error')return url?`Couldn’t open ${url}.`:'This page could not be opened.';
+    if(state==='loaded')return tab.viewportMessage||'Browser view is unavailable.';
+    return tab.viewportMessage||'Enter an address to open a page.';
+  }
+
   function normalizeBrowserWorkbenchNavigationError(value){
     if(!value||typeof value!=='object')return null;
     const chromiumError=String(value.chromium_error||value.error_description||'ERR_FAILED').trim().toUpperCase();
@@ -1224,6 +1262,7 @@
     if(selectionMode&&selectionModeTabId===target.id)setBrowserWorkbenchSelectionMode(false);
     if(areaCaptureMode)cancelBrowserWorkbenchAreaCapture(target);
     target.navigationRequestId=(target.navigationRequestId||0)+1;
+    setBrowserWorkbenchContentState(target,'loading');
     target.navigationError=null;
     target.renderError='';
     target.loadError='';
@@ -1336,6 +1375,7 @@
     const next=normalizeBrowserWorkbenchLoadStatus(status);
     clearBrowserWorkbenchLoadTimers(target);
     target.loadStatus=next;
+    setBrowserWorkbenchContentState(target,nextBrowserWorkbenchContentState(target,next));
     target.loadError=next==='error'?String(opts.message||target.loadError||'Load failed'):'';
     if(next==='loading'){
       markBrowserWorkbenchLoadStarted(target,opts.url||target.requestedUrl||target.url);
@@ -1899,7 +1939,7 @@
     const url=tab&&tab.bridgeUrl?String(tab.bridgeUrl):(tab&&tab.url?String(tab.url):'');
     if(!url){
       clearBrowserWorkbenchHostForRender(targetHost);
-      targetHost.appendChild(textEl('div','browser-workbench-placeholder',tab?tab.viewportMessage:'Click + Browser to open a Browser Workbench tab.'));
+      targetHost.appendChild(textEl('div','browser-workbench-placeholder',browserWorkbenchContentPlaceholder(tab)));
       return;
     }
     const existing=targetHost.querySelector&&targetHost.querySelector(`.browser-workbench-frame-wrap[data-browser-workbench-tab-id="${CSS.escape(tab.id)}"]`);
@@ -2195,13 +2235,19 @@
 
   function renderBrowserWorkbenchSurface(tab,host){
     if(!host)return;
-    if(tab&&tab.navigationError)renderBrowserWorkbenchNavigationError(tab,host);
+    const contentState=normalizeBrowserWorkbenchContentState(tab&&tab.contentState);
+    host.dataset.browserContentState=contentState;
+    if(contentState==='error'&&tab&&tab.navigationError)renderBrowserWorkbenchNavigationError(tab,host);
+    else if(contentState==='restored'||contentState==='error'){
+      host.textContent='';
+      host.appendChild(textEl('div','browser-workbench-placeholder',browserWorkbenchContentPlaceholder(tab)));
+    }
     else if(tab&&tab.renderer==='chromium-stream'&&tab.sessionId)renderBrowserWorkbenchChromiumStream(tab,host);
     else if(tab&&tab.renderer==='iframe-bridge'&&tab.bridgeUrl)renderBrowserWorkbenchFrame(tab,host);
     else if(tab&&tab.renderer==='electron-native'&&tab.sessionId)renderBrowserWorkbenchElectronNative(tab,host);
     else{
       host.textContent='';
-      host.appendChild(textEl('div','browser-workbench-placeholder',tab?tab.viewportMessage:'Click + Browser to open a Browser Workbench tab.'));
+      host.appendChild(textEl('div','browser-workbench-placeholder',browserWorkbenchContentPlaceholder(tab)));
     }
   }
 
@@ -3062,7 +3108,9 @@
     target.devtoolsUrl='';
     target.canGoBack=false;
     target.canGoForward=false;
-    target.loadStatus='idle';
+    const shouldReopen=target.hasStartedLoad===true&&!browserWorkbenchIsBlankUrl(target.requestedUrl||target.url||target.currentUrl);
+    target.loadStatus=shouldReopen?'loading':'idle';
+    setBrowserWorkbenchContentState(target,shouldReopen?'loading':'idle');
     target.loadError='';
     target.navigationError=null;
     target.state='idle';
@@ -3093,6 +3141,7 @@
     target.canGoBack=false;
     target.canGoForward=false;
     target.loadStatus='idle';
+    setBrowserWorkbenchContentState(target,'idle');
     target.loadError='';
     target.lastHistoryUrl='';
     target.navigationError=null;
@@ -3183,12 +3232,14 @@
         else if(target.renderer==='electron-native')scheduleBrowserWorkbenchLoadStatusPoll(target);
         else if(target.renderer!=='iframe-bridge'&&target.renderer!=='chromium-stream')setBrowserWorkbenchLoadStatus('success',target);
       }else{
+        setBrowserWorkbenchContentState(target,target.navigationError||target.renderError?'error':'loaded');
         setTabState(target.renderError?'warning':'ready',target);
       }
     }else{
       if(selectionModeTabId===target.id)setBrowserWorkbenchSelectionMode(false);
       clearBrowserWorkbenchLoadTimers(target);
       if(target.loadStatus!=='error')target.loadStatus='idle';
+      setBrowserWorkbenchContentState(target,target.loadStatus==='error'?'error':'idle');
       if(target.loadStatus!=='error')target.loadError='';
       target.canGoBack=false;
       target.canGoForward=false;
@@ -3471,6 +3522,7 @@
       statusEntries:new Map(),
       state:'idle',
       loadStatus:normalizeBrowserWorkbenchLoadStatus(opts.loadStatus||opts.load_status),
+      contentState:normalizeBrowserWorkbenchContentState(opts.contentState||opts.content_state),
       loadError:String(opts.loadError||opts.load_error||''),
       navigationError:normalizeBrowserWorkbenchNavigationError(opts.navigationError||opts.navigation_error),
       navigationRequestId:0,
@@ -3486,11 +3538,12 @@
       clientNavigatedUrl:'',
       surfaceNode:null,
       surfaceUrl:'',
-      viewportMessage:opts.url?`Restored history URL: ${String(opts.url)}`:'Enter an address to open a page.',
+      viewportMessage:'Enter an address to open a page.',
       openingPromise:null,
       tabEl:null,
       statusEl:null,
     };
+    if(!opts.contentState&&!opts.content_state)tab.contentState=nextBrowserWorkbenchContentState(tab,tab.loadStatus);
     tab.state=browserWorkbenchStatusState(tab.loadStatus,tab);
     workbenchTabs.set(tab.id,tab);
     renderBrowserWorkbenchTabs();
@@ -3639,17 +3692,23 @@
       pingButton.setAttribute('aria-pressed',selectionMode&&active&&selectionModeTabId===active.id?'true':'false');
       pingButton.textContent=selectionMode&&active&&selectionModeTabId===active.id?'Selecting…':'Ping selection';
     }
+    const contentState=normalizeBrowserWorkbenchContentState(active&&active.contentState);
     if(viewportEl){
+      viewportEl.dataset.browserContentState=contentState;
       viewportEl.classList.toggle('selecting',selectionMode&&active&&selectionModeTabId===active.id);
-      viewportEl.classList.toggle('has-rendered-browser',!!active&&!active.navigationError&&(active.renderer==='iframe-bridge'||active.renderer==='chromium-stream'||active.renderer==='electron-native'));
-      viewportEl.classList.toggle('has-navigation-error',!!active&&!!active.navigationError);
+      viewportEl.classList.toggle('has-rendered-browser',!!active&&contentState!=='restored'&&contentState!=='error'&&(active.renderer==='iframe-bridge'||active.renderer==='chromium-stream'||active.renderer==='electron-native'));
+      viewportEl.classList.toggle('has-navigation-error',!!active&&contentState==='error');
       viewportEl.classList.toggle('has-iframe-bridge',!!active&&active.renderer==='iframe-bridge');
       viewportEl.classList.toggle('has-chromium-stream',!!active&&active.renderer==='chromium-stream');
       viewportEl.classList.toggle('has-electron-native',!!active&&active.renderer==='electron-native');
       viewportEl.classList.toggle('area-capturing',areaCaptureMode);
       viewportEl.classList.toggle('has-devtools',!!active&&active.devtoolsOpen===true&&!!active.devtoolsUrl);
     }
-    if(active&&active.navigationError)renderBrowserWorkbenchNavigationError(active);
+    if(active&&contentState==='error'&&active.navigationError)renderBrowserWorkbenchNavigationError(active);
+    else if(active&&(contentState==='restored'||contentState==='error')){
+      stopBrowserWorkbenchChromiumStream();
+      setViewportMessage(browserWorkbenchContentPlaceholder(active));
+    }
     else if(active&&active.renderer==='iframe-bridge'&&active.bridgeUrl&&active.devtoolsOpen===true&&active.devtoolsUrl){
       if(!ensureBrowserWorkbenchSplitViewPreservingSurface(active))renderBrowserWorkbenchSplitView(active);
     }else if(active&&active.devtoolsOpen===true&&active.devtoolsUrl)renderBrowserWorkbenchSplitView(active);
@@ -3658,7 +3717,7 @@
     else if(active&&active.renderer==='iframe-bridge'&&active.bridgeUrl)renderBrowserWorkbenchFrame(active);
     else{
       stopBrowserWorkbenchChromiumStream();
-      setViewportMessage(active?active.viewportMessage:'Click + Browser to open a Browser Workbench tab.');
+      setViewportMessage(browserWorkbenchContentPlaceholder(active));
     }
     browserWorkbenchRenderManagedStatus(active);
     renderBrowserWorkbenchTabs();
@@ -3971,7 +4030,7 @@
     label.dataset.placement=placement;
   }
 
-  function renderBrowserWorkbenchOverlay(rect,label,kind){
+  function renderBrowserWorkbenchOverlay(rect,label,kind,selection){
     wireDom();
     if(!viewportEl||!rect)return;
     clearBrowserWorkbenchOverlay(kind||'hover');
@@ -4000,10 +4059,23 @@
     box.style.height=`${height}px`;
     const tag=document.createElement('span');
     tag.className=`${overlayClass}-label browser-workbench-selection-overlay-label`;
-    tag.textContent=String(label||'Browser element').slice(0,96);
+    const elementSelection=selection&&typeof selection==='object'?selection:null;
+    const tagName=browserWorkbenchHtmlTagName(elementSelection&&elementSelection.tag);
+    const componentName=String(elementSelection&&elementSelection.component||'').replace(/\s+/g,' ').trim();
+    const safeComponent=componentName&&componentName.toLowerCase()!=='unknown'?componentName:'';
+    const finalLabel=elementSelection?browserWorkbenchElementLabel(safeComponent,tagName,label):String(label||'Browser element');
+    tag.title=finalLabel;
+    if(safeComponent&&tagName){
+      const componentPart=textEl('span','browser-workbench-selection-overlay-component',safeComponent);
+      const separatorPart=textEl('span','browser-workbench-selection-overlay-separator','·');
+      const tagPart=textEl('span','browser-workbench-selection-overlay-tag',tagName);
+      tag.append(componentPart,separatorPart,tagPart);
+    }else{
+      tag.textContent=finalLabel;
+    }
     overlayHost.appendChild(box);
     overlayHost.appendChild(tag);
-    positionBrowserWorkbenchOverlayLabel(tag,{left:Math.max(0,left),top:Math.max(0,top),width,height},{width:renderFrame.width,height:renderFrame.height});
+    positionBrowserWorkbenchOverlayLabel(tag,{left:Math.max(0,left),top:Math.max(0,top),width,height},{width:hostFrame.width,height:hostFrame.height});
   }
 
   function updateBrowserWorkbenchHoverOverlay(event){
@@ -4021,7 +4093,7 @@
         if(requestId!==hoverInspectRequestId)return;
         const selected=normalizeSelection(rawSelection);
         if(selected.rect){
-          renderBrowserWorkbenchOverlay(selected.rect,selected.displayLabel||selected.selector,'hover');
+          renderBrowserWorkbenchOverlay(selected.rect,selected.displayLabel||selected.selector,'hover',selected);
         }else{
           renderBrowserWorkbenchOverlay({left:point.x-9,top:point.y-9,width:18,height:18},'Click to ping element','hover');
         }
@@ -4067,8 +4139,9 @@
   }
 
   function browserWorkbenchHtmlTagName(value){
-    const tag=String(value||'').replace(/\s+/g,' ').trim().toLowerCase();
-    return tag&&tag!=='unknown'?tag.slice(0,64):'';
+    const tag=String(value||'').trim();
+    if(!tag||tag.toLowerCase()==='unknown'||/[\s<>"']/.test(tag))return '';
+    return tag.slice(0,64);
   }
 
   function browserWorkbenchElementLabel(component,tag,fallback){
@@ -4076,8 +4149,13 @@
     const safeComponent=componentName&&componentName.toLowerCase()!=='unknown'?componentName:'';
     const tagName=browserWorkbenchHtmlTagName(tag);
     const fallbackLabel=String(fallback||'').replace(/\s+/g,' ').trim();
-    if(safeComponent&&tagName)return `${safeComponent} • ${tagName}`.slice(0,80);
-    return (safeComponent||tagName||fallbackLabel||'Browser element').slice(0,80);
+    if(safeComponent&&tagName){
+      const suffix=` · ${tagName}`;
+      const available=Math.max(1,96-suffix.length);
+      const shownComponent=safeComponent.length<=available?safeComponent:available===1?'…':`${safeComponent.slice(0,available-1)}…`;
+      return shownComponent+suffix;
+    }
+    return (safeComponent||tagName||fallbackLabel||'Browser element').slice(0,96);
   }
 
   function normalizeSelection(selection){
@@ -4157,7 +4235,7 @@
     const active=getActiveWorkbenchTab();
     if(!active||!selected.rect)return false;
     if(selected.session_id&&active.sessionId&&selected.session_id!==active.sessionId)return false;
-    renderBrowserWorkbenchOverlay(selected.rect,selected.displayLabel||selected.selector,'hover');
+    renderBrowserWorkbenchOverlay(selected.rect,selected.displayLabel||selected.selector,'hover',selected);
     return true;
   }
 
@@ -4208,7 +4286,7 @@
     return {
       active_tab_id:activeBrowserWorkbenchTabId,
       tab_count:workbenchTabs.size,
-      tabs:Array.from(workbenchTabs.values()).map((tab)=>({id:tab.id,label:browserWorkbenchDisplayLabel(tab),session_id:tab.sessionId,state:tab.state,load_status:normalizeBrowserWorkbenchLoadStatus(tab.loadStatus),url:tab.url,current_url:tab.currentUrl||'',requested_url:tab.requestedUrl||'',last_loaded_url:tab.lastLoadedUrl||'',has_started_load:tab.hasStartedLoad===true,has_committed_navigation:tab.hasCommittedNavigation===true,devtools_open:tab.devtoolsOpen===true,favicon_url:tab.faviconUrl||''})),
+      tabs:Array.from(workbenchTabs.values()).map((tab)=>({id:tab.id,label:browserWorkbenchDisplayLabel(tab),session_id:tab.sessionId,state:tab.state,content_state:normalizeBrowserWorkbenchContentState(tab.contentState),load_status:normalizeBrowserWorkbenchLoadStatus(tab.loadStatus),url:tab.url,current_url:tab.currentUrl||'',requested_url:tab.requestedUrl||'',last_loaded_url:tab.lastLoadedUrl||'',has_started_load:tab.hasStartedLoad===true,has_committed_navigation:tab.hasCommittedNavigation===true,devtools_open:tab.devtoolsOpen===true,favicon_url:tab.faviconUrl||''})),
     };
   }
 
