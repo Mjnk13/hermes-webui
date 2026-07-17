@@ -167,6 +167,10 @@ For this fork, the required remotes are:
 - `origin`: `git@github.com-personal:Mjnk13/hermes-webui.git`
 - `upstream`: `git@github.com-personal:nesquena/hermes-webui.git`
 
+Treat `upstream` as read-only. Never push commits, branches, or tags to the
+original repository and never create remote branches there. All remote writes
+for this custom fork must target the personal `origin` only.
+
 Do not replace remotes with:
 
 - HTTPS GitHub URLs
