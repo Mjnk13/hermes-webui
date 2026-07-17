@@ -129,4 +129,3 @@ def test_queue_drain_send_path_does_not_clear_visible_composer_or_draft():
     assert "const _submittedDraftTextForClear=queueDrain?'':($('msg').value||'');" in send
     assert "if(!queueDrain){$('msg').value='';autoResize();}" in send
     assert "if (!queueDrain && activeSid && typeof _clearComposerDraft === 'function')" in send
-
