@@ -148,4 +148,3 @@ def test_live_anchor_projection_reads_the_registry_kept_by_the_lease():
     assert "window._liveAnchorRegistries" in project
     assert "map.get(streamId)" in project
     assert "if(!api||!registry" in project
-
