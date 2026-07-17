@@ -154,7 +154,7 @@ def _gutter_triplets(rendered_html):
     news = _span_texts(rendered_html, "assistant-code-diff-gutter assistant-code-diff-new")
     markers = _span_texts(rendered_html, "assistant-code-diff-marker")
     codes = _span_texts(rendered_html, "assistant-code-diff-code")
-    return list(zip(olds, news, markers, codes))
+    return list(zip(olds, news, markers, codes, strict=True))
 
 def _changed_rows(rows):
     return [r for r in rows if "assistant-code-diff-added" in r["cls"] or "assistant-code-diff-removed" in r["cls"] or r["marker"] == " "]

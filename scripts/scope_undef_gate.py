@@ -81,7 +81,7 @@ BROWSER_GLOBALS = [
     "structuredClone", "crypto", "performance", "screen", "DOMParser", "Node", "NodeList",
     "HTMLElement", "Element", "Text", "AbortController", "AbortSignal", "TextDecoder",
     "TextEncoder", "caches", "self", "CSS", "Notification", "Response", "Request",
-    "Headers", "getSelection", "scrollTo", "scrollBy", "postMessage", "indexedDB",
+    "Headers", "ClipboardItem", "createImageBitmap", "getSelection", "scrollTo", "scrollBy", "postMessage", "indexedDB",
     # ECMAScript builtins
     "Promise", "Map", "Set", "WeakMap", "WeakSet", "Symbol", "Proxy", "Reflect", "JSON",
     "Math", "Date", "RegExp", "Array", "Object", "String", "Number", "Boolean", "Error",

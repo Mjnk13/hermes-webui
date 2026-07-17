@@ -109,11 +109,8 @@ def test_browser_workbench_env_can_force_launcher_on(monkeypatch, value):
     assert browser_workbench.browser_workbench_ui_enabled() is True
 
 
-def test_browser_workbench_capabilities_surface_opt_in_setting(monkeypatch):
-    monkeypatch.setattr(
-        "api.browser_workbench.load_settings",
-        lambda: {"browser_workbench_enabled": True},
-    )
+def test_browser_workbench_capabilities_surface_explicit_opt_in(monkeypatch):
+    monkeypatch.setenv("HERMES_WEBUI_BROWSER_WORKBENCH", "true")
 
     handler = _FakeHandler()
 
@@ -1056,12 +1053,12 @@ def test_browser_workbench_iframe_screenshot_actions_keep_viewport_and_full_page
     assert 'data-browser-action="take-full-page-screenshot"' in index
 
     # Default iframe screenshot path must request the visible viewport, never full-page.
-    default_call = "return await attachBrowserWorkbenchIframeScreenshot(active,{clip:clip||null})"
+    default_call = "return await attachBrowserWorkbenchIframeScreenshot(active,{clip:clip||null,statusToken})"
     default_screenshot_start = js.index("async function attachBrowserWorkbenchScreenshot")
     default_screenshot_body = js[default_screenshot_start:js.index("async function startBrowserWorkbenchAreaCapture", default_screenshot_start)]
     assert default_call in default_screenshot_body
     assert "fullPage:true" not in default_screenshot_body
-    assert "return await attachBrowserWorkbenchIframeScreenshot(active,{fullPage:true})" in js
+    assert "return await attachBrowserWorkbenchIframeScreenshot(active,{fullPage:true,statusToken})" in js
     assert "const mode=opts.fullPage===true?'full-page':'viewport'" in js
     assert "mode:String(opts.mode||'viewport')" in js
     assert "if(action==='take-screenshot')return await attachBrowserWorkbenchScreenshot();" in js
@@ -1079,10 +1076,9 @@ def test_browser_workbench_iframe_screenshot_actions_keep_viewport_and_full_page
     assert "const scrollY = mode === 'full-page' ? 0 : originalScrollY;" in api_py
     assert "window.scrollTo(originalScrollX, originalScrollY)" in api_py
 
-    # Full-page must be an explicit mode and message, not the default screenshot response.
+    # Full-page must be an explicit mode while both capture modes share the settled response.
     assert "String(request.mode || '') === 'full-page' ? 'full-page' : 'viewport'" in api_py
-    assert "Captured visible iframe viewport from DOM" in api_py
-    assert "Captured entire scrollable iframe page from DOM" in api_py
+    assert "message:'Screenshot captured.'" in api_py
 
 
 
@@ -1413,7 +1409,7 @@ def test_browser_workbench_static_shell_is_wired_default_off_and_safe():
     assert "function idleBrowserWorkbenchBlankTab" in js
     assert "const startsBlank=browserWorkbenchIsBlankUrl(requestedUrl)" in js
     assert "return idleBrowserWorkbenchBlankTab(target)" in js
-    assert "Blank tabs do not create or load an about:blank browser surface." in js
+    assert "message:'Ready for an address.'" in js
     assert "if(browserWorkbenchIsBlankUrl(requested))" in js
     assert "requestJSON(sessionStatusUrl(closingId),{method:'DELETE'}).catch(()=>{})" in js
     assert "Browser Workbench session expired. Recreating this Browser tab" not in js
@@ -1633,8 +1629,8 @@ def test_browser_workbench_static_shell_is_wired_default_off_and_safe():
     assert "target.bridgeUrl=hasSession&&payload.bridge_url" in js
     assert "client_renderer:nativeBridgeAvailable?'electron-native':'iframe-bridge'" in js
     assert "electron_native_available:nativeBridgeAvailable" in js
-    assert "Fast iframe proxy" in js
-    assert "No screenshot/canvas frame stream is used" in js
+    assert "function browserWorkbenchProxyUrlForTarget" in js
+    assert "Some pages may behave differently in the embedded browser." in js
     assert "document.createElement('img')" not in js
     assert "screenshot_data_url" not in js
     assert "browser-workbench-screenshot.png" in js
@@ -1642,7 +1638,7 @@ def test_browser_workbench_static_shell_is_wired_default_off_and_safe():
     assert "No image/base64 Browser Workbench fallback is enabled" not in js
     assert "Native/streamed browser rendering is required" not in js
     assert "browser-workbench-frame" in js
-    assert "Chromium stream" in js
+    assert "Chromium viewport" in js
     assert "X-Frame-Options or CSP frame-ancestors" not in js
     assert "Electron/CDP rendering and element inspection" not in js
     assert "browserTabOpen" not in js
@@ -1694,7 +1690,7 @@ def test_browser_workbench_static_shell_is_wired_default_off_and_safe():
     assert "main.main.showing-browser > #mainChat > .messages-shell" in css
     assert ".browser-workbench-overlay" not in css
     assert "setBrowserWorkbenchSelectionMode(false);\n    setStatus('Selection added" not in js
-    assert "Select another element or press Ping selection/Escape to exit" in js
+    assert "Element added. Select another or press Escape to finish." in js
     index_html = open("static/index.html", encoding="utf-8").read()
     assert 'id="msg" class="composer-editor"' in index_html
     assert 'contenteditable="true"' in index_html
@@ -1756,7 +1752,8 @@ def test_browser_context_ordered_parts_round_trip_across_render_and_persistence_
     assert "_browserWorkbenchContextPartsHaveElement(persistedParts)?persistedParts:parseBrowserWorkbenchContext(displayContent)" in ui_js
     assert "isUser && !hasParsedBrowserContext ? _browserContextMessageHtml(m.context_items)" in ui_js
 
-    assert "let outgoingBrowserContextParts=typeof window._composerBrowserContextPartsForSend==='function'?window._composerBrowserContextPartsForSend():[]" in messages_js
+    assert "let outgoingBrowserContextParts=queueDrain" in messages_js
+    assert ": (typeof window._composerBrowserContextPartsForSend==='function'?window._composerBrowserContextPartsForSend():[]);" in messages_js
     assert "browser_context_parts:outgoingBrowserContextParts.length?outgoingBrowserContextParts:undefined" in messages_js
     assert "parts:outgoingParts.length?outgoingParts:undefined" in messages_js
     assert "browser_context_parts:outgoingBrowserContextParts,parts:outgoingParts,model" in messages_js
