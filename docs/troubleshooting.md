@@ -195,6 +195,8 @@ systemctl --user restart hermes-webui.service
 
 If you launched `python3 bootstrap.py` in the foreground, stop it with Ctrl-C and start it again. Restarting the whole computer or WSL is not required when restarting the WebUI backend succeeds.
 
+On macOS, `./ctl.sh restart` also recognizes an installed Hermes WebUI launchd job configured for the same port. It unloads that `KeepAlive` job before stopping the old process, then loads the job again, so a standalone WebUI and launchd cannot race for the port or repeatedly reopen the Electron shell.
+
 **When to file a bug.** File a WebUI bug if the restart-required message appears even though the Agent revision did not change, or if a clean WebUI restart still produces the same import error. Include the WebUI launch method, WebUI revision, Agent revision, and the sanitized error text.
 
 ---

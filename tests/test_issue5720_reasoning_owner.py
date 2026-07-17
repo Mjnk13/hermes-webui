@@ -462,6 +462,11 @@ global._decorateTransparentEventRow=(row,opts)=>{
 global._rehydrateTransparentLiveRow=()=>{};
 global._sanitizeThinkingDisplayText=value=>String(value||'').trim();
 global._firstValidTimestampSeconds=()=>null;
+// This harness exercises reasoning ownership, not mutation-card rendering.
+// Keep the production Worklog renderer's newer DiffCard and disclosure
+// dependencies neutral so a missing unrelated helper cannot mask the behavior.
+global._assistantAnchorSceneMutationItemsFromRow=()=>[];
+global._worklogDetailsExpandedDefault=()=>false;
 
 eval(anchorsSrc);
 for(const name of [
@@ -475,6 +480,7 @@ for(const name of [
   '_resetMismatchedLiveAssistantTurnForSession',
   '_liveAnchorReasoningRowForFallback','_updateLiveAnchorReasoningRowForFallback',
   '_anchorSceneNodeForRow','_anchorSceneWorklogGroup','_renderAnchorSceneRowsIntoWorklog',
+  '_anchorSceneReportRenderError','_anchorSceneFallbackNodeForRenderError',
   'isLiveAnchorActivitySceneOwner','_projectLiveAnchorActivitySceneForStream',
   '_renderLiveAnchorActivitySceneTransparent','renderLiveAnchorActivityScene',
   '_renderLiveAnchorActivitySceneForStream','appendThinking','updateThinking',

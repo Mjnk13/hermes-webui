@@ -1,0 +1,18 @@
+{
+  "name": "hermes-webui-desktop",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Electron desktop shell for Hermes WebUI Browser Workbench native WebContentsView integration.",
+  "main": "out/main/index.js",
+  "scripts": {
+    "dev": "electron-vite dev",
+    "build": "electron-vite build",
+    "preview": "electron-vite preview",
+    "check": "node --check src/main/index.cjs && node --check src/preload/index.cjs"
+  },
+  "devDependencies": {
+    "electron": "^31.7.7",
+    "electron-vite": "^2.3.0",
+    "vite": "^5.4.21"
+  }
+}

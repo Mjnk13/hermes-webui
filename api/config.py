@@ -420,6 +420,9 @@ _DEFAULT_AGENT_PERSONALITIES = {
 
 def _apply_config_defaults(config_data: dict) -> None:
     """Populate documented default-only config keys in-place."""
+    config_data.setdefault("accounts", {})
+    config_data.setdefault("active_account", "")
+
     agent_cfg = config_data.get("agent")
     if not isinstance(agent_cfg, dict):
         agent_cfg = {}
@@ -1150,6 +1153,7 @@ _PROVIDER_DISPLAY = {
     "openai": "OpenAI",
     "openai-api": "OpenAI API",
     "openai-codex": "OpenAI Codex",
+    "codex-lb": "codex-lb",
     "xai-oauth": "xAI Grok OAuth",
     "copilot": "GitHub Copilot",
     "moa": "Mixture of Agents",
@@ -1689,6 +1693,16 @@ _PROVIDER_MODELS = {
         {"id": "gpt-5.1-codex-max", "label": "GPT-5.1 Codex Max"},
         {"id": "gpt-5.1-codex-mini", "label": "GPT-5.1 Codex Mini"},
         {"id": "codex-mini-latest", "label": "Codex Mini (latest)"},
+    ],
+    "codex-lb": [
+        {"id": "gpt-5.6-sol", "label": "GPT-5.6 Sol"},
+        {"id": "gpt-5.6-terra", "label": "GPT-5.6 Terra"},
+        {"id": "gpt-5.6-luna", "label": "GPT-5.6 Luna"},
+        {"id": "gpt-5.5", "label": "GPT-5.5"},
+        {"id": "gpt-5.4", "label": "GPT-5.4"},
+        {"id": "gpt-5.4-mini", "label": "GPT-5.4 Mini"},
+        {"id": "gpt-5.3-codex-spark", "label": "GPT-5.3 Codex Spark"},
+        {"id": "codex-auto-review", "label": "Codex Auto Review"},
     ],
     "google": [
         {"id": "gemini-3.1-pro-preview",            "label": "Gemini 3.1 Pro Preview"},
@@ -2622,7 +2636,12 @@ def resolve_model_provider(model_id: str, *, explicitly_picked: bool = False) ->
     """
     config_provider = None
     config_base_url = None
-    model_cfg = cfg.get("model", {})
+    try:
+        from api.accounts import apply_active_account_to_model_config
+
+        model_cfg = apply_active_account_to_model_config(cfg)
+    except Exception:
+        model_cfg = cfg.get("model", {})
     if isinstance(model_cfg, dict):
         config_base_url = model_cfg.get("base_url")
         config_provider = _resolve_configured_provider_id(
@@ -3150,7 +3169,12 @@ def get_effective_default_model(config_data: dict | None = None) -> str:
     active_cfg = config_data if config_data is not None else cfg
     default_model = DEFAULT_MODEL
 
-    model_cfg = active_cfg.get("model", {})
+    try:
+        from api.accounts import apply_active_account_to_model_config
+
+        model_cfg = apply_active_account_to_model_config(active_cfg)
+    except Exception:
+        model_cfg = active_cfg.get("model", {})
     if isinstance(model_cfg, str):
         default_model = model_cfg.strip()
     elif isinstance(model_cfg, dict):
@@ -4295,6 +4319,150 @@ def set_reasoning_effort(
     )
 
 
+# ── Fast mode config (CLI parity for /fast) ──────────────────────────────────
+
+def parse_service_tier_config(raw: str | None) -> str | None:
+    """Parse persisted ``agent.service_tier`` into a runtime fast-mode value."""
+    value = str(raw or "").strip().lower()
+    if not value or value in {"normal", "default", "standard", "off", "none"}:
+        return None
+    if value in {"fast", "priority", "on"}:
+        return "priority"
+    logger.warning("Unknown service_tier '%s', ignoring", raw)
+    return None
+
+
+def _model_supports_fast_mode(model_id: str | None) -> bool:
+    """Return whether the selected model should expose the Fast-mode control."""
+    try:
+        from hermes_cli.models import model_supports_fast_mode  # type: ignore[import-not-found]
+
+        return bool(model_supports_fast_mode(model_id))
+    except Exception:
+        raw = _strip_provider_hint_for_reasoning(str(model_id or "")).strip().lower()
+        base = raw.rsplit("/", 1)[-1].split(":", 1)[0]
+        if not base or "codex" in base:
+            return False
+        if base.startswith(("gpt-", "o1", "o3", "o4")):
+            return True
+        return base.startswith("claude-") and ("opus-4-6" in base or "opus-4.6" in base)
+
+
+def _fast_mode_overrides_for_model(model_id: str | None) -> dict:
+    """Return request overrides for fast mode; empty dict means unsupported."""
+    try:
+        from hermes_cli.models import resolve_fast_mode_overrides  # type: ignore[import-not-found]
+
+        overrides = resolve_fast_mode_overrides(model_id)
+        return dict(overrides or {})
+    except Exception:
+        if not _model_supports_fast_mode(model_id):
+            return {}
+        raw = _strip_provider_hint_for_reasoning(str(model_id or "")).strip().lower()
+        base = raw.rsplit("/", 1)[-1].split(":", 1)[0]
+        if base.startswith("claude-"):
+            return {"speed": "fast"}
+        return {"service_tier": "priority"}
+
+
+def _resolve_fast_mode_model_context(
+    config_data: dict,
+    model_id: str | None,
+    provider_id: str | None,
+    base_url: str | None,
+) -> tuple[str | None, str | None, str | None]:
+    resolve_model = model_id
+    resolve_provider = provider_id
+    resolve_base_url = base_url
+    if not resolve_model:
+        model_cfg = config_data.get("model") or {}
+        if isinstance(model_cfg, dict):
+            resolve_model = str(model_cfg.get("default") or "").strip() or None
+            if not resolve_provider and model_cfg.get("provider"):
+                resolve_provider = str(model_cfg["provider"]).strip()
+            if not resolve_base_url and model_cfg.get("base_url"):
+                resolve_base_url = str(model_cfg["base_url"]).strip()
+    return resolve_model, resolve_provider, resolve_base_url
+
+
+def get_fast_mode_status(
+    *,
+    model_id: str | None = None,
+    provider_id: str | None = None,
+    base_url: str | None = None,
+) -> dict:
+    """Return current fast-mode config from the active profile's config.yaml.
+
+    Mirrors CLI ``/fast``: ``agent.service_tier`` stores ``fast``/``normal`` and
+    the selected model gates whether the Fast option is available.
+    """
+    config_data = _load_yaml_config_file(_get_config_path())
+    agent_cfg = config_data.get("agent") or {}
+    raw = agent_cfg.get("service_tier") if isinstance(agent_cfg, dict) else None
+    resolve_model, resolve_provider, resolve_base_url = _resolve_fast_mode_model_context(
+        config_data,
+        model_id,
+        provider_id,
+        base_url,
+    )
+    service_tier = parse_service_tier_config(raw)
+    supported = _model_supports_fast_mode(resolve_model)
+    return {
+        "fast_mode": "fast" if service_tier == "priority" else "normal",
+        "service_tier": service_tier or "",
+        "supports_fast_mode": bool(supported),
+        "supported_options": ["normal", "fast"] if supported else ["normal"],
+        "options": [
+            {"value": "normal", "label": "Normal"},
+            {"value": "fast", "label": "Fast", "disabled": not supported},
+        ],
+        "model": resolve_model or "",
+        "provider": resolve_provider or "",
+        "base_url": resolve_base_url or "",
+    }
+
+
+def set_fast_mode(
+    mode: str,
+    *,
+    model_id: str | None = None,
+    provider_id: str | None = None,
+    base_url: str | None = None,
+) -> dict:
+    """Persist ``agent.service_tier`` using CLI ``/fast`` semantics."""
+    raw = str(mode or "").strip().lower()
+    if raw in {"fast", "on", "priority"}:
+        next_mode = "fast"
+    elif raw in {"normal", "off", "default", "standard", "none"}:
+        next_mode = "normal"
+    else:
+        raise ValueError("fast mode must be fast|normal|on|off")
+
+    config_path = _get_config_path()
+    with _cfg_lock:
+        config_data = _load_yaml_config_file(config_path)
+        resolve_model, _resolve_provider, _resolve_base_url = _resolve_fast_mode_model_context(
+            config_data,
+            model_id,
+            provider_id,
+            base_url,
+        )
+        if next_mode == "fast" and not _model_supports_fast_mode(resolve_model):
+            raise ValueError("fast mode is not available for this model")
+        agent_cfg = config_data.get("agent")
+        if not isinstance(agent_cfg, dict):
+            agent_cfg = {}
+        agent_cfg["service_tier"] = next_mode
+        config_data["agent"] = agent_cfg
+        _save_yaml_config_file(config_path, config_data)
+    reload_config()
+    return get_fast_mode_status(
+        model_id=model_id,
+        provider_id=provider_id,
+        base_url=base_url,
+    )
+
+
 def _public_advanced_model_options(model_cfg: dict) -> dict:
     """Return write-only-safe advanced options from a model config block."""
     if not isinstance(model_cfg, dict):
@@ -4476,6 +4644,18 @@ def _main_model_request_overrides(
     extra_body = model_cfg.get("extra_body")
     if isinstance(extra_body, dict) and extra_body:
         overrides["extra_body"] = copy.deepcopy(extra_body)
+    agent_cfg = config_data.get("agent", {})
+    if isinstance(agent_cfg, dict) and parse_service_tier_config(agent_cfg.get("service_tier")) == "priority":
+        fast_overrides = _fast_mode_overrides_for_model(
+            gate_model or str(model_cfg.get("default") or "").strip() or None
+        )
+        if fast_overrides:
+            fast_extra_body = fast_overrides.pop("extra_body", None)
+            if isinstance(fast_extra_body, dict) and fast_extra_body:
+                merged_extra_body = dict(overrides.get("extra_body") or {})
+                merged_extra_body.update(fast_extra_body)
+                overrides["extra_body"] = merged_extra_body
+            overrides.update(fast_overrides)
     return overrides
 
 
@@ -6598,7 +6778,12 @@ def get_available_models(*, prefer_cache: bool = False, force_refresh: bool = Fa
 
         # 1. Read config.yaml model section
         cfg_base_url = ""  # must be defined before conditional blocks (#117)
-        model_cfg = cfg.get("model", {})
+        try:
+            from api.accounts import apply_active_account_to_model_config
+
+            model_cfg = apply_active_account_to_model_config(cfg)
+        except Exception:
+            model_cfg = cfg.get("model", {})
         cfg_base_url = ""
         if isinstance(model_cfg, str):
             pass  # default_model already set by get_effective_default_model
@@ -9193,6 +9378,7 @@ _SETTINGS_DEFAULTS = {
     "simplified_tool_calling": True,  # legacy compatibility; Worklog renderer remains enabled
     "terminal_auto_expand_on_output": False,  # auto-expand terminal panel when output arrives while collapsed
     "workspace_todos_tab": False,  # show a Todos tab in the workspace panel (right side)
+    "browser_workbench_enabled": True,  # Browser Workbench launcher is on by default; backend remains capability-gated
     "api_redact_enabled": True,  # redact sensitive data (API keys, secrets) from API responses
     "dashboard_plugins": {},  # plugin_name -> bool, opt-in per plugin (default off per PF-10b)
     "sidebar_density": "compact",  # compact | detailed
@@ -9333,6 +9519,16 @@ def _settings_payload_for_write(settings: dict, persisted_speech_keys: set[str])
     return persisted
 
 
+def _browser_workbench_enabled_from_env(default: bool = True) -> bool:
+    """Browser Workbench defaults on; env can force 0/false or 1/true."""
+    raw = str(os.getenv("HERMES_WEBUI_BROWSER_WORKBENCH") or "").strip().lower()
+    if raw in {"0", "false"}:
+        return False
+    if raw in {"1", "true"}:
+        return True
+    return bool(default)
+
+
 def load_settings() -> dict:
     """Load settings from disk, merging with defaults for any missing keys."""
     settings = dict(_SETTINGS_DEFAULTS)
@@ -9394,6 +9590,7 @@ def load_settings() -> dict:
         stored.get("theme") if isinstance(stored, dict) else settings.get("theme"),
         stored.get("skin") if isinstance(stored, dict) else settings.get("skin"),
     )
+    settings["browser_workbench_enabled"] = _browser_workbench_enabled_from_env(True)
     settings["default_model"] = get_effective_default_model()
     try:
         model_cfg = get_config().get("model", {})
@@ -9465,6 +9662,7 @@ _SETTINGS_BOOL_KEYS = {
     "show_thinking",
     "terminal_auto_expand_on_output",
     "workspace_todos_tab",
+    "browser_workbench_enabled",
     "api_redact_enabled",
     "session_jump_buttons",
     "render_user_markdown",
@@ -9715,6 +9913,7 @@ def save_settings(settings: dict) -> dict:
     )
     effective_persisted_speech_keys = set(persisted_speech_keys)
     effective_persisted_speech_keys.update(applied_speech_keys)
+    current["browser_workbench_enabled"] = _browser_workbench_enabled_from_env(True)
     persisted = _settings_payload_for_write(current, effective_persisted_speech_keys)
     SETTINGS_FILE.parent.mkdir(parents=True, exist_ok=True)
     _atomic_write_settings_text(

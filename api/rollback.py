@@ -28,6 +28,7 @@ logger = logging.getLogger(__name__)
 # would let any authenticated caller diff or restore from another
 # allowlisted workspace's checkpoint store. (Opus pre-release advisor.)
 _CHECKPOINT_ID_RE = re.compile(r"^[A-Za-z0-9_-][A-Za-z0-9_.-]{0,63}$")
+_MAX_WORKSPACE_GIT_DIFF_BYTES = 512_000
 
 
 def _validate_checkpoint_id(checkpoint: str) -> str:
@@ -353,6 +354,112 @@ def get_checkpoint_diff(workspace: str, checkpoint: str) -> dict[str, Any]:
         "diff": "\n".join(diff_lines) if diff_lines else "",
         "files_changed": files_changed,
         "total_changes": len(files_changed),
+    }
+
+
+def _run_git(git: str, args: list[str], *, timeout: int = 10, allow_returncodes: tuple[int, ...] = (0,)) -> subprocess.CompletedProcess:
+    result = subprocess.run(
+        [git, *args],
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+    if result.returncode not in allow_returncodes:
+        msg = (result.stderr or result.stdout or "git command failed").strip()
+        raise ValueError(msg[:300] or "git command failed")
+    return result
+
+
+def _workspace_git_diff_paths(workspace_root: Path, repo_root: Path, requested_path: str) -> tuple[str, str, Path]:
+    """Return workspace-relative path, git-repo-relative path, and absolute target."""
+    raw = str(requested_path or "").strip()
+    if not raw:
+        raise ValueError("path query parameter is required")
+    if "\x00" in raw:
+        raise ValueError("path contains null byte")
+
+    from api.workspace import safe_resolve_ws
+
+    workspace_root = workspace_root.resolve()
+    repo_root = repo_root.resolve()
+    if Path(raw).is_absolute():
+        target = Path(raw).resolve()
+        try:
+            target.relative_to(workspace_root)
+        except ValueError:
+            raise ValueError(f"Path traversal blocked: {requested_path}") from None
+    else:
+        target = safe_resolve_ws(workspace_root, raw)
+
+    try:
+        workspace_rel = target.relative_to(workspace_root).as_posix()
+    except ValueError:
+        raise ValueError(f"Path traversal blocked: {requested_path}") from None
+    try:
+        repo_rel = target.relative_to(repo_root).as_posix()
+    except ValueError:
+        raise ValueError("workspace file is not inside the git repository") from None
+    return workspace_rel, repo_rel, target
+
+
+def get_workspace_git_diff(workspace: str, path: str) -> dict[str, Any]:
+    """Return the current git diff for one workspace file.
+
+    Baseline is explicit and intentionally not per-turn: this is the selected
+    file's current repository state against ``HEAD``. Untracked files use a
+    ``/dev/null`` no-index diff so newly-created files still preview usefully.
+    """
+    resolved = _resolve_workspace(workspace)
+    workspace_root = Path(resolved)
+    git = _find_git()
+
+    repo_result = _run_git(git, ["-C", resolved, "rev-parse", "--show-toplevel"], timeout=5)
+    repo_root = Path(repo_result.stdout.strip()).resolve()
+    workspace_rel, repo_rel, target = _workspace_git_diff_paths(workspace_root, repo_root, path)
+
+    status_result = _run_git(
+        git,
+        ["-C", str(repo_root), "status", "--porcelain=v1", "--untracked-files=all", "--", repo_rel],
+        timeout=5,
+    )
+    status_lines = [line for line in status_result.stdout.splitlines() if line.strip()]
+    status_code = status_lines[0][:2] if status_lines else ""
+    is_untracked = any(line.startswith("?? ") for line in status_lines)
+
+    if is_untracked:
+        diff_result = _run_git(
+            git,
+            ["-C", str(repo_root), "diff", "--no-ext-diff", "--no-color", "--no-index", "--", "/dev/null", str(target)],
+            timeout=10,
+            allow_returncodes=(0, 1),
+        )
+    else:
+        diff_result = _run_git(
+            git,
+            ["-C", str(repo_root), "diff", "--no-ext-diff", "--no-color", "HEAD", "--", repo_rel],
+            timeout=10,
+        )
+
+    diff = diff_result.stdout or ""
+    truncated = False
+    encoded = diff.encode("utf-8", errors="replace")
+    if len(encoded) > _MAX_WORKSPACE_GIT_DIFF_BYTES:
+        diff = encoded[:_MAX_WORKSPACE_GIT_DIFF_BYTES].decode("utf-8", errors="replace")
+        diff += "\n\n[diff truncated by Hermes WebUI]"
+        truncated = True
+
+    return {
+        "ok": True,
+        "workspace": resolved,
+        "repo_root": str(repo_root),
+        "path": workspace_rel,
+        "repo_path": repo_rel,
+        "status": status_code.strip() or ("untracked" if is_untracked else "unchanged"),
+        "baseline": "git:HEAD",
+        "baseline_label": "Current workspace git diff vs HEAD",
+        "diff": diff,
+        "has_diff": bool(diff.strip()),
+        "truncated": truncated,
     }
 
 

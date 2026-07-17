@@ -214,7 +214,8 @@ def test_tool_events_are_guarded_against_stale_session_and_stream():
         assert "_terminalStateReached||_streamFinalized" in handler
         assert "S.session.session_id!==activeSid" in handler
         assert "S.activeStreamId!==streamId" in handler
-        assert "appendLiveToolCard(tc,{sessionId:activeSid,streamId})" in handler
+        assert "appendLiveToolCard(tc,{sessionId:activeSid,streamId" in handler
+        assert "anchorAlreadyRendered:" in handler
 
 
 def test_close_live_stream_marks_inflight_for_reattach_on_return():
@@ -812,8 +813,11 @@ def test_tool_complete_handler_gates_segment_reset_on_orphan_flag():
         "segment reset must be gated behind the orphan-completion branch"
     )
     # The non-orphan branch must still place the card (in place).
-    assert handler.count("appendLiveToolCard(tc,{sessionId:activeSid,streamId})") >= 2, (
+    assert handler.count("appendLiveToolCard(tc,{sessionId:activeSid,streamId") >= 2, (
         "both orphan and in-place branches must append/update the tool card"
+    )
+    assert handler.count("anchorAlreadyRendered:toolCompleteAnchorRender.rendered") >= 2, (
+        "both branches must preserve anchor-render ownership and avoid a duplicate DiffCard paint"
     )
 
 

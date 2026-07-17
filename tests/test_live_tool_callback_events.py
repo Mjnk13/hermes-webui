@@ -56,11 +56,25 @@ def test_legacy_progress_events_are_suppressed_when_structured_callbacks_are_wir
     src = _read("api/streaming.py")
     block = _function_block(src, "on_tool")
 
-    assert "event_type in (None, 'tool.started') and 'tool_start_callback' in _agent_params" in block
+    assert "event_type in (None, 'tool.started') and 'tool_start_callback' in _agent_params and not mutation_preview" in block
     assert "event_type == 'tool.completed' and 'tool_complete_callback' in _agent_params" in block
     assert block.index("'tool_start_callback' in _agent_params") < block.index("put('tool'")
     assert block.index("'tool_complete_callback' in _agent_params") < block.index("put('tool_complete'")
 
+
+def test_mutation_progress_starts_are_not_suppressed_and_write_file_starts_pending():
+    src = _read("api/streaming.py")
+    on_tool = _function_block(src, "on_tool")
+    preview = _function_block(src, "_live_mutation_preview_from_tool")
+
+    assert "and not mutation_preview" in on_tool, (
+        "File mutation progress starts must still emit a tool SSE event even "
+        "when structured callbacks are wired, otherwise real patch/write_file "
+        "runs stay visually silent until completion."
+    )
+    assert "'pending': True" in preview
+    assert "'status': 'Writing file…'" in preview
+    assert "result is None and ('write' in tool_name or 'create' in tool_name)" in preview
 
 def test_tool_callback_events_keep_existing_frontend_event_contract():
     messages = _read("static/messages.js")

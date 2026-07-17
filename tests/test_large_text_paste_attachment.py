@@ -122,7 +122,19 @@ def test_paste_handler_keeps_image_paste_path_before_large_text_path():
     attach_idx = BOOT_JS.index("_attachLargePastedText(pastedTextFile);", text_idx)
 
     assert image_idx < return_idx < text_idx < attach_idx
-    assert "if(!hasText)e.preventDefault();" in BOOT_JS[image_idx:return_idx]
+
+
+def test_image_paste_always_prevents_native_contenteditable_insert():
+    paste_idx = BOOT_JS.index("$('msg').addEventListener('paste',e=>{")
+    image_idx = BOOT_JS.index("if(imageItems.length){", paste_idx)
+    return_idx = BOOT_JS.index("return;", image_idx)
+    image_block = BOOT_JS[image_idx:return_idx]
+
+    assert "e.preventDefault();" in image_block
+    assert "addFiles(files);" in image_block
+    assert "setStatus(t('image_pasted')+files.map(f=>f.name).join(', '));" in image_block
+    assert "hasText" not in image_block
+    assert image_block.index("e.preventDefault();") < image_block.index("addFiles(files);")
 
 
 def test_large_text_paste_prevents_default_textarea_insert_only_for_large_plain_text():

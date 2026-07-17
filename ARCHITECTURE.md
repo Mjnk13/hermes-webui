@@ -309,6 +309,26 @@ on_tool callback:
 The approval surface-on-tool logic means approvals appear immediately after the tool
 fires (within the same SSE stream), without waiting for the next poll cycle.
 
+#### Background delegation handoff
+
+An asynchronous `delegate_task` completion has two separate state paths:
+
+1. `api/background_process.py` persists the full completion prompt in
+   `DEFERRED_PROCESS_WAKEUPS`. This durable queue owns exactly-once delivery to
+   the successor `process_wakeup` turn.
+2. If the parent WebUI turn is still active, the host calls
+   `AIAgent.request_turn_handoff()` with control intent only. Hermes Agent
+   attaches a system handoff marker to the next completed tool result and
+   removes tools from the following provider request, allowing one concise
+   assistant response to close the parent turn.
+
+The control lane is deliberately separate from user Steer state: it must not
+render as user-authored input or drain as leftover Steer. WebUI clears it in a
+`finally` block around `run_conversation()` so a cached agent cannot carry the
+text-only closing state into the successor turn. If no safe tool boundary is
+reached, normal turn teardown still delivers the persisted completion; ordinary
+background command completions do not proactively close the active turn.
+
 ### 4.5 Approval System Integration
 
 The approval system uses the existing Hermes gateway module at tools/approval.py.
@@ -450,6 +470,25 @@ Rendering:
     renderMd(raw)         Homegrown markdown renderer (see 5.4 for known gaps)
     syncTopbar()          Updates topbar title, meta, model chip, workspace chip
     renderTray()          Updates attach tray showing pending files
+
+Live mutation DiffCards receive complete unified-diff payloads rather than token
+deltas. `assistantModifiedDiffHtml()` pre-renders their line-numbered, colored
+rows, then `ui.js` progressively types each code cell character by character
+over a short bounded animation. Per-line work is capped so one unusually long
+line cannot monopolize the timeline. Added/removed totals and collapsed
+unmodified-line gap labels count in direct proportion to the same reveal
+progress. Gutters, diff markers, and colors remain stable while text grows. The
+animation state is owned by the live mutation event and file path. File metadata
+(`diff --git`, `---`, `+++`) renders immediately without consuming progress;
+each hunk (`@@`) stays hidden until its sequential turn, then its old/new range
+numbers count to their targets before the hunk's code rows continue. Optional
+hunk section context after the closing `@@` is rendered as a separate row. For
+expandable diffs only the truncated view streams, so the animation ends at the
+`view_more` boundary while the hidden full view remains ready for expansion.
+State survives live DOM replacement, follows the internal diff scroll only
+while the reader is at its tail, and is cleared with the live mutation
+lifecycle. Reduced-motion, hidden-document, settled-history, and final-recap
+paths render all rows and counters at once.
 
 Approval:
     showApprovalCard(p)   Shows the approval card with command/description text

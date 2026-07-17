@@ -397,6 +397,17 @@
   <div class="resize-handle" id="sidebarResize"></div>
   </aside>
   <main class="main">
+    <div class="workbench-tabstrip" id="workbenchTabstrip" role="tablist" aria-label="Workspace tabs">
+      <button class="workbench-tab active" id="workbenchTabChat" type="button" role="tab" aria-selected="true" aria-controls="mainChat" onclick="switchPanel('chat')">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+        <span data-i18n="tab_chat">Chat</span>
+      </button>
+      <div class="workbench-browser-tabs" id="browserWorkbenchTabs" role="presentation"></div>
+      <button class="workbench-tab workbench-tab-open" id="workbenchOpenBrowser" type="button" data-browser-workbench-opener onclick="openBrowserWorkbenchTab()" title="Open new Browser tab (⇧⌘B)" aria-label="Open new Browser tab">
+        <span class="workbench-tab-plus" aria-hidden="true">+</span>
+        <span>Browser</span>
+      </button>
+    </div>
     <div class="update-banner" id="updateBanner">
       <div style="display:flex;flex-direction:column;flex:1;min-width:0">
         <span id="updateMsg"></span>
@@ -455,6 +466,62 @@
       <div id="liveToolCards" style="display:none;max-width:800px;margin:0 auto;width:100%;padding:0 24px;"></div>
     </div>
     </div>
+    <div id="mainBrowser" class="main-view" aria-labelledby="browserWorkbenchTitle">
+      <div class="browser-workbench-shell" data-mode="tab">
+        <div class="browser-workbench-header">
+          <div>
+            <h3 class="browser-workbench-title" id="browserWorkbenchTitle">Browser</h3>
+            <p class="browser-workbench-meta">Browse pages without leaving your chat.</p>
+          </div>
+          <button class="icon-btn browser-workbench-close" type="button" aria-label="Close Browser tab" onclick="closeBrowserWorkbenchTab()">×</button>
+        </div>
+        <div class="browser-workbench-toolbar" role="toolbar" aria-label="Browser Workbench controls">
+          <button class="browser-workbench-nav" id="browserWorkbenchBack" type="button" disabled aria-label="Back">←</button>
+          <button class="browser-workbench-nav" id="browserWorkbenchForward" type="button" disabled aria-label="Forward">→</button>
+          <button class="browser-workbench-nav browser-workbench-nav--reload" id="browserWorkbenchReload" type="button" disabled aria-label="Reload" data-load-status="idle"><span class="browser-workbench-reload-icon" aria-hidden="true">↻</span></button>
+          <div class="browser-workbench-url-wrap">
+            <input class="browser-workbench-url" id="browserWorkbenchUrl" type="url" placeholder="https://example.com or http://localhost:3000" aria-label="Browser Workbench URL" autocomplete="off" aria-autocomplete="list" aria-expanded="false" aria-controls="browserWorkbenchUrlSuggestions">
+            <div class="browser-workbench-url-suggestions" id="browserWorkbenchUrlSuggestions" role="listbox" aria-label="Browser history suggestions" hidden></div>
+          </div>
+          <button class="sm-btn" id="browserWorkbenchPing" type="button" disabled aria-pressed="false">Ping selection</button>
+          <button class="browser-workbench-menu-btn" id="browserWorkbenchMenuButton" type="button" aria-haspopup="menu" aria-expanded="false" aria-controls="browserWorkbenchMenu" title="Browser actions">⋯</button>
+        </div>
+        <div class="browser-workbench-menu" id="browserWorkbenchMenu" role="menu" aria-label="Browser actions" hidden>
+          <div class="browser-workbench-menu-section" role="none">
+            <div class="browser-workbench-menu-label" role="presentation">Capture</div>
+            <button class="browser-workbench-menu-item" type="button" role="menuitem" data-browser-action="take-screenshot"><span aria-hidden="true">□</span><span>Take Screenshot</span></button>
+            <button class="browser-workbench-menu-item" type="button" role="menuitem" data-browser-action="take-full-page-screenshot"><span aria-hidden="true">▤</span><span>Take Full Page Screenshot</span></button>
+            <button class="browser-workbench-menu-item" type="button" role="menuitem" data-browser-action="capture-area-screenshot"><span aria-hidden="true">⌗</span><span>Capture Area Screenshot</span></button>
+          </div>
+          <div class="browser-workbench-menu-section" role="none">
+            <div class="browser-workbench-menu-label" role="presentation">Page</div>
+            <button class="browser-workbench-menu-item" type="button" role="menuitem" data-browser-action="hard-reload"><span aria-hidden="true">↻</span><span>Hard Reload</span></button>
+            <button class="browser-workbench-menu-item" type="button" role="menuitem" data-browser-action="copy-url"><span aria-hidden="true">⛓</span><span>Copy Current URL</span></button>
+            <button class="browser-workbench-menu-item" type="button" role="menuitem" data-browser-action="open-devtools-panel"><span aria-hidden="true">◧</span><span>Open DevTools Panel</span></button>
+            <button class="browser-workbench-menu-item" type="button" role="menuitem" data-browser-action="open-devtools-popout"><span aria-hidden="true">↗</span><span>Pop Out DevTools</span></button>
+          </div>
+          <div class="browser-workbench-menu-section browser-workbench-menu-zoom" role="group" aria-label="Browser zoom controls">
+            <div class="browser-workbench-menu-label" role="presentation">Zoom</div>
+            <div class="browser-workbench-menu-zoom-row" role="none">
+              <button class="browser-workbench-menu-zoom-btn" type="button" role="menuitem" data-browser-action="zoom-out" aria-label="Zoom out"><span aria-hidden="true">−</span></button>
+              <label class="browser-workbench-menu-zoom-value" aria-label="Browser zoom percentage in menu">
+                <input id="browserWorkbenchMenuZoomInput" type="text" inputmode="decimal" value="100" aria-label="Browser zoom percentage value in menu">
+                <span aria-hidden="true">%</span>
+              </label>
+              <button class="browser-workbench-menu-zoom-btn" type="button" role="menuitem" data-browser-action="zoom-in" aria-label="Zoom in"><span aria-hidden="true">+</span></button>
+            </div>
+          </div>
+          <div class="browser-workbench-menu-section" role="none">
+            <div class="browser-workbench-menu-label" role="presentation">Data</div>
+            <button class="browser-workbench-menu-item" type="button" role="menuitem" data-browser-action="clear-history"><span aria-hidden="true">◷</span><span>Clear Browsing History</span></button>
+            <button class="browser-workbench-menu-item" type="button" role="menuitem" data-browser-action="clear-cookies"><span aria-hidden="true">●</span><span>Clear Cookies</span></button>
+            <button class="browser-workbench-menu-item" type="button" role="menuitem" data-browser-action="clear-cache"><span aria-hidden="true">◇</span><span>Clear Cache</span></button>
+          </div>
+        </div>
+        <div class="browser-workbench-viewport" id="browserWorkbenchViewport" tabindex="0" aria-label="Browser viewport"></div>
+        <div class="browser-workbench-status" id="browserWorkbenchStatus" aria-live="polite"></div>
+      </div>
+    </div>
     <div class="reconnect-banner" id="reconnectBanner">
       <span id="reconnectMsg"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="vertical-align:-1px"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg> A response may have been in progress when you last left. Reload messages?</span>
       <div style="display:flex;gap:8px;flex-shrink:0">
@@ -483,10 +550,10 @@
     <div class="composer-wrap" id="composerWrap">
       <div class="composer-flyout">
       <!-- Queue flyout: slides up from behind composer, same pattern as approval-card -->
-      <div id="queueCard" class="queue-card" role="region" aria-label="Queued messages" aria-live="polite">
+      <div id="queueCard" class="queue-card" role="region" aria-label="Queued messages" aria-live="polite" data-global-overlay="visible">
         <div id="queueChips" class="queue-card-inner"></div>
       </div>
-      <div class="approval-card" id="approvalCard" role="alertdialog" aria-labelledby="approvalHeading" aria-describedby="approvalDesc" hidden aria-hidden="true" inert>
+      <div class="approval-card" id="approvalCard" role="alertdialog" aria-labelledby="approvalHeading" aria-describedby="approvalDesc" hidden aria-hidden="true" inert data-global-overlay="visible">
         <div class="approval-inner">
           <div class="approval-header">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>
@@ -522,7 +589,7 @@
           </div>
         </div>
       </div>
-      <div class="clarify-card" id="clarifyCard" role="dialog" aria-labelledby="clarifyHeading" aria-describedby="clarifyQuestion clarifyHint" hidden aria-hidden="true" inert>
+      <div class="clarify-card" id="clarifyCard" role="dialog" aria-labelledby="clarifyHeading" aria-describedby="clarifyQuestion clarifyHint" hidden aria-hidden="true" inert data-global-overlay="visible">
         <div class="clarify-inner">
           <div class="clarify-header">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 17h.01"/><path d="M9.09 9a3 3 0 1 1 5.82 1c0 2-3 2-3 4"/><circle cx="12" cy="12" r="10"/></svg>
@@ -539,7 +606,7 @@
           <div class="clarify-hint" id="clarifyHint" data-i18n="clarify_hint">Pick a choice, or type your own answer below.</div>
         </div>
       </div>
-      <div class="composer-terminal-panel" id="composerTerminalPanel" hidden>
+      <div class="composer-terminal-panel" id="composerTerminalPanel" hidden data-global-overlay="shown">
         <div class="composer-terminal-inner">
           <div class="composer-terminal-resize-handle" id="terminalResizeHandle" role="separator" aria-orientation="horizontal" aria-label="Resize terminal" tabindex="0"></div>
           <div class="composer-terminal-header">
@@ -573,7 +640,7 @@
           </div>
         </div>
       </div>
-      <div id="handoffHintContainer" class="handoff-hint-container" style="display:none;"></div>
+      <div id="handoffHintContainer" class="handoff-hint-container" style="display:none;" data-global-overlay="shown"></div>
       </div>
       <!-- Queue pill outer: same positioning wrapper as .queue-card (max-width + padding) -->
       <div class="queue-pill-outer">
@@ -581,7 +648,7 @@
       </div>
       <div id="composerSelectionChips" class="composer-selection-chips" hidden aria-live="polite"></div>
       <div class="composer-box" id="composerBox">
-        <div class="cmd-dropdown" id="cmdDropdown"></div>
+        <div class="cmd-dropdown" id="cmdDropdown" data-global-overlay="open"></div>
         <div class="drop-hint" id="dropHint">
           <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
           <span id="dropHintText">Drop files to attach</span>
@@ -592,7 +659,7 @@
           <span class="voice-mode-indicator" id="voiceModeIndicator"></span>
           <span class="voice-mode-label" id="voiceModeLabel"></span>
         </div>
-        <textarea id="msg" rows="1" placeholder="Message Hermes…"></textarea>
+        <div id="msg" class="composer-editor" role="textbox" contenteditable="true" aria-multiline="true" aria-label="Message Hermes" data-placeholder="Message Hermes…" spellcheck="true"></div>
         <div id="composerWorkspaceContext" class="sr-only"></div>
         <div class="composer-footer">
           <div class="composer-left">
@@ -687,6 +754,13 @@
                 <span class="composer-reasoning-chevron" aria-hidden="true"><svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg></span>
               </button>
             </div>
+            <div class="composer-fast-wrap" id="composerFastWrap" style="display:none">
+              <button class="composer-fast-chip" id="composerFastChip" type="button" onclick="toggleFastDropdown()" title="Fast mode">
+                <span class="composer-fast-icon" aria-hidden="true"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg></span>
+                <span class="composer-fast-label" id="composerFastLabel">Normal</span>
+                <span class="composer-fast-chevron" aria-hidden="true"><svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg></span>
+              </button>
+            </div>
             <div class="composer-toolsets-wrap" id="composerToolsetsWrap">
               <button class="composer-toolsets-chip" id="composerToolsetsChip" type="button" onclick="toggleToolsetsDropdown()" title="Session toolsets">
                 <span class="composer-toolsets-icon" aria-hidden="true"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/></svg></span>
@@ -695,11 +769,13 @@
               </button>
             </div>
           </div>
-          <div id="savedPromptsPopup" class="saved-prompts-popup" style="display:none" role="menu" aria-label="Saved prompts" data-i18n-aria-label="composer_control_saved_prompts"></div>
+          <div id="savedPromptsPopup" class="saved-prompts-popup" style="display:none" role="menu" aria-label="Saved prompts" data-i18n-aria-label="composer_control_saved_prompts" data-global-overlay="shown"></div>
           <div class="composer-right">
             <span class="composer-status" id="composerStatus" style="display:none"></span>
+            <span class="thread-elapsed-timer" id="threadElapsedTimer" style="display:none" aria-live="off"></span>
             <div class="ctx-indicator-wrap" id="ctxIndicatorWrap" style="display:none">
               <button class="ctx-indicator" id="ctxIndicator" type="button" aria-label="Context window usage" aria-describedby="ctxTooltip">
+                <span class="ctx-compression-count" id="ctxCompressionCount" style="display:none"></span>
                 <span class="ctx-ring">
                   <svg class="ctx-ring-svg" viewBox="0 0 24 24" aria-hidden="true">
                     <circle class="ctx-ring-track" cx="12" cy="12" r="9.75"></circle>
@@ -708,11 +784,12 @@
                   <span class="ctx-ring-center" id="ctxPercent">0</span>
                 </span>
               </button>
-              <div class="ctx-tooltip" id="ctxTooltip" role="tooltip" aria-hidden="true">
+              <div class="ctx-tooltip" id="ctxTooltip" role="tooltip" aria-hidden="true" data-global-overlay="hover" data-global-overlay-trigger="ctxIndicatorWrap">
                 <div class="ctx-tooltip-title">Context window</div>
                 <div class="ctx-tooltip-line" id="ctxTooltipUsage"></div>
                 <div class="ctx-tooltip-line" id="ctxTooltipTokens"></div>
                 <div class="ctx-tooltip-line" id="ctxTooltipThreshold"></div>
+                <div class="ctx-tooltip-line" id="ctxTooltipCompressions" style="display:none"></div>
                 <div class="ctx-tooltip-line" id="ctxTooltipCost" style="display:none"></div>
                 <div class="ctx-tooltip-compress" id="ctxTooltipCompress" style="display:none">
                   <button class="ctx-compress-btn" id="ctxCompressBtn" type="button"></button>
@@ -724,7 +801,7 @@
               <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="12" y1="19" x2="12" y2="5"/><polyline points="5 12 12 5 19 12"/></svg>
             </button>
           </div>
-          <div class="composer-mobile-config-panel" id="composerMobileConfigPanel" aria-label="Workspace, model, quota, reasoning, and context settings">
+          <div class="composer-mobile-config-panel" id="composerMobileConfigPanel" aria-label="Workspace, model, quota, reasoning, and context settings" data-global-overlay="open">
             <button class="composer-mobile-config-action" id="composerMobileWorkspaceAction" type="button" onclick="toggleComposerWsDropdown()" title="Switch workspace" aria-label="Switch workspace" aria-haspopup="true" aria-expanded="false" aria-controls="composerWsDropdown">
               <span class="composer-workspace-icon" aria-hidden="true"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg></span>
               <span class="composer-mobile-config-copy"><span class="composer-mobile-config-kicker" data-i18n="composer_mobile_workspace">Workspace</span><span class="composer-mobile-config-value" id="composerMobileWorkspaceLabel"></span></span>
@@ -741,19 +818,24 @@
               <span class="composer-reasoning-icon" aria-hidden="true"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9.5 2A2.5 2.5 0 0 1 12 4.5v15a2.5 2.5 0 0 1-4.96-.46 2.5 2.5 0 0 1-2.96-3.08 3 3 0 0 1-.34-5.58 2.5 2.5 0 0 1 1.32-4.24 2.5 2.5 0 0 1 1.98-3A2.5 2.5 0 0 1 9.5 2Z"/><path d="M14.5 2A2.5 2.5 0 0 0 12 4.5v15a2.5 2.5 0 0 0 4.96-.46 2.5 2.5 0 0 0 2.96-3.08 3 3 0 0 0 .34-5.58 2.5 2.5 0 0 0-1.32-4.24 2.5 2.5 0 0 0-1.98-3A2.5 2.5 0 0 0 14.5 2Z"/></svg></span>
               <span class="composer-mobile-config-copy"><span class="composer-mobile-config-kicker" data-i18n="composer_mobile_reasoning">Reasoning</span><span class="composer-mobile-config-value" id="composerMobileReasoningLabel"></span></span>
             </button>
+            <button class="composer-mobile-config-action" id="composerMobileFastAction" type="button" onclick="toggleFastDropdown()" title="Fast mode" style="display:none">
+              <span class="composer-fast-icon" aria-hidden="true"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg></span>
+              <span class="composer-mobile-config-copy"><span class="composer-mobile-config-kicker" data-i18n="composer_mobile_fast">Fast</span><span class="composer-mobile-config-value" id="composerMobileFastLabel">Normal</span></span>
+            </button>
             <div class="composer-mobile-config-action composer-mobile-context-action" id="composerMobileContextAction" role="group" aria-label="Context window" style="display:none">
               <span class="composer-mobile-config-copy composer-mobile-context-copy">
                 <span class="composer-mobile-config-kicker" data-i18n="composer_mobile_context">Context</span>
                 <span class="composer-mobile-config-value" id="composerMobileContextUsage"></span>
                 <span class="composer-mobile-context-detail" id="composerMobileContextTokens"></span>
                 <span class="composer-mobile-context-detail" id="composerMobileContextThreshold"></span>
+                <span class="composer-mobile-context-detail" id="composerMobileContextCompressions" style="display:none"></span>
                 <span class="composer-mobile-context-detail" id="composerMobileContextCost" style="display:none"></span>
               </span>
               <button class="ctx-compress-btn composer-mobile-context-compress" id="composerMobileCtxCompressBtn" type="button" style="display:none"></button>
             </div>
           </div>
-          <div class="ws-dropdown ws-dropdown-footer" id="composerWsDropdown" hidden aria-hidden="true" inert></div>
-          <div class="composer-reasoning-dropdown" id="composerReasoningDropdown">
+          <div class="ws-dropdown ws-dropdown-footer" id="composerWsDropdown" hidden aria-hidden="true" inert data-global-overlay="open"></div>
+          <div class="composer-reasoning-dropdown" id="composerReasoningDropdown" data-global-overlay="open">
             <div class="reasoning-option" data-effort="">Default</div>
             <div class="reasoning-option" data-effort="none">None</div>
             <div class="reasoning-option" data-effort="minimal">Minimal</div>
@@ -763,7 +845,11 @@
             <div class="reasoning-option" data-effort="xhigh">Extra High</div>
             <div class="reasoning-option" data-effort="max">Max</div>
           </div>
-          <div class="composer-toolsets-dropdown" id="composerToolsetsDropdown">
+          <div class="composer-fast-dropdown" id="composerFastDropdown" data-global-overlay="open">
+            <div class="fast-option" data-fast-mode="normal">Normal</div>
+            <div class="fast-option" data-fast-mode="fast">Fast</div>
+          </div>
+          <div class="composer-toolsets-dropdown" id="composerToolsetsDropdown" data-global-overlay="open">
             <div class="toolsets-dropdown-desc" id="toolsetsDropdownDesc"></div>
             <div class="toolsets-dropdown-state" id="toolsetsDropdownState"></div>
             <div class="toolsets-dropdown-input-row">
@@ -774,12 +860,13 @@
               <button type="button" class="toolsets-action-btn toolsets-clear-btn" id="toolsetsClearBtn">Clear (global)</button>
             </div>
           </div>
-          <div class="model-dropdown" id="composerModelDropdown"></div>
+          <div class="model-dropdown" id="composerModelDropdown" data-global-overlay="open"></div>
         </div>
         <div class="upload-bar-wrap" id="uploadBarWrap"><div class="upload-bar" id="uploadBar"></div></div>
       </div>
     </div>
     </div><!-- /#mainChat -->
+
     <div id="mainSkills" class="main-view">
       <div class="main-view-header">
         <div class="main-view-title" id="skillDetailTitle"></div>
@@ -946,8 +1033,9 @@
               <button class="settings-action-btn" id="btnShareSession" title="Create a public read-only share link" data-i18n-title="share_session_tooltip"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="18" cy="5" r="3"/><circle cx="6" cy="12" r="3"/><circle cx="18" cy="19" r="3"/><path d="M8.6 13.5l6.8 4"/><path d="M15.4 6.5 8.6 10.5"/></svg> <span data-i18n="share_session">Share</span></button>
               <button class="settings-action-btn danger" id="btnStopSharingSession" title="Revoke the public read-only share link for this conversation" data-i18n-title="stop_sharing_session_tooltip"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M18 8a6 6 0 0 0-8.49 0L6 11.5"/><path d="M18 16a6 6 0 0 1-8.49 0L6 12.5"/><line x1="3" y1="3" x2="21" y2="21"/></svg> <span data-i18n="stop_sharing_session">Stop sharing</span></button>
               <button class="settings-action-btn" id="btnExportHTML" title="Export as a self-contained HTML page" data-i18n-title="export_session_html_tooltip"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><path d="M9 13l-2 2 2 2"/><path d="M15 13l2 2-2 2"/></svg> <span data-i18n="export_session_html">HTML</span></button>
-              <button class="settings-action-btn" id="btnImportJSON" title="Import session from JSON" data-i18n-title="import_session_json_tooltip"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg> <span data-i18n="import">Import</span></button>
-              <button class="settings-action-btn danger" id="btnClearConvModal" onclick="clearConversation()" title="Clear all messages in this conversation" data-i18n-title="clear_conversation_btn_tooltip"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 1 2 2 2v2"/></svg> <span data-i18n="clear">Clear</span></button>
+              <button class="settings-action-btn" id="btnExportHTML" title="Export as a self-contained HTML page" data-i18n-title="export_session_html_tooltip"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><path d="M9 13l-2 2 2 2"/><path d="M15 13l2 2-2 2"/></svg> <span data-i18n="export_session_html">HTML</span></button>
+              <button class="settings-action-btn" id="btnImportJSON" title="Import session from JSON" data-i18n-title="import_session_json_tooltip"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5c-1.1 0-2-.9-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg> <span data-i18n="import">Import</span></button>
+              <button class="settings-action-btn danger" id="btnClearConvModal" onclick="clearConversation()" title="Clear all messages in this conversation" data-i18n-title="clear_conversation_btn_tooltip"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/></svg> <span data-i18n="clear">Clear</span></button>
             </div>
             <input type="file" id="importFileInput" accept=".json" style="display:none">
           </div>
@@ -1681,6 +1769,13 @@
       </div>
     </div>
     <input type="file" id="workspaceFileInput" class="file-input-visually-hidden" multiple accept="image/*,text/*,.pdf,.json,.csv,.md,.py,.js,.ts,.yaml,.yml,.toml,.zip,.tar,.gz,.tgz,.bz2,.xz">
+    <section class="changed-turn-panel" id="changedTurnPanel" hidden aria-live="polite">
+      <div class="changed-turn-header">
+        <div class="changed-turn-title">Changed This Turn</div>
+        <span class="changed-turn-count" id="changedTurnCount">0</span>
+      </div>
+      <div class="changed-turn-list" id="changedTurnList"></div>
+    </section>
     <div class="workspace-panel-tabs" role="tablist" aria-label="Workspace panel views" data-i18n-aria-label="workspace_panel_views">
       <button class="workspace-panel-tab active" id="workspaceFilesTab" type="button" onclick="switchWorkspacePanelTab('files')" role="tab" aria-selected="true" data-i18n="workspace_files_tab">Files</button>
       <button class="workspace-panel-tab" id="workspaceArtifactsTab" type="button" onclick="switchWorkspacePanelTab('artifacts')" role="tab" aria-selected="false"><span data-i18n="workspace_artifacts_tab">Artifacts</span> <span id="workspaceArtifactsCount" class="workspace-artifacts-count">0</span></button>
@@ -1738,7 +1833,7 @@
 </div>
 <div class="mobile-overlay" id="mobileOverlay" onclick="closeMobileSidebar()"></div>
 <div class="pwa-sidebar-edge-guard" id="pwaSidebarEdgeGuard" aria-hidden="true"></div>
-<div class="app-dialog-overlay" id="appDialogOverlay" style="display:none" aria-hidden="true">
+<div class="app-dialog-overlay" id="appDialogOverlay" style="display:none" aria-hidden="true" data-global-overlay="modal">
   <div class="app-dialog" id="appDialog" role="dialog" aria-modal="true" aria-labelledby="appDialogTitle" aria-describedby="appDialogDesc">
     <div class="app-dialog-header">
       <div class="app-dialog-title" id="appDialogTitle">Confirm action</div>
@@ -1754,6 +1849,7 @@
     </div>
   </div>
 </div>
+<div id="globalOverlayLayer" class="global-overlay-layer" aria-live="off"></div>
 <div class="toast" id="toast"></div>
 <script src="static/i18n.js?v=__WEBUI_VERSION__" defer></script>
 <script src="static/icons.js?v=__WEBUI_VERSION__" defer></script>
@@ -1765,6 +1861,7 @@
 <script src="static/commands.js?v=__WEBUI_VERSION__" defer></script>
 <script src="static/messages.js?v=__WEBUI_VERSION__" defer></script>
 <script src="static/extension_settings.js?v=__WEBUI_VERSION__" defer></script>
+<script src="static/browser_workbench.js?v=__WEBUI_VERSION__" defer></script>
 <script src="static/panels.js?v=__WEBUI_VERSION__" defer></script>
 <script src="static/onboarding.js?v=__WEBUI_VERSION__" defer></script>
 <script src="static/boot.js?v=__WEBUI_VERSION__" defer></script>
@@ -1889,6 +1986,6 @@
   </div>
   <div id="outlinePanel"></div>
 </div>
-<div class="profile-dropdown" id="profileDropdown"></div>
+<div class="profile-dropdown" id="profileDropdown" data-global-overlay="open"></div>
 </body>
 </html>

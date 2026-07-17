@@ -2822,6 +2822,8 @@ from api.config import (
     get_reasoning_status,
     set_reasoning_display,
     set_reasoning_effort,
+    get_fast_mode_status,
+    set_fast_mode,
     create_stream_channel,
     get_webui_session_save_mode,
     STREAM_GOAL_RELATED,
@@ -2963,6 +2965,10 @@ def _clear_stale_stream_state(session) -> bool:
                     original_stub.pending_user_message = None
                 if hasattr(original_stub, "pending_attachments"):
                     original_stub.pending_attachments = []
+                if hasattr(original_stub, "pending_context_items"):
+                    original_stub.pending_context_items = []
+                if hasattr(original_stub, "pending_browser_context_parts"):
+                    original_stub.pending_browser_context_parts = []
                 if hasattr(original_stub, "pending_started_at"):
                     original_stub.pending_started_at = None
                 if hasattr(original_stub, "pending_user_source"):
@@ -3004,6 +3010,10 @@ def _clear_stale_stream_state(session) -> bool:
                             original_stub.pending_user_message = None
                         if hasattr(original_stub, "pending_attachments"):
                             original_stub.pending_attachments = []
+                        if hasattr(original_stub, "pending_context_items"):
+                            original_stub.pending_context_items = []
+                        if hasattr(original_stub, "pending_browser_context_parts"):
+                            original_stub.pending_browser_context_parts = []
                         if hasattr(original_stub, "pending_started_at"):
                             original_stub.pending_started_at = None
                         if hasattr(original_stub, "pending_user_source"):
@@ -3019,6 +3029,10 @@ def _clear_stale_stream_state(session) -> bool:
             session.pending_user_message = None
         if hasattr(session, "pending_attachments"):
             session.pending_attachments = []
+        if hasattr(session, "pending_context_items"):
+            session.pending_context_items = []
+        if hasattr(session, "pending_browser_context_parts"):
+            session.pending_browser_context_parts = []
         if hasattr(session, "pending_started_at"):
             session.pending_started_at = None
         if hasattr(session, "pending_user_source"):
@@ -3042,6 +3056,10 @@ def _clear_stale_stream_state(session) -> bool:
                 original_stub.pending_user_message = None
             if hasattr(original_stub, "pending_attachments"):
                 original_stub.pending_attachments = []
+            if hasattr(original_stub, "pending_context_items"):
+                original_stub.pending_context_items = []
+            if hasattr(original_stub, "pending_browser_context_parts"):
+                original_stub.pending_browser_context_parts = []
             if hasattr(original_stub, "pending_started_at"):
                 original_stub.pending_started_at = None
             if hasattr(original_stub, "pending_user_source"):
@@ -3429,6 +3447,7 @@ def _run_journal_live_snapshot(stream_id: str | None, *, handler=None) -> dict |
         args = call.get("args") if isinstance(call.get("args"), dict) else {}
         preview = str(call.get("preview") or "")
         snippet = str(call.get("snippet") or "")
+        mutation_preview = copy.deepcopy(call.get("mutation_preview") or call.get("mutationPreview")) if isinstance(call, dict) else None
         tool = {
             "id": tool_id,
             "tid": tool_id,
@@ -3441,6 +3460,9 @@ def _run_journal_live_snapshot(stream_id: str | None, *, handler=None) -> dict |
             "duration": call.get("duration"),
             "started_at": call.get("started_at"),
         }
+        if mutation_preview:
+            tool["mutation_preview"] = mutation_preview
+            tool["mutationPreview"] = mutation_preview
         payload = {
             "name": name,
             "args": args,
@@ -3453,7 +3475,19 @@ def _run_journal_live_snapshot(stream_id: str | None, *, handler=None) -> dict |
             "activitySegmentSeq": segment_seq,
             "activityBurstId": burst_id or 0,
         }
-        return {
+        if mutation_preview:
+            payload["mutation_preview"] = mutation_preview
+            payload["mutationPreview"] = mutation_preview
+            ui_part = {
+                "type": "mutation_timeline_event",
+                "renderer": "assistant_diff_card",
+                "tool_call_id": tool_id or None,
+                "tool_name": name,
+                "mutation_preview": mutation_preview,
+            }
+        else:
+            ui_part = None
+        row = {
             "row_id": row_id,
             "order_index": len(anchor_activity_rows),
             "kind": "tool_completed" if call.get("done") else "tool_started",
@@ -3485,6 +3519,9 @@ def _run_journal_live_snapshot(stream_id: str | None, *, handler=None) -> dict |
             "tool": tool,
             "payload": payload,
         }
+        if ui_part:
+            row["ui_part"] = ui_part
+        return row
 
     anchor_activity_rows: list[dict] = []
     thinking_row_inserted = False
@@ -3667,6 +3704,12 @@ def _run_journal_live_snapshot(stream_id: str | None, *, handler=None) -> dict |
             "final_message_ref": None,
             "terminal_state": None,
             "activity_rows": anchor_activity_rows,
+            "ui_parts": [
+                {**row["ui_part"], "row_id": row.get("row_id") or "", "order_index": row.get("order_index")}
+                for row in anchor_activity_rows
+                if isinstance(row, dict) and isinstance(row.get("ui_part"), dict)
+                and row.get("ui_part", {}).get("type") == "mutation_timeline_event"
+            ],
         },
     }
 
@@ -4198,6 +4241,7 @@ def _anchor_scene_tool_row(tool, order_index, message_index, stream_id=""):
     args = _anchor_scene_tool_args(tool)
     preview = str((tool or {}).get("preview") or (tool or {}).get("summary") or "")
     snippet = str((tool or {}).get("snippet") or (tool or {}).get("result") or (tool or {}).get("output") or "")
+    mutation_preview = copy.deepcopy((tool or {}).get("mutation_preview") or (tool or {}).get("mutationPreview")) if isinstance(tool, dict) else None
     row["row_id"] = f"hydrated:{stream_id or 'stream'}:tool:{tid}" if tid else row["row_id"]
     row["tool_call_id"] = tid or None
     row["tool"] = {
@@ -4214,7 +4258,19 @@ def _anchor_scene_tool_row(tool, order_index, message_index, stream_id=""):
         "started_at": (tool or {}).get("started_at") if isinstance(tool, dict) else None,
         "signature": f"{name}|{tid}|{json.dumps(args, sort_keys=True, default=str)}",
     }
+    if mutation_preview:
+        row["tool"]["mutation_preview"] = mutation_preview
+        row["tool"]["mutationPreview"] = mutation_preview
+        row["ui_part"] = {
+            "type": "mutation_timeline_event",
+            "renderer": "assistant_diff_card",
+            "tool_call_id": tid or None,
+            "tool_name": name,
+            "mutation_preview": mutation_preview,
+        }
     row["payload"].update({"tid": tid, "id": tid, "name": name, "args": args, "preview": preview, "snippet": snippet})
+    if mutation_preview:
+        row["payload"].update({"mutation_preview": mutation_preview, "mutationPreview": mutation_preview, "ui_part": row.get("ui_part")})
     return row
 
 
@@ -4485,10 +4541,33 @@ def _anchor_scene_content_rows(message, order_index, message_index, stream_id=""
     return rows
 
 
+def _anchor_scene_tool_row_semantic_mutation_key(row) -> str:
+    if not isinstance(row, dict) or row.get("role") != "tool":
+        return ""
+    tool_raw = row.get("tool")
+    payload_raw = row.get("payload")
+    tool = tool_raw if isinstance(tool_raw, dict) else {}
+    payload = payload_raw if isinstance(payload_raw, dict) else {}
+    name = str(tool.get("name") or payload.get("name") or "").replace("functions.", "", 1).lower()
+    if name not in {"write_file", "patch", "edit_file", "create_file"}:
+        return ""
+    tool_args = tool.get("args")
+    payload_args = payload.get("args")
+    args = tool_args if isinstance(tool_args, dict) else payload_args if isinstance(payload_args, dict) else {}
+    path = str(args.get("path") or args.get("file_path") or args.get("file") or args.get("target") or "")
+    if not path:
+        return ""
+    discriminator = "\x1f".join(str(args.get(key) or "") for key in ("mode", "old_string", "new_string", "content"))
+    return "\x1f".join([name, path, discriminator])
+
+
 def _anchor_scene_row_key(row) -> str:
     if not isinstance(row, dict):
         return ""
     if row.get("role") == "tool":
+        semantic_mutation_key = _anchor_scene_tool_row_semantic_mutation_key(row)
+        if semantic_mutation_key:
+            return f"tool-mutation:{semantic_mutation_key}"
         tool = row.get("tool") if isinstance(row.get("tool"), dict) else {}
         return "tool:" + str(
             row.get("tool_call_id")
@@ -4580,6 +4659,21 @@ def _complete_hydrated_anchor_scene(messages, scene, message_index, *, message_o
                     changed = True
             return base, changed
 
+        def mutation_preview_quality(value):
+            if not isinstance(value, dict):
+                return 0
+            quality = 0
+            for file in value.get("files") or []:
+                if not isinstance(file, dict):
+                    continue
+                diff = str(file.get("diff") or "")
+                if not diff.strip():
+                    continue
+                quality = max(quality, 1)
+                if re.search(r"^@@\s+-\d+(?:,\d+)?\s+\+\d+(?:,\d+)?\s+@@", diff, re.MULTILINE):
+                    quality = 2
+            return quality
+
         for key in ("snippet", "result", "output"):
             incoming_value = incoming_tool.get(key)
             if not empty(incoming_value) and (
@@ -4606,6 +4700,19 @@ def _complete_hydrated_anchor_scene(messages, scene, message_index, *, message_o
             incoming_value = incoming_payload.get(key)
             if not empty(incoming_value) and empty(merged_payload.get(key)):
                 merged_payload[key] = copy.deepcopy(incoming_value)
+        for key in ("mutation_preview", "mutationPreview"):
+            incoming_value = incoming_tool.get(key)
+            if mutation_preview_quality(incoming_value) > mutation_preview_quality(merged_tool.get(key)):
+                merged_tool[key] = copy.deepcopy(incoming_value)
+            incoming_value = incoming_payload.get(key)
+            if mutation_preview_quality(incoming_value) > mutation_preview_quality(merged_payload.get(key)):
+                merged_payload[key] = copy.deepcopy(incoming_value)
+        incoming_ui_part = incoming.get("ui_part") if isinstance(incoming.get("ui_part"), dict) else None
+        merged_ui_part = merged.get("ui_part") if isinstance(merged.get("ui_part"), dict) else None
+        if incoming_ui_part and mutation_preview_quality(incoming_ui_part.get("mutation_preview")) > mutation_preview_quality(
+            merged_ui_part.get("mutation_preview") if merged_ui_part else None
+        ):
+            merged["ui_part"] = copy.deepcopy(incoming_ui_part)
         merged_args, args_changed = merge_missing_args(merged_tool.get("args"), incoming_tool.get("args"))
         if args_changed:
             merged_tool["args"] = merged_args
@@ -4635,7 +4742,7 @@ def _complete_hydrated_anchor_scene(messages, scene, message_index, *, message_o
             return
         key = _anchor_scene_row_key(row)
         if key and key in seen:
-            if key.startswith("tool:"):
+            if row.get("role") == "tool":
                 index = seen[key]
                 rows[index] = merge_duplicate_tool_row(
                     rows[index],
@@ -4788,6 +4895,12 @@ def _complete_hydrated_anchor_scene(messages, scene, message_index, *, message_o
         if duration is not None:
             repaired["turn_duration"] = duration
     repaired["activity_rows"] = rows
+    repaired["ui_parts"] = [
+        {**row["ui_part"], "row_id": row.get("row_id") or "", "order_index": row.get("order_index")}
+        for row in rows
+        if isinstance(row, dict) and isinstance(row.get("ui_part"), dict)
+        and row.get("ui_part", {}).get("type") == "mutation_timeline_event"
+    ]
     identity = repaired.get("identity") if isinstance(repaired.get("identity"), dict) else {}
     identity = dict(identity)
     identity["source_message_refs"] = [
@@ -6677,18 +6790,18 @@ def _context_length_lookup_inputs_for_model(
 def _should_attach_codex_provider_context(model: str, raw_active_provider: str, catalog: dict) -> bool:
     """Return True when a bare Codex model needs separate provider context.
 
-    OpenAI, OpenAI Codex, Copilot, and OpenRouter can all expose GPT-looking
-    bare names. If a session stores only ``gpt-...`` while Codex is active, a
-    later provider-list/default-model round trip can lose the user's Codex
-    choice. Store the provider separately instead of converting the persisted
-    model to ``@openai-codex:model``.
+    OpenAI, OpenAI Codex, codex-lb, Copilot, and OpenRouter can all expose
+    GPT-looking bare names. If a session stores only ``gpt-...`` while a Codex
+    account route is active, a later provider-list/default-model round trip can
+    lose the user's account choice. Store the provider separately instead of
+    converting the persisted model to ``@openai-codex:model``.
     """
-    if raw_active_provider != "openai-codex":
+    if raw_active_provider not in {"openai-codex", "codex-lb"}:
         return False
     if not model.lower().startswith("gpt"):
         return False
     for group in catalog.get("groups") or []:
-        if str(group.get("provider_id") or "").strip().lower() != "openai-codex":
+        if str(group.get("provider_id") or "").strip().lower() != raw_active_provider:
             continue
         return any(
             _catalog_model_id_matches(entry.get("id"), model)
@@ -9611,6 +9724,145 @@ from api.oauth import (
     start_onboarding_oauth_flow,
 )
 
+_CHECKPOINT_RESTORE_CHAT_MODES = {"chat_only", "chat_files"}
+_CHECKPOINT_RESTORE_FILE_MODES = {"files_only", "chat_files"}
+_CHECKPOINT_RESTORE_MODES = _CHECKPOINT_RESTORE_CHAT_MODES | _CHECKPOINT_RESTORE_FILE_MODES
+
+
+def _checkpoint_ids_from_turn_journal_event(event: dict) -> set[str]:
+    ids: set[str] = set()
+    if not isinstance(event, dict):
+        return ids
+    single = str(event.get("checkpoint_id") or "").strip()
+    if single:
+        ids.add(single)
+    for item in event.get("checkpoints") or []:
+        if not isinstance(item, dict):
+            continue
+        cid = str(item.get("checkpoint_id") or item.get("id") or "").strip()
+        if cid:
+            ids.add(cid)
+    return ids
+
+
+def _checkpoint_assistant_index_from_events(events, checkpoint: str) -> int | None:
+    target = str(checkpoint or "").strip()
+    if not target:
+        return None
+    for event in reversed(list(events or [])):
+        if not isinstance(event, dict) or event.get("event") != "checkpoint_paths":
+            continue
+        if target not in _checkpoint_ids_from_turn_journal_event(event):
+            continue
+        raw_idx = event.get("assistant_message_index")
+        if raw_idx is None:
+            return None
+        try:
+            idx = int(raw_idx)
+        except (TypeError, ValueError):
+            return None
+        return idx if idx >= 0 else None
+    return None
+
+
+def _session_compression_count_for_display(session) -> int:
+    """Return a monotonic count, backfilling legacy sidecars from lineage.
+
+    New sidecars persist ``compression_count`` directly. Older WebUI sessions
+    predate that field but every successful compression rotated the live session
+    and marked its immediate predecessor ``pre_compression_snapshot``. Walking
+    only that consecutive snapshot chain reconstructs the historical count
+    without treating ordinary fork parents as compressions.
+    """
+    try:
+        persisted = max(0, int(getattr(session, "compression_count", 0) or 0))
+    except (TypeError, ValueError):
+        persisted = 0
+    lineage_count = 0
+    parent_sid = str(getattr(session, "parent_session_id", "") or "").strip()
+    seen: set[str] = set()
+    while parent_sid and parent_sid not in seen:
+        seen.add(parent_sid)
+        try:
+            parent = Session.load_metadata_only(parent_sid)
+        except Exception:
+            parent = None
+        if parent is None or not bool(getattr(parent, "pre_compression_snapshot", False)):
+            break
+        lineage_count += 1
+        parent_sid = str(getattr(parent, "parent_session_id", "") or "").strip()
+    # Legacy in-place manual compactions did not persist ``compression_count``
+    # and do not create a pre-compression lineage row.  Their durable anchor is
+    # still enough to prove that at least one compaction completed, so expose a
+    # minimum count of one instead of hiding the composer badge forever.
+    manual_anchor_count = 1 if str(
+        getattr(session, "compression_anchor_mode", "") or ""
+    ).strip().lower() == "manual" else 0
+    return max(persisted, lineage_count, manual_anchor_count)
+
+
+def _checkpoint_chat_restore_keep_count(messages, assistant_message_index: int) -> int:
+    """Return the prefix length that removes the turn owning a checkpoint."""
+    if not isinstance(messages, list):
+        return 0
+    idx = max(0, min(int(assistant_message_index), len(messages)))
+    for i in range(idx - 1, -1, -1):
+        msg = messages[i]
+        if isinstance(msg, dict) and msg.get("role") == "user":
+            return i
+    return idx
+
+
+def _checkpoint_chat_restore_plan(session_id: str, checkpoint: str) -> dict:
+    """Find the chat truncation target associated with a rollback checkpoint."""
+    from api.turn_journal import read_turn_journal
+
+    session = get_session(session_id)
+    journal = read_turn_journal(session_id)
+    assistant_idx = _checkpoint_assistant_index_from_events(journal.get("events") or [], checkpoint)
+    if assistant_idx is None:
+        raise ValueError("No chat turn is associated with this checkpoint yet")
+    keep_count = _checkpoint_chat_restore_keep_count(session.messages or [], assistant_idx)
+    return {
+        "session": session,
+        "assistant_message_index": assistant_idx,
+        "keep_count": keep_count,
+    }
+
+
+def _truncate_session_for_checkpoint_restore(session, keep_count: int) -> dict:
+    old_msg_count = len(session.messages or [])
+    old_ctx_count = len(getattr(session, 'context_messages', None) or [])
+    keep = max(0, min(int(keep_count), old_msg_count))
+    session.messages = (session.messages or [])[:keep]
+    if isinstance(getattr(session, 'context_messages', None), list):
+        session.context_messages = session.context_messages[:keep]
+    try:
+        from api.session_ops import _truncation_watermark_for
+        session.truncation_watermark = _truncation_watermark_for(session.messages)
+    except Exception:
+        session.truncation_watermark = 0.0
+    session.save()
+    return {
+        "ok": True,
+        "keep_count": keep,
+        "old_message_count": old_msg_count,
+        "message_count": len(session.messages or []),
+        "old_context_message_count": old_ctx_count,
+        "context_message_count": len(getattr(session, 'context_messages', None) or []),
+    }
+
+
+def _restore_checkpoint_files_for_restore_mode(workspace: str, checkpoint: str, *, require_complete: bool = False) -> dict:
+    from api.rollback import restore_checkpoint
+
+    file_result = restore_checkpoint(workspace, checkpoint)
+    errors = file_result.get("errors") if isinstance(file_result, dict) else None
+    if require_complete and errors:
+        raise ValueError("Checkpoint file restore had errors; chat was not truncated")
+    return file_result
+
+
 # Approval system -- state and helpers live in api.route_approvals; imported
 # here for backward compatibility so existing call sites continue to resolve.
 from api.route_approvals import (  # noqa: F401 — re-exports for backward compat
@@ -12135,6 +12387,11 @@ def handle_get(handler, parsed) -> bool:
     if parsed.path.startswith("/api/") and not _guard_request_session_visibility(handler, parsed, method="GET"):
         return True
 
+    if parsed.path.startswith("/browser-proxy/") or parsed.path == "/browser-proxy":
+        from api.browser_workbench import handle_browser_workbench_proxy_request
+
+        return handle_browser_workbench_proxy_request(handler, parsed, method="GET")
+
     # ── Insights / knowledge status ──
     if parsed.path == "/api/insights":
         return _handle_insights(handler, parsed)
@@ -12150,6 +12407,13 @@ def handle_get(handler, parsed) -> bool:
         result = handle_kanban_get(handler, parsed)
         if result is False:
             return _kanban_unknown_endpoint(handler, parsed, "GET")
+        return True
+    if parsed.path.startswith("/api/browser-workbench/"):
+        from api.browser_workbench import handle_browser_workbench_get
+
+        result = handle_browser_workbench_get(handler, parsed)
+        if result is False:
+            return bad(handler, f"unknown browser workbench endpoint: GET {parsed.path}", status=404) or True
         return True
     if parsed.path == "/api/wiki/status":
         return _handle_llm_wiki_status(handler, parsed)
@@ -12410,6 +12674,22 @@ def handle_get(handler, parsed) -> bool:
         return j(
             handler,
             get_reasoning_status(
+                model_id=model_id,
+                provider_id=provider_id,
+                base_url=base_url,
+            ),
+        )
+
+    if parsed.path == "/api/fast":
+        # Current fast-mode config (shared source of truth with the CLI — reads
+        # agent.service_tier from the active profile's config.yaml).
+        query = parse_qs(parsed.query)
+        model_id = (query.get("model", [""])[0] or "").strip() or None
+        provider_id = (query.get("provider", [""])[0] or "").strip() or None
+        base_url = (query.get("base_url", [""])[0] or "").strip() or None
+        return j(
+            handler,
+            get_fast_mode_status(
                 model_id=model_id,
                 provider_id=provider_id,
                 base_url=base_url,
@@ -12771,6 +13051,7 @@ def handle_get(handler, parsed) -> bool:
                 "context_length": _persisted_cl,
                 "threshold_tokens": _threshold_tokens,
                 "last_prompt_tokens": getattr(s, "last_prompt_tokens", 0) or 0,
+                "compression_count": _session_compression_count_for_display(s),
             }
             if original_stream_id:
                 try:
@@ -13224,6 +13505,10 @@ def handle_get(handler, parsed) -> bool:
         except RuntimeError as e:
             return bad(handler, str(e), 503)
 
+    if parsed.path == "/api/accounts":
+        from api.accounts import accounts_payload
+        return j(handler, accounts_payload())
+
     if parsed.path == "/api/updates/check":
         settings = load_settings()
         if not settings.get("check_for_updates", True):
@@ -13618,6 +13903,21 @@ def handle_get(handler, parsed) -> bool:
             logger.exception("rollback/diff failed")
             return bad(handler, str(e), status=500)
 
+    if parsed.path == "/api/workspace/git-diff":
+        qs = parse_qs(parsed.query)
+        workspace = qs.get("workspace", [""])[0]
+        path = qs.get("path", [""])[0]
+        if not workspace or not path:
+            return bad(handler, "workspace and path query parameters are required")
+        try:
+            from api.rollback import get_workspace_git_diff
+            return j(handler, get_workspace_git_diff(workspace, path))
+        except ValueError as e:
+            return bad(handler, str(e))
+        except Exception as e:
+            logger.exception("workspace/git-diff failed")
+            return bad(handler, str(e), status=500)
+
     # ── Plugin shared assets (e.g. /plugins/plugin.css) ──
     # Restricted to shared plugin assets only — no cross-plugin file access.
     if parsed.path.startswith("/plugins/"):
@@ -13819,6 +14119,16 @@ def handle_post(handler, parsed) -> bool:
         finally:
             if diag:
                 diag.finish()
+    if parsed.path.startswith("/browser-proxy/") or parsed.path == "/browser-proxy":
+        if diag:
+            diag.stage("browser_workbench_proxy")
+        try:
+            from api.browser_workbench import handle_browser_workbench_proxy_request
+
+            return handle_browser_workbench_proxy_request(handler, parsed, method="POST")
+        finally:
+            if diag:
+                diag.finish()
     # CSRF: reject cross-origin or tokenless authenticated browser requests.
     # /api/auth/login has no authenticated session token yet, and /api/csp-report
     # is intentionally unauthenticated for browser-generated violation reports.
@@ -13826,7 +14136,7 @@ def handle_post(handler, parsed) -> bool:
         diag.stage("csrf")
     if not _csrf_exempt_path(parsed.path) and not _check_csrf(handler):
         try:
-            return j(handler, {"error": _csrf_rejection_error(handler)}, status=403)
+            return j(handler, {"error": _csrf_rejection_error(handler)}, status=403) or True
         finally:
             if diag:
                 diag.finish()
@@ -13993,6 +14303,13 @@ def handle_post(handler, parsed) -> bool:
         result = handle_kanban_post(handler, parsed, body)
         if result is False:
             return _kanban_unknown_endpoint(handler, parsed, "POST")
+        return True
+    if parsed.path.startswith("/api/browser-workbench/"):
+        from api.browser_workbench import handle_browser_workbench_post
+
+        result = handle_browser_workbench_post(handler, parsed, body)
+        if result is False:
+            return bad(handler, f"unknown browser workbench endpoint: POST {parsed.path}", status=404) or True
         return True
     if parsed.path == "/api/dashboard/config":
         from api import dashboard_probe
@@ -14439,6 +14756,29 @@ def handle_post(handler, parsed) -> bool:
         except RuntimeError as e:
             return bad(handler, str(e), 500)
 
+    if parsed.path == "/api/fast":
+        # CLI-parity /fast handler — writes agent.service_tier in config.yaml.
+        try:
+            mode = body.get("mode", body.get("fast_mode"))
+            if mode is None:
+                return bad(handler, "fast: must supply 'mode'")
+            model_id = str(body.get("model") or "").strip() or None
+            provider_id = str(body.get("provider") or "").strip() or None
+            base_url = str(body.get("base_url") or "").strip() or None
+            return j(
+                handler,
+                set_fast_mode(
+                    mode,
+                    model_id=model_id,
+                    provider_id=provider_id,
+                    base_url=base_url,
+                ),
+            )
+        except ValueError as e:
+            return bad(handler, str(e))
+        except RuntimeError as e:
+            return bad(handler, str(e), 500)
+
     if parsed.path == "/api/admin/reload":
         # Hot-reload api.models module to pick up code changes without restart.
         import importlib
@@ -14616,12 +14956,15 @@ def handle_post(handler, parsed) -> bool:
             return bad(handler, "Subagent sessions are view-only and cannot store a draft from WebUI", 400)
         text = body.get("text")
         files = body.get("files")
+        context_items = body.get("context_items")
+        browser_context_parts = body.get("browser_context_parts")
         # Stage-326 hardening (per Opus advisor): size + type validation on
         # the draft inputs. Without this, a misbehaving or malicious client
         # can persist multi-MB strings into the session JSON on every keystroke
         # via the 400ms debounced auto-save.
         _MAX_DRAFT_TEXT = 50_000  # 50 KB cap on textarea content
         _MAX_DRAFT_FILES = 50  # max number of attached file references
+        _MAX_DRAFT_CONTEXT_ITEMS = 8  # bounded browser-element context pills
         if text is not None and not isinstance(text, str):
             text = ""
         if isinstance(text, str) and len(text) > _MAX_DRAFT_TEXT:
@@ -14630,6 +14973,15 @@ def handle_post(handler, parsed) -> bool:
             files = []
         if isinstance(files, list) and len(files) > _MAX_DRAFT_FILES:
             files = files[:_MAX_DRAFT_FILES]
+        if context_items is not None:
+            try:
+                from api.browser_workbench import _normalize_browser_context_items
+
+                context_items = _normalize_browser_context_items(context_items)[:_MAX_DRAFT_CONTEXT_ITEMS]
+            except Exception:
+                context_items = []
+        if browser_context_parts is not None:
+            browser_context_parts = _normalize_browser_context_parts_for_session(browser_context_parts)
         try:
             s = get_session(sid)
         except KeyError:
@@ -14644,6 +14996,10 @@ def handle_post(handler, parsed) -> bool:
                 next_draft["text"] = text
             if files is not None:
                 next_draft["files"] = files
+            if context_items is not None:
+                next_draft["context_items"] = context_items
+            if browser_context_parts is not None:
+                next_draft["browser_context_parts"] = browser_context_parts
             if next_draft == current_draft:
                 unchanged = True
                 saved_draft = current_draft
@@ -14922,6 +15278,7 @@ def handle_post(handler, parsed) -> bool:
             s.pending_attachments = []
             s.pending_started_at = None
             s.pending_user_source = None
+            s.compression_count = 0
             s.clear_generation = uuid.uuid4().hex if had_sidecar_messages else None
             # Reset the title via the rename helper so clearing a manually-named
             # session also clears manual_title/llm_title_generated — otherwise the
@@ -15396,6 +15753,30 @@ def handle_post(handler, parsed) -> bool:
             return bad(handler, str(e), 400)
         except KeyError:
             return bad(handler, "Plugin command not found", 404)
+        except RuntimeError as e:
+            return bad(handler, _sanitize_error(e), 500)
+
+    if parsed.path == "/api/account/switch":
+        name = str(body.get("name", "") or "").strip()
+        if not name:
+            return bad(handler, "name is required")
+        try:
+            from api.accounts import set_active_account
+
+            runtime = set_active_account(name)
+            return j(
+                handler,
+                {
+                    "ok": True,
+                    "active": runtime.name,
+                    "provider": runtime.provider,
+                    "model": runtime.model,
+                    "base_url": runtime.base_url,
+                    "api_mode": runtime.api_mode,
+                },
+            )
+        except ValueError as e:
+            return bad(handler, str(e), 404)
         except RuntimeError as e:
             return bad(handler, _sanitize_error(e), 500)
 
@@ -16420,12 +16801,41 @@ def handle_post(handler, parsed) -> bool:
         if not body:
             return bad(handler, "request body is required")
         workspace = body.get("workspace", "")
-        checkpoint = body.get("checkpoint", "")
-        if not workspace or not checkpoint:
+        checkpoint = str(body.get("checkpoint", "") or "").strip()
+        mode = str(body.get("mode") or "files_only").strip() or "files_only"
+        session_id = str(body.get("session_id") or "").strip()
+        if mode not in _CHECKPOINT_RESTORE_MODES:
+            return bad(handler, "mode must be one of files_only, chat_only, chat_files")
+        if mode in _CHECKPOINT_RESTORE_FILE_MODES and (not workspace or not checkpoint):
             return bad(handler, "workspace and checkpoint are required")
+        if mode in _CHECKPOINT_RESTORE_CHAT_MODES and (not session_id or not checkpoint):
+            return bad(handler, "session_id and checkpoint are required for chat restore")
         try:
-            from api.rollback import restore_checkpoint
-            return j(handler, restore_checkpoint(workspace, checkpoint))
+            result = {"ok": True, "mode": mode}
+            if mode in _CHECKPOINT_RESTORE_CHAT_MODES:
+                with _get_session_agent_lock(session_id):
+                    plan = _checkpoint_chat_restore_plan(session_id, checkpoint)
+                    if mode in _CHECKPOINT_RESTORE_FILE_MODES:
+                        file_result = _restore_checkpoint_files_for_restore_mode(
+                            workspace,
+                            checkpoint,
+                            require_complete=True,
+                        )
+                        result.update(file_result)
+                        result["file_restored"] = bool(file_result.get("ok"))
+                    chat_result = _truncate_session_for_checkpoint_restore(plan["session"], plan["keep_count"])
+                result.update({
+                    "chat_restored": True,
+                    "assistant_message_index": plan["assistant_message_index"],
+                    **chat_result,
+                })
+            elif mode in _CHECKPOINT_RESTORE_FILE_MODES:
+                file_result = _restore_checkpoint_files_for_restore_mode(workspace, checkpoint)
+                result.update(file_result)
+                result["file_restored"] = bool(file_result.get("ok"))
+            return j(handler, result)
+        except KeyError:
+            return bad(handler, "session not found", status=404)
         except ValueError as e:
             return bad(handler, str(e))
         except Exception as e:
@@ -16495,6 +16905,13 @@ def handle_delete(handler, parsed) -> bool:
         result = handle_kanban_delete(handler, parsed, body)
         if result is False:
             return _kanban_unknown_endpoint(handler, parsed, "DELETE")
+        return True
+    if parsed.path.startswith("/api/browser-workbench/"):
+        from api.browser_workbench import handle_browser_workbench_delete
+
+        result = handle_browser_workbench_delete(handler, parsed, body)
+        if result is False:
+            return bad(handler, f"unknown browser workbench endpoint: DELETE {parsed.path}", status=404) or True
         return True
     return False
 
@@ -19684,6 +20101,40 @@ def _handle_live_models(handler, parsed):
         from api.config import _resolve_provider_alias
         provider = _resolve_provider_alias(provider)
 
+        def _custom_provider_entries_for_request():
+            try:
+                from api.config import _custom_provider_slug_from_name
+
+                _cp_entries = cfg.get("custom_providers", [])
+                if not isinstance(_cp_entries, list):
+                    return []
+                _matches = []
+                for _cp in _cp_entries:
+                    if not isinstance(_cp, dict):
+                        continue
+                    _slug = _custom_provider_slug_from_name(_cp.get("name", ""))
+                    if provider.startswith("custom:"):
+                        if _slug == provider:
+                            _matches.append(_cp)
+                    elif provider == "custom":
+                        if not _slug:
+                            _matches.append(_cp)
+                    elif _slug == f"custom:{provider}":
+                        # Account/profile providers can retain their public
+                        # name (for example codex-lb) while routing through a
+                        # matching named custom endpoint.
+                        _matches.append(_cp)
+                return _matches
+            except Exception:
+                return []
+
+        _matching_custom_provider_entries = _custom_provider_entries_for_request()
+        _is_custom_provider_request = bool(
+            provider == "custom"
+            or provider.startswith("custom:")
+            or _matching_custom_provider_entries
+        )
+
         cache_key = _live_models_cache_key(provider)
         cached = _get_cached_live_models(cache_key)
         if cached is not None:
@@ -19696,44 +20147,23 @@ def _handle_live_models(handler, parsed):
         # Delegate to the agent's live-fetch + fallback resolver.
         # provider_model_ids() tries live endpoints first and falls back to
         # the static _PROVIDER_MODELS list — it never raises.
-        try:
-            import sys as _sys
-            import os as _os
-            _agent_dir = _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))),
-                                       "..", "..", ".hermes", "hermes-agent")
-            _agent_dir = _os.path.normpath(_agent_dir)
-            if _agent_dir not in _sys.path:
-                _sys.path.insert(0, _agent_dir)
-            from hermes_cli.models import provider_model_ids as _pmi
-            ids = _pmi(provider)
-        except Exception as _import_err:
-            logger.debug("provider_model_ids import failed for %s: %s", provider, _import_err)
-            ids = []
+        ids = []
+        if not _is_custom_provider_request:
+            try:
+                import sys as _sys
+                import os as _os
+                _agent_dir = _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))),
+                                           "..", "..", ".hermes", "hermes-agent")
+                _agent_dir = _os.path.normpath(_agent_dir)
+                if _agent_dir not in _sys.path:
+                    _sys.path.insert(0, _agent_dir)
+                from hermes_cli.models import provider_model_ids as _pmi
+                ids = _pmi(provider)
+            except Exception as _import_err:
+                logger.debug("provider_model_ids import failed for %s: %s", provider, _import_err)
 
         if not ids:
             custom_provider_entry = None
-
-            def _custom_provider_entries_for_request():
-                if not (provider == "custom" or provider.startswith("custom:")):
-                    return []
-                try:
-                    from api.config import _custom_provider_slug_from_name
-                    _cp_entries = cfg.get("custom_providers", [])
-                    if not isinstance(_cp_entries, list):
-                        return []
-                    _matches = []
-                    for _cp in _cp_entries:
-                        if not isinstance(_cp, dict):
-                            continue
-                        _slug = _custom_provider_slug_from_name(_cp.get("name", ""))
-                        if provider.startswith("custom:"):
-                            if _slug == provider:
-                                _matches.append(_cp)
-                        elif provider == "custom" and not _slug:
-                            _matches.append(_cp)
-                    return _matches
-                except Exception:
-                    return []
 
             def _custom_provider_model_ids(_cp):
                 _ids = []
@@ -19776,8 +20206,8 @@ def _handle_live_models(handler, parsed):
             # Collect config-specified model IDs separately so they don't
             # prevent the live fetch below from running (#3718).
             _config_ids = []
-            if provider == "custom" or provider.startswith("custom:"):
-                for _cp in _custom_provider_entries_for_request():
+            if _is_custom_provider_request:
+                for _cp in _matching_custom_provider_entries:
                     if custom_provider_entry is None:
                         custom_provider_entry = _cp
                     _config_ids.extend(_custom_provider_model_ids(_cp))
@@ -19785,7 +20215,7 @@ def _handle_live_models(handler, parsed):
             # Always try live fetch for custom providers — config entries are a
             # fallback, not a replacement.  The live endpoint should return ALL
             # models the key has access to, not just what's listed in config.yaml.
-            if provider == "custom" or provider.startswith("custom:"):
+            if _is_custom_provider_request:
                 _base_url = None
                 _api_key = None
                 if custom_provider_entry:
@@ -19827,10 +20257,16 @@ def _handle_live_models(handler, parsed):
                         else:
                             _models_url = f"{_ep}/v1/models"
                         
-                        _req = urllib.request.Request(
-                            _models_url,
-                            headers={"Authorization": f"Bearer {_api_key}"},
-                        )
+                        _request_headers = {"Authorization": f"Bearer {_api_key}"}
+                        if custom_provider_entry:
+                            _extra_headers = custom_provider_entry.get("extra_headers")
+                            if isinstance(_extra_headers, dict):
+                                _request_headers.update({
+                                    str(_key): str(_value)
+                                    for _key, _value in _extra_headers.items()
+                                    if _key is not None and _value is not None
+                                })
+                        _req = urllib.request.Request(_models_url, headers=_request_headers)
                         
                         with urllib.request.urlopen(_req, timeout=CUSTOM_MODELS_ENDPOINT_TIMEOUT_SECONDS) as _resp:
                             _body = json.loads(_resp.read())
@@ -20747,7 +21183,16 @@ def _handle_background(handler, body):
     return j(handler, {"task_id": task_id, "stream_id": stream_id, "session_id": bg.session_id})
 
 
-def _checkpoint_user_message_for_eager_session_save(s, msg: str, attachments, started_at: float | None, source: str = "webui") -> None:
+def _checkpoint_user_message_for_eager_session_save(
+    s,
+    msg: str,
+    attachments,
+    started_at: float | None,
+    context_items=None,
+    browser_context_parts=None,
+    client_message_id: str | None = None,
+    source: str = "webui",
+) -> None:
     """Materialize the current user turn for eager first-turn persistence.
 
     The streaming thread still receives ``pending_user_message`` so existing
@@ -20760,17 +21205,29 @@ def _checkpoint_user_message_for_eager_session_save(s, msg: str, attachments, st
     if existing:
         latest = existing[-1]
         if isinstance(latest, dict) and latest.get("role") == "user":
+            latest_client_id = str(latest.get("client_message_id") or "").strip()
+            if client_message_id and latest_client_id == client_message_id:
+                return
             latest_text = " ".join(str(latest.get("content") or "").split())
             msg_text = " ".join(str(msg or "").split())
-            if latest_text == msg_text:
+            # Identified turns are never reconciled by text: repeating the same
+            # prompt intentionally must create a separate row.
+            if not client_message_id and latest_text == msg_text:
                 return
-    user_msg = {"role": "user", "content": msg}
+    user_msg: dict = {"role": "user", "content": msg}
     if source and source != "webui":
         user_msg["_source"] = source
     if isinstance(started_at, (int, float)) and started_at > 0:
         user_msg["timestamp"] = int(started_at)
     if attachments:
         user_msg["attachments"] = list(attachments)
+    if context_items:
+        user_msg["context_items"] = list(context_items)
+    if browser_context_parts:
+        user_msg["browser_context_parts"] = list(browser_context_parts)
+        user_msg["parts"] = list(browser_context_parts)
+    if client_message_id:
+        user_msg["client_message_id"] = client_message_id
     s.messages.append(user_msg)
     # The new user turn is now committed to messages (#3831): advance the
     # truncation watermark to the new message's timestamp so that
@@ -20803,6 +21260,9 @@ def _prepare_chat_start_session_for_stream(
     model: str,
     model_provider,
     stream_id: str,
+    context_items=None,
+    browser_context_parts=None,
+    client_message_id: str | None = None,
     started_at: float | None = None,
     source: str = "webui",
 ):
@@ -20822,6 +21282,9 @@ def _prepare_chat_start_session_for_stream(
     s.post_compression_context_tokens_estimate = None
     s.pending_user_message = msg
     s.pending_attachments = attachments
+    s.pending_context_items = list(context_items or [])
+    s.pending_browser_context_parts = list(browser_context_parts or [])
+    s.pending_client_message_id = client_message_id
     s.pending_started_at = started_at if started_at is not None else time.time()
     s.pending_user_source = source
     current_title = getattr(s, "title", None)
@@ -20835,6 +21298,9 @@ def _prepare_chat_start_session_for_stream(
             msg,
             attachments,
             s.pending_started_at,
+            context_items=s.pending_context_items,
+            browser_context_parts=s.pending_browser_context_parts,
+            client_message_id=s.pending_client_message_id,
             source=source,
         )
     s.save()
@@ -20883,6 +21349,40 @@ def _active_stream_blocks_chat_start(session, stream_id: str | None) -> bool:
         if pending_started_at and time.time() - pending_started_at < grace_seconds:
             return True
     return False
+
+
+def _normalize_browser_context_parts_for_session(raw_parts, *, max_parts: int = 24):
+    """Normalize ordered text/browser-element display parts from the composer."""
+    if not isinstance(raw_parts, list):
+        return []
+    normalized = []
+    try:
+        from api.browser_workbench import _normalize_browser_context_items
+    except Exception:
+        _normalize_browser_context_items = None
+    for part in raw_parts:
+        if not isinstance(part, dict):
+            continue
+        kind = str(part.get("type") or "").strip().lower().replace("-", "_")
+        if kind == "text":
+            raw_text = part.get("content") if "content" in part else part.get("text")
+            text = str(raw_text or "")
+            if text:
+                normalized.append({"type": "text", "content": text[:50_000]})
+        elif kind == "browser_element":
+            item = part.get("item") if isinstance(part.get("item"), dict) else part
+            if _normalize_browser_context_items is not None:
+                try:
+                    items = _normalize_browser_context_items([item])
+                except Exception:
+                    items = []
+            else:
+                items = [item] if isinstance(item, dict) else []
+            if items:
+                normalized.append({"type": "browser_element", "item": items[0]})
+        if len(normalized) >= max_parts:
+            break
+    return normalized
 
 
 def _active_run_stream_for_session(session_id: str | None) -> str | None:
@@ -20981,7 +21481,11 @@ def _start_chat_stream_for_session(
     s,
     *,
     msg: str,
+    agent_msg: str | None = None,
     attachments=None,
+    context_items=None,
+    browser_context_parts=None,
+    client_message_id: str | None = None,
     workspace: str,
     model: str,
     model_provider=None,
@@ -21003,6 +21507,7 @@ def _start_chat_stream_for_session(
         stale_response["_status"] = 409
         return stale_response
     attachments = attachments or []
+    worker_msg = str(agent_msg or msg)
     # Prevent duplicate runs in the same session while a stream is still active.
     # This commonly happens after page refresh/reconnect races and can produce
     # duplicated clarify cards for what appears to be a single user request.
@@ -21066,6 +21571,9 @@ def _start_chat_stream_for_session(
                     s,
                     msg=msg,
                     attachments=attachments,
+                    context_items=context_items,
+                    browser_context_parts=browser_context_parts,
+                    client_message_id=client_message_id,
                     workspace=workspace,
                     model=model,
                     model_provider=model_provider,
@@ -21101,6 +21609,10 @@ def _start_chat_stream_for_session(
                 "role": "user",
                 "content": msg,
                 "attachments": attachments,
+                "context_items": context_items or [],
+                "browser_context_parts": browser_context_parts or [],
+                "parts": browser_context_parts or [],
+                "client_message_id": client_message_id,
                 "workspace": workspace,
                 "model": model,
                 "model_provider": model_provider,
@@ -21126,7 +21638,7 @@ def _start_chat_stream_for_session(
         worker_kwargs["moa_config"] = moa_config
     thr = threading.Thread(
         target=worker_target,
-        args=(s.session_id, msg, model, workspace, stream_id, attachments),
+        args=(s.session_id, worker_msg, model, workspace, stream_id, attachments),
         kwargs=worker_kwargs,
         daemon=True,
     )
@@ -21135,6 +21647,7 @@ def _start_chat_stream_for_session(
         "stream_id": stream_id,
         "session_id": s.session_id,
         "pending_started_at": s.pending_started_at,
+        "client_message_id": client_message_id,
         "turn_id": journal_event.get("turn_id"),
         "title": s.title,
     }
@@ -21170,6 +21683,7 @@ def _chat_start_response_from_run_start(result):
         "stream_id",
         "session_id",
         "pending_started_at",
+        "client_message_id",
         "turn_id",
         "title",
         "effective_model",
@@ -21201,7 +21715,11 @@ def _start_run(
     s,
     *,
     msg: str,
+    agent_msg: str | None = None,
     attachments,
+    context_items=None,
+    browser_context_parts=None,
+    client_message_id: str | None = None,
     workspace: str,
     model,
     model_provider,
@@ -21242,7 +21760,11 @@ def _start_run(
             return _start_chat_stream_for_session(
                 s,
                 msg=request.message,
+                agent_msg=agent_msg if request.message == msg else None,
                 attachments=request.attachments,
+                context_items=context_items,
+                browser_context_parts=browser_context_parts,
+                client_message_id=client_message_id,
                 workspace=request.workspace or workspace,
                 model=request.model or model,
                 model_provider=request.provider or model_provider,
@@ -21272,7 +21794,7 @@ def _start_run(
                     provider=model_provider,
                     model=model,
                     source=source,
-                    metadata={"route": route},
+                    metadata={"route": route, "context_items": context_items or [], "browser_context_parts": browser_context_parts or [], "client_message_id": client_message_id},
                 )
             )
         except NotImplementedError as exc:
@@ -21282,7 +21804,11 @@ def _start_run(
     return _start_chat_stream_for_session(
         s,
         msg=msg,
+        agent_msg=agent_msg,
         attachments=attachments,
+        context_items=context_items,
+        browser_context_parts=browser_context_parts,
+        client_message_id=client_message_id,
         workspace=workspace,
         model=model,
         model_provider=model_provider,
@@ -21987,6 +22513,38 @@ def _handle_chat_start(handler, body, diag=None):
         msg = str(body.get("message", "")).strip()
         if not msg:
             return bad(handler, "message is required")
+        client_message_id = str(body.get("client_message_id") or "").strip()
+        if client_message_id:
+            # Opaque browser-generated reconciliation token. Keep it bounded
+            # and printable before it reaches session JSON / turn journals.
+            if len(client_message_id) > 192 or not re.fullmatch(r"[A-Za-z0-9_.:-]+", client_message_id):
+                return bad(handler, "invalid client_message_id")
+        else:
+            client_message_id = None
+        agent_msg = msg
+        browser_context_items = []
+        browser_context_parts = []
+        browser_context_block = ""
+        if "context_items" in body:
+            try:
+                from api.browser_workbench import (
+                    _format_browser_context_items_for_prompt,
+                    _normalize_browser_context_items,
+                )
+
+                browser_context_items = _normalize_browser_context_items(body.get("context_items"))
+                browser_context_block = _format_browser_context_items_for_prompt(browser_context_items)
+            except Exception:
+                browser_context_items = []
+                browser_context_block = ""
+        raw_browser_context_parts = body.get(
+            "parts",
+            body.get("browser_context_parts") if "browser_context_parts" in body else None,
+        )
+        if raw_browser_context_parts is not None:
+            browser_context_parts = _normalize_browser_context_parts_for_session(raw_browser_context_parts)
+        if browser_context_block:
+            agent_msg = f"{msg}\n\n{browser_context_block}"
         diag.stage("normalize_attachments") if diag else None
         attachments = _normalize_chat_attachments(body.get("attachments") or [])[:20]
         recovery = compression_recovery_payload_for_session(s)
@@ -22078,7 +22636,11 @@ def _handle_chat_start(handler, body, diag=None):
         # — Q-2979-A2 / Copilot discussion_r3305864087/r3305864173).
         start_run_kwargs = {
             "msg": msg,
+            "agent_msg": agent_msg,
             "attachments": attachments,
+            "context_items": browser_context_items,
+            "browser_context_parts": browser_context_parts,
+            "client_message_id": client_message_id,
             "workspace": workspace,
             "model": model,
             "model_provider": model_provider,
@@ -24424,6 +24986,8 @@ def _handle_session_compress(handler, body):
             s.active_stream_id = None
             s.pending_user_message = None
             s.pending_attachments = []
+            s.pending_context_items = []
+            s.pending_browser_context_parts = []
             s.pending_started_at = None
             s.pending_user_source = None
             visible_after = visible_messages_for_anchor(s.messages, auto_compression=False)
@@ -24440,7 +25004,15 @@ def _handle_session_compress(handler, body):
             compress_watermark = _truncation_watermark_for(compressed_copy)
             s.truncation_watermark = compress_watermark
             s.truncation_boundary = compress_watermark
+            prior_compression_count = _session_compression_count_for_display(s)
             s.compression_anchor_mode = "manual"
+            # The WebUI creates a short-lived AIAgent for each manual /compress,
+            # so its compressor-local counter is reset every time.  Persist the
+            # session-level monotonic count explicitly after a successful
+            # compaction.  The display helper also backfills legacy lineage and
+            # manual-anchor state, preventing an upgrade from resetting the
+            # visible count.
+            s.compression_count = prior_compression_count + 1
             s.last_prompt_tokens = new_tokens
             s.save()
             # Drop stale backups that would undo an intentional manual compress.
