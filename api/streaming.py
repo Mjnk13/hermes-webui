@@ -1573,6 +1573,164 @@ def _provider_error_payload(message: str, err_type: str, hint: str = '') -> dict
     return payload
 
 
+class _TurnOutcomeState:
+    """Authoritative, once-only outcome for one provider stream.
+
+    Provider adapters do not all terminate the same way: some return a final
+    message, some only close the delta stream, and some emit a late empty
+    completion callback.  Keep usable-output evidence separate from transport
+    completion so a late close/error path can never turn an already-completed
+    response into ``no_response``.
+    """
+
+    _TERMINAL = frozenset({'completed', 'failed'})
+
+    def __init__(self, stream_id: str, session_id: str):
+        self.stream_id = str(stream_id or '')
+        self.session_id = str(session_id or '')
+        self.status = 'pending'
+        self.accumulated_text_length = 0
+        self.reasoning_event_count = 0
+        self.reasoning_text_length = 0
+        self.tool_event_count = 0
+        self.result_has_final_text = False
+        self.result_has_reasoning = False
+        self.result_has_tool_output = False
+        self.finish_reason = None
+        self.close_reason = None
+        self.abort_source = None
+        self.failure_type = None
+        self._has_non_whitespace_text = False
+        self._tool_event_keys = set()
+        self._lock = threading.Lock()
+
+    def _diagnostic(self, event_type: str, **extra) -> None:
+        if not logger.isEnabledFor(logging.DEBUG):
+            return
+        fields = {
+            'event': str(event_type or ''),
+            'stream_id': self.stream_id,
+            'session_id': self.session_id,
+            'status': self.status,
+            'text_length': self.accumulated_text_length,
+            'reasoning_events': self.reasoning_event_count,
+            'reasoning_length': self.reasoning_text_length,
+            'tool_events': self.tool_event_count,
+            'finish_reason': self.finish_reason,
+            'close_reason': self.close_reason,
+            'abort_source': self.abort_source,
+            **extra,
+        }
+        logger.debug('[turn-outcome] %s', json.dumps(fields, ensure_ascii=False, default=str))
+
+    def _mark_streaming_locked(self) -> None:
+        if self.status == 'pending':
+            self.status = 'streaming'
+
+    def mark_text(self, text, *, event_type: str = 'token') -> None:
+        value = '' if text is None else str(text)
+        with self._lock:
+            self.accumulated_text_length += len(value)
+            if value.strip():
+                self._has_non_whitespace_text = True
+                self._mark_streaming_locked()
+            self._diagnostic(event_type)
+
+    def mark_reasoning(self, text, *, event_type: str = 'reasoning') -> None:
+        value = '' if text is None else str(text)
+        with self._lock:
+            if value.strip():
+                self.reasoning_event_count += 1
+                self.reasoning_text_length += len(value)
+                self._mark_streaming_locked()
+            self._diagnostic(event_type)
+
+    def mark_tool(self, key=None, *, event_type: str = 'tool') -> None:
+        normalized_key = str(key or '').strip()
+        with self._lock:
+            if normalized_key and normalized_key in self._tool_event_keys:
+                self._diagnostic(event_type, duplicate=True)
+                return
+            if normalized_key:
+                self._tool_event_keys.add(normalized_key)
+            self.tool_event_count += 1
+            self._mark_streaming_locked()
+            self._diagnostic(event_type)
+
+    def observe_result(self, summary: dict | None, result: dict | None = None) -> None:
+        summary = summary or {}
+        result = result if isinstance(result, dict) else {}
+        with self._lock:
+            final_response = str(result.get('final_response') or '').strip()
+            self.result_has_final_text = bool(
+                summary.get('assistant_text')
+                or (final_response and final_response.lower() != '(empty)')
+            )
+            self.result_has_reasoning = bool(summary.get('reasoning'))
+            self.result_has_tool_output = bool(summary.get('tool_output'))
+            self.finish_reason = str(
+                result.get('finish_reason')
+                or result.get('stop_reason')
+                or result.get('terminal_reason')
+                or summary.get('finish_reason')
+                or ''
+            ).strip() or None
+            if self.result_has_final_text or self.result_has_reasoning or self.result_has_tool_output:
+                self._mark_streaming_locked()
+            self._diagnostic('result')
+
+    @property
+    def has_usable_output(self) -> bool:
+        with self._lock:
+            return bool(
+                self._has_non_whitespace_text
+                or self.reasoning_event_count
+                or self.tool_event_count
+                or self.result_has_final_text
+                or self.result_has_reasoning
+                or self.result_has_tool_output
+            )
+
+    def finalize(self, status: str, *, reason=None, failure_type=None, abort_source=None) -> bool:
+        target = str(status or '').strip().lower()
+        if target not in self._TERMINAL:
+            raise ValueError(f'Invalid terminal turn status: {status!r}')
+        with self._lock:
+            if self.status in self._TERMINAL:
+                self._diagnostic(
+                    'duplicate-finalize',
+                    attempted_status=target,
+                    attempted_reason=reason,
+                )
+                return False
+            self.status = target
+            self.close_reason = str(reason or '').strip() or None
+            self.failure_type = str(failure_type or '').strip() or None
+            self.abort_source = str(abort_source or '').strip() or None
+            self._diagnostic('finalize')
+            return True
+
+    def payload(self) -> dict:
+        with self._lock:
+            return {
+                'turn_status': self.status,
+                'usable_output': bool(
+                    self._has_non_whitespace_text
+                    or self.reasoning_event_count
+                    or self.tool_event_count
+                    or self.result_has_final_text
+                    or self.result_has_reasoning
+                    or self.result_has_tool_output
+                ),
+                'accumulated_text_length': self.accumulated_text_length,
+                'reasoning_event_count': self.reasoning_event_count,
+                'tool_event_count': self.tool_event_count,
+                'finish_reason': self.finish_reason,
+                'stream_close_reason': self.close_reason,
+                'abort_source': self.abort_source,
+            }
+
+
 _MAX_ITERATION_SUMMARY_REQUEST = (
     "You've reached the maximum number of tool-calling iterations allowed. "
     "Please provide a final response summarizing what you've found and accomplished "
@@ -3063,6 +3221,70 @@ def _assistant_message_has_final_visible_text(message) -> bool:
     if message.get('tool_calls'):
         return False
     return bool(_message_text(content).strip())
+
+
+def _current_turn_result_output_summary(result_messages, previous_context, msg_text) -> dict:
+    """Summarize usable provider output belonging to the current user turn.
+
+    This deliberately counts executed tool calls/results and reasoning as usable
+    output, while ignoring whitespace and unrelated metadata.  It shares the
+    same current-turn boundary rules as display reconciliation so an older
+    assistant answer cannot satisfy a genuinely empty new turn.
+    """
+    result_messages = list(result_messages or [])
+    previous_context = list(previous_context or [])
+    if _messages_have_prefix(result_messages, previous_context):
+        candidates = result_messages[len(previous_context):]
+    else:
+        current_user_idx = _find_current_user_turn(result_messages, msg_text)
+        candidates = result_messages[current_user_idx + 1:] if current_user_idx is not None else result_messages
+
+    assistant_text = False
+    reasoning = False
+    tool_output = False
+    tool_event_count = 0
+    finish_reason = None
+    for message in candidates:
+        if not isinstance(message, dict) or message.get('_error'):
+            continue
+        role = str(message.get('role') or '').lower()
+        if role == 'assistant':
+            if _assistant_message_has_final_visible_text(message) or str(message.get('refusal') or '').strip():
+                assistant_text = True
+            if str(
+                message.get('reasoning')
+                or message.get('reasoning_content')
+                or message.get('thinking')
+                or ''
+            ).strip() or _content_has_reasoning_only_parts(message.get('content')):
+                reasoning = True
+            message_tool_calls = message.get('tool_calls') or []
+            if isinstance(message_tool_calls, list) and message_tool_calls:
+                tool_output = True
+                tool_event_count += len(message_tool_calls)
+            content = message.get('content')
+            if isinstance(content, list):
+                content_tools = sum(1 for part in content if _assistant_content_part_is_tool_use(part))
+                if content_tools:
+                    tool_output = True
+                    tool_event_count += content_tools
+            if finish_reason is None:
+                finish_reason = str(
+                    message.get('finish_reason') or message.get('stop_reason') or ''
+                ).strip() or None
+        elif role == 'tool':
+            # A tool-role row is emitted only after a tool was actually invoked;
+            # even an empty/error result is meaningful turn output.
+            tool_output = True
+            tool_event_count += 1
+
+    return {
+        'assistant_text': assistant_text,
+        'reasoning': reasoning,
+        'tool_output': tool_output,
+        'tool_event_count': tool_event_count,
+        'finish_reason': finish_reason,
+    }
 
 
 
@@ -8111,11 +8333,76 @@ def _run_agent_streaming(
     _metering_thread = threading.Thread(target=_metering_ticker, daemon=True)
 
     _success_writeback_committed = False
+    _turn_outcome = _TurnOutcomeState(stream_id, session_id)
 
     def put(event, data):
-        # If cancelled, drop all further events except the cancel event itself
+        # If cancelled, drop all further events except the established terminal
+        # cancel/error signals. Do this before outcome mutation so a discarded
+        # late apperror cannot consume the once-only terminal transition and
+        # prevent the real cancel event from being delivered.
         if cancel_event.is_set() and not _success_writeback_committed and event not in ('cancel', 'error'):
             return
+        # Record usable provider output at the single event boundary shared by
+        # every adapter callback. Empty/whitespace chunks remain non-usable.
+        if event in ('token', 'interim_assistant') and isinstance(data, dict):
+            _turn_outcome.mark_text(data.get('text'), event_type=event)
+        elif event == 'reasoning' and isinstance(data, dict):
+            _turn_outcome.mark_reasoning(data.get('text'), event_type=event)
+        elif event in ('tool', 'tool_complete') and isinstance(data, dict):
+            _tool_key = data.get('tid') or data.get('tool_call_id') or data.get('call_id')
+            if not _tool_key:
+                _tool_key = f"{data.get('name') or 'tool'}:{data.get('activitySegmentSeq') or ''}"
+            _turn_outcome.mark_tool(_tool_key, event_type=event)
+
+        # Terminal events are once-only. A late close/error callback after done
+        # is ignored before it can enter the run journal or reach the browser.
+        if event == 'done':
+            if not _turn_outcome.finalize('completed', reason='done'):
+                return
+            data = dict(data or {})
+            data.update(_turn_outcome.payload())
+            data['status'] = 'completed'
+        elif event in ('apperror', 'error'):
+            _error_data = dict(data or {}) if isinstance(data, dict) else {'message': str(data or '')}
+            _error_type = str(_error_data.get('type') or 'error').strip().lower()
+            if _turn_outcome.status == 'completed':
+                _turn_outcome._diagnostic(
+                    'late-error-dropped',
+                    error_type=_error_type,
+                    code_path='put-terminal-guard',
+                )
+                return
+            if _error_type in {'no_response', 'silent_failure'} and _turn_outcome.has_usable_output:
+                _error_type = 'interrupted'
+                _error_data['type'] = 'interrupted'
+                _error_data['message'] = (
+                    _error_data.get('message')
+                    or 'The provider stream ended after returning partial output.'
+                )
+                _error_data['hint'] = (
+                    'The partial response was preserved. Retry if you need the remainder.'
+                )
+            if not _turn_outcome.finalize(
+                'failed',
+                reason=_error_data.get('stream_close_reason') or event,
+                failure_type=_error_type,
+                abort_source=_error_data.get('abort_source'),
+            ):
+                return
+            _error_data.update(_turn_outcome.payload())
+            _error_data['status'] = 'failed'
+            data = _error_data
+        elif event == 'cancel':
+            if not _turn_outcome.finalize(
+                'failed',
+                reason='cancelled',
+                failure_type='cancelled',
+                abort_source='user',
+            ):
+                return
+            data = dict(data or {})
+            data.update(_turn_outcome.payload())
+            data['status'] = 'failed'
         event_id = None
         if run_journal is not None:
             try:
@@ -9891,6 +10178,14 @@ def _run_agent_streaming(
                         _clear_turn_handoff()
 
             result = _run_conversation_once(agent, _run_conversation_kwargs)
+            _turn_outcome.observe_result(
+                _current_turn_result_output_summary(
+                    result.get('messages') or [],
+                    _previous_context_messages,
+                    msg_text,
+                ),
+                result,
+            )
             # #4729: the run is done — flush any reasoning tail still in the coalescing
             # buffer (the agent never calls reasoning_callback(None), and a turn can end on
             # reasoning with no trailing token/tool boundary to trigger a flush) so the last
@@ -9983,6 +10278,30 @@ def _run_agent_streaming(
                 with _stream_writeback_stage(_writeback_timings, "merge_result"):
                     _tool_limit_reached = _agent_result_tool_limit_reached(result)
                     _result_messages = result.get('messages') or _previous_context_messages
+                    _standalone_final_response = str(result.get('final_response') or '').strip()
+                    if (
+                        _standalone_final_response
+                        and _standalone_final_response.lower() != '(empty)'
+                        and not result.get('error')
+                        and not result.get('failed')
+                        and not result.get('compression_exhausted')
+                        and str(result.get('status') or result.get('state') or '').strip().lower()
+                            not in {'failed', 'error', 'compression_exhausted'}
+                        and not _assistant_reply_added_after_current_turn(
+                            _result_messages,
+                            _previous_context_messages,
+                            msg_text,
+                        )
+                    ):
+                        # Some provider adapters return the final answer only in
+                        # result.final_response after streaming it. Materialize
+                        # that answer before reconciliation so the terminal done
+                        # render and later refresh cannot lose visible content.
+                        _result_messages = list(_result_messages) + [{
+                            'role': 'assistant',
+                            'content': _standalone_final_response,
+                        }]
+                        result = {**result, 'messages': _result_messages}
                     _result_messages = _drop_synthetic_max_iteration_summary_requests(
                         _result_messages,
                         enabled=_tool_limit_reached,
@@ -10206,6 +10525,12 @@ def _run_agent_streaming(
                     _previous_context_messages,
                     msg_text,
                 )
+                _result_output_summary = _current_turn_result_output_summary(
+                    _all_result_messages,
+                    _previous_context_messages,
+                    msg_text,
+                )
+                _turn_outcome.observe_result(_result_output_summary, result)
                 _last_err = getattr(agent, '_last_error', None) or result.get('error') or ''
                 # #5940: if the Agent aborted on a non-retryable provider error
                 # (captured from its lifecycle status_callback) but left no error on
@@ -10220,6 +10545,12 @@ def _run_agent_streaming(
                     _last_err,
                     silent_failure=not bool(_last_err),
                 )
+                if _turn_outcome.has_usable_output and _classification['type'] == 'error':
+                    _classification = {
+                        'label': 'Response interrupted',
+                        'type': 'interrupted',
+                        'hint': 'The provider stream ended after returning partial output. The partial response was preserved; retry if you need the remainder.',
+                    }
                 _is_quota = _classification['type'] == 'quota_exhausted'
                 _is_auth = _classification['type'] == 'auth_mismatch'
                 _drop_replayed_assistant = (
@@ -10236,6 +10567,19 @@ def _run_agent_streaming(
                     source=getattr(s, 'pending_user_source', None) or 'webui',
                     drop_replayed_assistant=_drop_replayed_assistant,
                 )
+                if _drop_replayed_assistant and _saved_transcript_lacks_final_answer:
+                    # The provider/result payload may replay an older assistant
+                    # row after the current request. Remove that result-side
+                    # evidence before empty-response classification; only live
+                    # callbacks (if any) should keep this turn non-empty.
+                    _result_output_summary = {
+                        'assistant_text': False,
+                        'reasoning': False,
+                        'tool_output': False,
+                        'tool_event_count': 0,
+                        'finish_reason': None,
+                    }
+                    _turn_outcome.observe_result(_result_output_summary, {})
                 _is_agent_result_terminal = _agent_result_terminal_failure(result)
                 _terminal_failure = (
                     _captured_terminal_failure
@@ -10255,19 +10599,49 @@ def _run_agent_streaming(
                     and not _tool_limit_reached
                     and not _last_err
                 )
+                # A transcript-boundary mismatch may say "no final answer" even
+                # though this exact turn produced valid output. Do not let that
+                # inferred condition override direct callback/result evidence.
+                if (
+                    _terminal_failure
+                    and (
+                        _turn_outcome.result_has_final_text
+                        or _result_output_summary.get('reasoning')
+                        or _result_output_summary.get('tool_output')
+                    )
+                    and not _captured_terminal_failure
+                    and not _is_agent_result_terminal
+                    and not _drop_replayed_assistant
+                ):
+                    _terminal_failure = False
                 if (
                     _terminal_failure
                     and (_soft_partial_terminal_failure or _tool_limit_reached)
                     and _classification['type'] == 'no_response'
-                    and not _saved_transcript_lacks_final_answer
+                    and _turn_outcome.result_has_final_text
                 ):
                     _terminal_failure = False
+                # If an explicit terminal result really did follow partial
+                # text/reasoning/tool output, preserve it as an interrupted run.
+                # It is not a provider-empty response.
+                if (
+                    _terminal_failure
+                    and _classification['type'] == 'no_response'
+                    and _turn_outcome.has_usable_output
+                ):
+                    _classification = {
+                        'label': 'Response interrupted',
+                        'type': 'interrupted',
+                        'hint': 'The provider stream ended after returning partial output. The partial response was preserved; retry if you need the remainder.',
+                    }
                 if _terminal_failure:
                     _assistant_added = False
                 elif _tool_limit_reached and not _session_lacks_final_assistant_answer(s.messages):
                     _mark_latest_assistant_tool_limit_status(s.messages)
-                # _token_sent tracks whether on_token() was called (any streamed text)
-                if _terminal_failure or (not _assistant_added and not _token_sent):
+                # The authoritative outcome counts visible text, reasoning, and
+                # actual tool activity; an empty/whitespace token callback alone
+                # does not make the response usable.
+                if _terminal_failure or not _turn_outcome.has_usable_output:
                     if cancel_event.is_set():
                         _finalize_cancelled_turn(s, ephemeral=ephemeral)
                         if not ephemeral:
@@ -10456,6 +10830,16 @@ def _run_agent_streaming(
                             _err_str or f'{_err_label}.',
                             _err_type,
                             _err_hint,
+                        )
+                        _error_payload['stream_close_reason'] = (
+                            'provider-empty'
+                            if _err_type == 'no_response'
+                            else 'provider-terminal-failure'
+                        )
+                        _turn_outcome._diagnostic(
+                            'create-provider-error',
+                            error_type=_err_type,
+                            code_path='silent-failure-finalizer',
                         )
                         if _turn_pending_source == 'process_wakeup':
                             _recorded_pause = record_process_wakeup_provider_unavailable_pause(
@@ -11503,6 +11887,17 @@ def _run_agent_streaming(
 
     except Exception as e:
         print('[webui] stream error:\n' + traceback.format_exc(), flush=True)
+        # ``done`` is authoritative. Cleanup/title/metering code can still raise
+        # after the completed payload was queued; never persist or emit a second
+        # terminal error for that already-successful turn.
+        if _turn_outcome.status == 'completed':
+            _turn_outcome._diagnostic(
+                'post-completion-exception-dropped',
+                exception_type=type(e).__name__,
+                code_path='outer-exception-guard',
+            )
+            put('stream_end', {'session_id': session_id, 'turn_status': 'completed'})
+            return
         err_str = str(e)
         # Sanitize HTML from provider error responses — some providers return
         # full HTML pages (e.g. nginx "404 page not found") instead of JSON errors.
@@ -11513,6 +11908,12 @@ def _run_agent_streaming(
             err_str = _stripped
         _exc_lower = err_str.lower()
         _classification = _classify_provider_error(err_str, e)
+        if _turn_outcome.has_usable_output and _classification['type'] == 'error':
+            _classification = {
+                'label': 'Response interrupted',
+                'type': 'interrupted',
+                'hint': 'The provider stream ended after returning partial output. The partial response was preserved; retry if you need the remainder.',
+            }
         _exc_is_credential_pool_empty = _classification['type'] == 'credential_pool_empty'
         if cancel_event.is_set():
             if s is not None:
@@ -11711,6 +12112,16 @@ def _run_agent_streaming(
             _exc_label, _exc_type, _exc_hint = 'Error', 'error', ''
 
         _error_payload = _provider_error_payload(err_str, _exc_type, _exc_hint)
+        _error_payload['stream_close_reason'] = 'provider-exception'
+        if 'timeout' in _exc_lower or 'timed out' in _exc_lower:
+            _error_payload['abort_source'] = 'provider-timeout'
+        elif 'abort' in _exc_lower or 'interrupt' in _exc_lower:
+            _error_payload['abort_source'] = 'provider-abort'
+        _turn_outcome._diagnostic(
+            'create-provider-error',
+            error_type=_exc_type,
+            code_path='outer-exception-finalizer',
+        )
         if s is not None:
             if _checkpoint_stop is not None:
                 _checkpoint_stop.set()

@@ -6043,7 +6043,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
         const d=_doneData;
         _flushReasoningToAnchor();
         _applyToAnchor('done',{
-          status:d.status||'completed',
+          status:d.turn_status||d.status||'completed',
           usage:d.usage||null,
           created_at:d.created_at||null,
         },_doneEvent);
@@ -6429,6 +6429,11 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     });
 
     source.addEventListener('apperror',e=>{
+      _streamEventDiagnostic('apperror',e,source);
+      // Terminal status is authoritative per stream. In particular, ignore a
+      // late empty/error callback after `done`; otherwise the completed answer
+      // is replaced by a false "No response from provider" state.
+      if(_streamFinalized) return;
       if(_bailOutOfTerminalEventsFromStaleStream(source)) return;
       _clearStreamEndRecovery();
       _terminalStateReached=true;
@@ -6458,7 +6463,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
         _flushReasoningToAnchor();
         _applyToAnchor('apperror',{
           type:d.type||'error',
-          status:d.status||d.type||'error',
+          status:d.turn_status||d.status||d.type||'error',
           message:d.message||'',
           hint:d.hint||'',
           details:d.details||'',

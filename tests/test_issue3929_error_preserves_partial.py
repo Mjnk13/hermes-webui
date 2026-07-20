@@ -161,6 +161,152 @@ def test_silent_failure_preserves_partials(tmp_path):
 
     err_msg = saved.messages[-1]
     assert err_msg.get("_error") is True
+    queued_events = []
+    while not fake_queue.empty():
+        queued_events.append(fake_queue.get_nowait())
+    app_errors = [data for event, data, *_ in queued_events if event == "apperror"]
+    assert app_errors
+    assert app_errors[-1]["type"] == "interrupted"
+    assert app_errors[-1]["turn_status"] == "failed"
+    assert app_errors[-1]["usable_output"] is True
+
+
+def test_genuinely_empty_provider_result_is_still_no_response(tmp_path):
+    fake_session = Session(session_id="test_sess_no_response", title="Test Session")
+    fake_session.pending_user_message = "Empty provider result"
+    fake_session.active_stream_id = "test_stream_no_response"
+    fake_session.save()
+    models.SESSIONS[fake_session.session_id] = fake_session
+
+    class EmptyResultAgent(MockAgent):
+        def run_conversation(self, **kwargs):
+            return {"messages": kwargs.get("conversation_history") or []}
+
+    fake_queue = queue.Queue()
+    streaming.STREAMS[fake_session.active_stream_id] = fake_queue
+
+    with mock.patch.object(streaming, "get_session", return_value=fake_session), \
+         mock.patch.object(streaming, "_get_ai_agent", return_value=EmptyResultAgent), \
+         mock.patch.object(streaming, "resolve_model_provider", return_value=("test-model", "test-provider", None)), \
+         mock.patch("api.config.get_config", return_value={}), \
+         mock.patch("api.config._resolve_cli_toolsets", return_value=[]):
+        streaming._run_agent_streaming(
+            session_id=fake_session.session_id,
+            msg_text="Empty provider result",
+            model="test-model",
+            workspace=str(tmp_path),
+            stream_id="test_stream_no_response",
+        )
+
+    queued_events = []
+    while not fake_queue.empty():
+        queued_events.append(fake_queue.get_nowait())
+    app_errors = [data for event, data, *_ in queued_events if event == "apperror"]
+    assert app_errors
+    assert app_errors[-1]["type"] == "no_response"
+    assert app_errors[-1]["usable_output"] is False
+    assert app_errors[-1]["turn_status"] == "failed"
+
+
+def test_streamed_standalone_final_response_completes_without_false_error(tmp_path):
+    fake_session = Session(session_id="test_sess_final_response", title="Test Session")
+    fake_session.pending_user_message = "Give the final answer"
+    fake_session.active_stream_id = "test_stream_final_response"
+    fake_session.save()
+    models.SESSIONS[fake_session.session_id] = fake_session
+
+    class StandaloneFinalAgent(MockAgent):
+        def run_conversation(self, **kwargs):
+            answer = "This answer was streamed and completed."
+            self.stream_delta_callback(answer)
+            return {
+                # Reproduces adapters that leave a stale soft-partial marker but
+                # do provide a complete final_response outside messages.
+                "status": "partial",
+                "partial": True,
+                "final_response": answer,
+                "messages": kwargs.get("conversation_history") or [],
+            }
+
+    fake_queue = queue.Queue()
+    streaming.STREAMS[fake_session.active_stream_id] = fake_queue
+
+    with mock.patch.object(streaming, "get_session", return_value=fake_session), \
+         mock.patch.object(streaming, "_get_ai_agent", return_value=StandaloneFinalAgent), \
+         mock.patch.object(streaming, "resolve_model_provider", return_value=("test-model", "test-provider", None)), \
+         mock.patch("api.config.get_config", return_value={}), \
+         mock.patch("api.config._resolve_cli_toolsets", return_value=[]):
+        streaming._run_agent_streaming(
+            session_id=fake_session.session_id,
+            msg_text="Give the final answer",
+            model="test-model",
+            workspace=str(tmp_path),
+            stream_id="test_stream_final_response",
+        )
+
+    saved = Session.load(fake_session.session_id)
+    assert any(
+        message.get("role") == "assistant"
+        and message.get("content") == "This answer was streamed and completed."
+        and not message.get("_error")
+        for message in saved.messages
+    )
+    queued_events = []
+    while not fake_queue.empty():
+        queued_events.append(fake_queue.get_nowait())
+    assert not [data for event, data, *_ in queued_events if event == "apperror"]
+    done_events = [data for event, data, *_ in queued_events if event == "done"]
+    assert done_events
+    assert done_events[-1]["turn_status"] == "completed"
+    assert done_events[-1]["usable_output"] is True
+
+
+def test_completed_tool_only_result_is_not_treated_as_empty(tmp_path):
+    fake_session = Session(session_id="test_sess_tool_only", title="Test Session")
+    fake_session.pending_user_message = "Run one tool"
+    fake_session.active_stream_id = "test_stream_tool_only"
+    fake_session.save()
+    models.SESSIONS[fake_session.session_id] = fake_session
+
+    class ToolOnlyAgent(MockAgent):
+        def run_conversation(self, **kwargs):
+            history = list(kwargs.get("conversation_history") or [])
+            return {
+                "messages": history + [
+                    {"role": "user", "content": "Run one tool"},
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [{"id": "call-1", "type": "function", "function": {"name": "check", "arguments": "{}"}}],
+                    },
+                    {"role": "tool", "tool_call_id": "call-1", "content": "ok"},
+                ]
+            }
+
+    fake_queue = queue.Queue()
+    streaming.STREAMS[fake_session.active_stream_id] = fake_queue
+
+    with mock.patch.object(streaming, "get_session", return_value=fake_session), \
+         mock.patch.object(streaming, "_get_ai_agent", return_value=ToolOnlyAgent), \
+         mock.patch.object(streaming, "resolve_model_provider", return_value=("test-model", "test-provider", None)), \
+         mock.patch("api.config.get_config", return_value={}), \
+         mock.patch("api.config._resolve_cli_toolsets", return_value=[]):
+        streaming._run_agent_streaming(
+            session_id=fake_session.session_id,
+            msg_text="Run one tool",
+            model="test-model",
+            workspace=str(tmp_path),
+            stream_id="test_stream_tool_only",
+        )
+
+    queued_events = []
+    while not fake_queue.empty():
+        queued_events.append(fake_queue.get_nowait())
+    assert not [data for event, data, *_ in queued_events if event == "apperror"]
+    done_events = [data for event, data, *_ in queued_events if event == "done"]
+    assert done_events
+    assert done_events[-1]["turn_status"] == "completed"
+    assert done_events[-1]["usable_output"] is True
 
 
 def test_exception_preserves_partials(tmp_path):
@@ -205,6 +351,12 @@ def test_exception_preserves_partials(tmp_path):
     err_msg = saved.messages[-1]
     assert err_msg.get("_error") is True
     assert "Fake provider crash!" in err_msg.get("content", "")
+    queued_events = []
+    while not fake_queue.empty():
+        queued_events.append(fake_queue.get_nowait())
+    app_errors = [data for event, data, *_ in queued_events if event == "apperror"]
+    assert app_errors[-1]["type"] == "interrupted"
+    assert app_errors[-1]["usable_output"] is True
 
 
 def test_empty_partials_do_not_create_spurious_messages(tmp_path):

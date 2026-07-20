@@ -6479,17 +6479,27 @@ function _applyReasoningOptions(supportedEfforts,options){
   const renderKey=JSON.stringify(rendered.map(function(item){
     return [item.value,item.label,item.backend_value||item.value,item.provider_value||item.value];
   }));
+  if(!dd.dataset) dd.dataset={};
   if(dd.dataset.reasoningOptionsKey===renderKey) return;
   dd.dataset.reasoningOptionsKey=renderKey;
-  dd.replaceChildren();
-  rendered.forEach(function(item){
-    const opt=document.createElement('div');
-    opt.className='reasoning-option';
-    opt.dataset.effort=item.value;
-    opt.dataset.backendValue=item.backend_value||item.value;
-    opt.dataset.providerValue=item.provider_value||item.backend_value||item.value;
-    opt.textContent=item.label;
-    dd.appendChild(opt);
+  if(typeof dd.replaceChildren==='function'&&typeof dd.appendChild==='function'){
+    dd.replaceChildren();
+    rendered.forEach(function(item){
+      const opt=document.createElement('div');
+      opt.className='reasoning-option';
+      opt.dataset.effort=item.value;
+      opt.dataset.backendValue=item.backend_value||item.value;
+      opt.dataset.providerValue=item.provider_value||item.backend_value||item.value;
+      opt.textContent=item.label;
+      dd.appendChild(opt);
+    });
+    return;
+  }
+  // Keep pre-rendered dropdowns usable for older cached pages while newer
+  // pages use the backend-owned dynamic option list above.
+  const visibleValues=new Set(rendered.map(function(item){return item.value;}));
+  Array.from(dd.querySelectorAll?dd.querySelectorAll('.reasoning-option'):[]).forEach(function(opt){
+    opt.style.display=visibleValues.has(opt.dataset.effort)?'':'none';
   });
 }
 
@@ -6542,7 +6552,9 @@ function _applyReasoningChip(eff){
   wrap.style.display='';
   if(mobileAction) mobileAction.style.display='';
   if(typeof _applyReasoningOptions==='function'){
-    _applyReasoningOptions(supportedEfforts,_currentReasoningOptions);
+    const options=(typeof _currentReasoningOptions==='undefined')
+      ?null:_currentReasoningOptions;
+    _applyReasoningOptions(supportedEfforts,options);
   }
   const text=_formatReasoningEffortLabel(effort);
   label.textContent=text;

@@ -4415,24 +4415,6 @@ def set_reasoning_effort(
             f"Unknown reasoning effort '{effort}'. "
             f"Valid: none, {', '.join(VALID_REASONING_EFFORTS)}."
         )
-    if raw and raw != "none":
-        capability_status = get_reasoning_status(
-            model_id=model_id,
-            provider_id=provider_id,
-            base_url=base_url,
-        )
-        supported = capability_status.get("supported_efforts") or []
-        target = capability_status.get("diagnostics", {})
-        # With no model context there is nothing to validate against; preserve
-        # CLI behavior and store the canonical value for the next model. Once a
-        # model is known, fail closed instead of persisting a value that would
-        # immediately be coerced to something different.
-        if target.get("selected_model") and raw not in supported:
-            raise ValueError(
-                f"Reasoning effort '{raw}' is not supported by "
-                f"{target.get('selected_provider') or 'this provider'} / "
-                f"{target.get('selected_model') or 'this model'}."
-            )
     config_path = _get_config_path()
     with _cfg_lock:
         config_data = _load_yaml_config_file(config_path)
