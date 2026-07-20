@@ -47,6 +47,9 @@ const browserBridge = {
   setOverlaySuppressed(payload) {
     return ipcRenderer.invoke('browser-workbench:set-overlay-suppressed', payload || {});
   },
+  captureOverlaySnapshot(payload) {
+    return ipcRenderer.invoke('browser-workbench:capture-overlay-snapshot', payload || {});
+  },
   showUrlSuggestions(payload) {
     return ipcRenderer.invoke('browser-workbench:show-url-suggestions', payload || {});
   },
@@ -101,6 +104,7 @@ const browserBridge = {
   invoke(method, payload) {
     if (method === 'setBounds') return ipcRenderer.invoke('browser-workbench:set-bounds', payload || {});
     if (method === 'setOverlaySuppressed') return ipcRenderer.invoke('browser-workbench:set-overlay-suppressed', payload || {});
+    if (method === 'captureOverlaySnapshot') return ipcRenderer.invoke('browser-workbench:capture-overlay-snapshot', payload || {});
     if (method === 'showUrlSuggestions') return ipcRenderer.invoke('browser-workbench:show-url-suggestions', payload || {});
     if (method === 'updateUrlSuggestions') return ipcRenderer.invoke('browser-workbench:update-url-suggestions', payload || {});
     if (method === 'hideUrlSuggestions') return ipcRenderer.invoke('browser-workbench:hide-url-suggestions', payload || {});

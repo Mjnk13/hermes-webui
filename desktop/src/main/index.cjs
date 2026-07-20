@@ -25,7 +25,7 @@ let activeSessionId = '';
 let urlSuggestionOverlay = null;
 let actionsMenuOverlay = null;
 let appIsQuitting = false;
-let applicationOverlaySuppression = { suppressed: false, generation: 0, overlayCount: 0 };
+let applicationOverlaySuppression = { suppressed: false, generation: 0, overlayCount: 0, sessionId: '' };
 
 function desktopAppPidFilePath() {
   const raw = String(process.env.HERMES_WEBUI_DESKTOP_APP_PID_FILE || '').trim();
@@ -1358,6 +1358,12 @@ function applyApplicationOverlaySuppressionToRecord(record, suppressed, wasSuppr
   }
 }
 
+function applicationOverlaySuppressionAppliesToRecord(state, record) {
+  if (!state || state.suppressed !== true || !record) return false;
+  const sessionId = String(state.sessionId || '');
+  return !!sessionId && String(record.id || '') === sessionId;
+}
+
 function setApplicationOverlaySuppression(payload) {
   const rawGeneration = Number(payload && payload.generation);
   const generation = Number.isFinite(rawGeneration) && rawGeneration >= 0
@@ -1366,35 +1372,55 @@ function setApplicationOverlaySuppression(payload) {
   if (generation < applicationOverlaySuppression.generation) {
     return { ok: true, ignored: true, ...applicationOverlaySuppression };
   }
-  const wasSuppressed = applicationOverlaySuppression.suppressed === true;
+  const previous = applicationOverlaySuppression;
   const suppressed = payload && payload.suppressed === true;
   applicationOverlaySuppression = {
     suppressed,
     generation,
     overlayCount: Math.max(0, Math.round(Number(payload && payload.overlayCount) || 0)),
+    sessionId: suppressed ? String(payload && (payload.sessionId || payload.session_id) || '') : '',
   };
-  if (suppressed !== wasSuppressed) {
-    for (const record of tabs.values()) {
-      applyApplicationOverlaySuppressionToRecord(record, suppressed, wasSuppressed);
+  for (const record of tabs.values()) {
+    const wasSuppressed = applicationOverlaySuppressionAppliesToRecord(previous, record);
+    const isSuppressed = applicationOverlaySuppressionAppliesToRecord(applicationOverlaySuppression, record);
+    if (isSuppressed !== wasSuppressed) {
+      applyApplicationOverlaySuppressionToRecord(record, isSuppressed, wasSuppressed);
     }
   }
   return { ok: true, ...applicationOverlaySuppression };
 }
 
 function resetApplicationOverlaySuppression() {
-  const wasSuppressed = applicationOverlaySuppression.suppressed === true;
-  applicationOverlaySuppression = { suppressed: false, generation: 0, overlayCount: 0 };
-  if (wasSuppressed) {
-    for (const record of tabs.values()) {
+  const previous = applicationOverlaySuppression;
+  applicationOverlaySuppression = { suppressed: false, generation: 0, overlayCount: 0, sessionId: '' };
+  for (const record of tabs.values()) {
+    if (applicationOverlaySuppressionAppliesToRecord(previous, record)) {
       applyApplicationOverlaySuppressionToRecord(record, false, true);
     }
   }
 }
 
-function setNativeBounds(payload) {
-  if (payload && payload.applicationOverlay && typeof payload.applicationOverlay === 'object') {
-    setApplicationOverlaySuppression(payload.applicationOverlay);
+async function captureApplicationOverlaySnapshot(payload) {
+  const sessionId = String(payload && (payload.sessionId || payload.session_id) || '').trim();
+  const generation = Math.max(0, Math.round(Number(payload && payload.generation) || 0));
+  const record = sessionId ? tabs.get(sessionId) : null;
+  if (!record || !record.visible || !record.view || record.view.isDestroyed && record.view.isDestroyed()) {
+    return { ok: false, generation, session_id: sessionId, error: 'native browser surface is unavailable' };
   }
+  const wc = record.view.webContents;
+  if (!wc || wc.isDestroyed && wc.isDestroyed()) {
+    return { ok: false, generation, session_id: sessionId, error: 'native browser contents are unavailable' };
+  }
+  const image = await wc.capturePage();
+  return {
+    ok: true,
+    generation,
+    session_id: sessionId,
+    data_url: image.toDataURL(),
+  };
+}
+
+function setNativeBounds(payload) {
   const sessionId = String(payload && (payload.sessionId || payload.session_id) || '').trim();
   const visible = !!(payload && payload.visible && sessionId && tabs.has(sessionId));
   for (const [id, record] of tabs) {
@@ -1424,7 +1450,7 @@ function setNativeBounds(payload) {
   addNativeViewToWindow(record);
   record.view.setBounds(nextBounds);
   try {
-    if (applicationOverlaySuppression.suppressed === true) record.view.setVisible(false);
+    if (applicationOverlaySuppressionAppliesToRecord(applicationOverlaySuppression, record)) record.view.setVisible(false);
     else record.view.setVisible(true);
   } catch (_) {}
   if (urlSuggestionOverlay && urlSuggestionOverlay.visible) addUrlSuggestionOverlayToWindow();
@@ -1682,6 +1708,7 @@ function startBridgeServer() {
 
 ipcMain.handle('browser-workbench:set-bounds', (_event, payload) => setNativeBounds(payload || {}));
 ipcMain.handle('browser-workbench:set-overlay-suppressed', (_event, payload) => setApplicationOverlaySuppression(payload || {}));
+ipcMain.handle('browser-workbench:capture-overlay-snapshot', (_event, payload) => captureApplicationOverlaySnapshot(payload || {}));
 ipcMain.handle('browser-workbench:show-url-suggestions', (_event, payload) => showUrlSuggestionOverlay(payload || {}));
 ipcMain.handle('browser-workbench:update-url-suggestions', (_event, payload) => showUrlSuggestionOverlay(payload || {}));
 ipcMain.handle('browser-workbench:hide-url-suggestions', () => hideUrlSuggestionOverlay());

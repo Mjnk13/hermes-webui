@@ -1633,7 +1633,8 @@ def test_browser_workbench_static_shell_is_wired_default_off_and_safe():
     assert "electron_native_available:nativeBridgeAvailable" in js
     assert "function browserWorkbenchProxyUrlForTarget" in js
     assert "Some pages may behave differently in the embedded browser." in js
-    assert "document.createElement('img')" not in js
+    assert "image.className='browser-workbench-native-overlay-snapshot'" in js
+    assert "function renderBrowserWorkbenchScreenshot" not in js
     assert "screenshot_data_url" not in js
     assert "browser-workbench-screenshot.png" in js
     assert "iframe CSP/X-Frame-Options cannot block this preview" not in js

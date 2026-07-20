@@ -372,14 +372,19 @@ coordinates with flip, shift, and collision handling; full-window dialogs keep
 viewport-centered coordinates.
 
 When an application overlay intersects the Browser Workbench viewport, the
-desktop bridge temporarily makes the native view invisible. This operation is
-visibility-only: it must not change bounds, detach or recreate the view, or
-alter the browser tab's URL, scroll position, zoom, session, focus history, or
-navigation history. The DOM browser placeholder remains at the same dimensions,
-so overlays never resize, crop, split, or push the browser/composer layout.
-Generation ordering and the overlay count prevent a stale close event or one
-nested overlay from restoring the native view before the last intersecting
-overlay closes. Renderer reload/teardown resets suppression as a final cleanup.
+desktop bridge first captures the current native page pixels without mutating
+the page. The renderer decodes and paints that frame in the unchanged Browser
+Workbench viewport before the desktop bridge temporarily makes the matching
+native view invisible. The visual handoff is session-scoped: it must not hide
+other attached native tabs, change bounds, detach or recreate the view, or alter
+the browser tab's URL, scroll position, zoom, session, focus history, or
+navigation history. On close, the live native view becomes visible before the
+captured frame is retired or replaced, preventing a white compositor gap. The
+DOM browser viewport remains at the same dimensions, so overlays never resize,
+crop, split, or push the browser/composer layout. Generation ordering and the
+overlay count prevent a stale close event or one nested overlay from restoring
+the native view before the last intersecting overlay closes. Renderer
+reload/teardown resets suppression as a final cleanup.
 
 Browser-owned native UI such as its URL suggestions remains separate from this
 application-overlay portal. New overlays opened by the main Hermes UI should

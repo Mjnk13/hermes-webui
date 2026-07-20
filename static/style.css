@@ -5239,6 +5239,7 @@ main.main > #mainPlugin{display:none;}
 .browser-workbench-stream-wrap{width:100%;height:100%;min-height:0;display:flex;flex-direction:column;background:#fff;border-radius:10px;overflow:hidden;}
 .browser-workbench-stream-canvas{flex:1;min-height:0;width:100%;height:100%;display:block;background:#fff;object-fit:fill;}
 .browser-workbench-native-wrap{width:100%;height:100%;min-height:0;background:transparent;border-radius:10px;overflow:hidden;pointer-events:none;}
+.browser-workbench-native-overlay-snapshot{position:absolute;inset:0;width:100%;height:100%;display:block;object-fit:fill;border-radius:inherit;pointer-events:none;user-select:none;z-index:0;}
 .browser-workbench-viewport.area-capturing{cursor:crosshair;border-color:var(--accent);box-shadow:inset 0 0 0 1px var(--accent-bg-strong),0 0 0 3px var(--accent-bg);}
 .browser-workbench-viewport.area-capturing .browser-workbench-frame{pointer-events:none;}
 .browser-workbench-area-capture-box{position:absolute;z-index:8;border:1.5px dashed #f59e0b;background:rgba(245,158,11,.16);box-shadow:0 0 0 1px rgba(15,23,42,.35),0 10px 24px rgba(15,23,42,.20);pointer-events:none;border-radius:5px;}

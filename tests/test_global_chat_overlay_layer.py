@@ -20,6 +20,8 @@ NODE = shutil.which("node")
 
 def _function(source: str, name: str) -> str:
     start = source.index(f"function {name}(")
+    if source[max(0, start - 6) : start] == "async ":
+        start -= 6
     brace = source.index("{", start)
     depth = 0
     quote = None
@@ -60,7 +62,11 @@ def test_overlay_portal_covers_chat_flyouts_popovers_and_lightboxes():
         "queueCard",
         "approvalCard",
         "clarifyCard",
+        "composerTerminalPanel",
+        "handoffHintContainer",
         "cmdDropdown",
+        "savedPromptsPopup",
+        "composerMobileConfigPanel",
         "composerWsDropdown",
         "composerReasoningDropdown",
         "composerFastDropdown",
@@ -205,7 +211,7 @@ process.stdout.write(JSON.stringify(events.map(event=>({{count:event.overlayCoun
     )
 
 
-def test_browser_surface_is_visibility_suppressed_without_changing_native_bounds():
+def test_browser_surface_is_snapshot_backed_before_scoped_visibility_suppression():
     assert "let browserWorkbenchGlobalOverlayRects=[];" in WORKBENCH
     assert "function browserWorkbenchOverlayIntersections(bounds)" in WORKBENCH
     assert "function browserWorkbenchOverlaySuppression(bounds)" in WORKBENCH
@@ -216,9 +222,13 @@ def test_browser_surface_is_visibility_suppressed_without_changing_native_bounds
     assert "browserWorkbenchBoundsBelowGlobalOverlays" not in WORKBENCH
     assert "payload.bounds=browserWorkbenchBoundsBelowGlobalOverlays" not in WORKBENCH
     assert "setOverlaySuppressed(payload)" in PRELOAD
+    assert "captureOverlaySnapshot(payload)" in PRELOAD
     assert "browser-workbench:set-overlay-suppressed" in PRELOAD
+    assert "browser-workbench:capture-overlay-snapshot" in PRELOAD
     assert "function setApplicationOverlaySuppression(payload)" in DESKTOP
-    assert "if (applicationOverlaySuppression.suppressed === true) record.view.setVisible(false)" in DESKTOP
+    assert "function captureApplicationOverlaySnapshot(payload)" in DESKTOP
+    assert "applicationOverlaySuppressionAppliesToRecord(applicationOverlaySuppression, record)" in DESKTOP
+    assert ".browser-workbench-native-overlay-snapshot{" in CSS
 
     suppress = _function(DESKTOP, "applyApplicationOverlaySuppressionToRecord")
     assert "record.view.setVisible(!suppressed)" in suppress
@@ -265,6 +275,7 @@ def test_native_overlay_suppression_is_generation_safe_and_nested():
     functions = "\n".join(
         _function(DESKTOP, name)
         for name in (
+            "applicationOverlaySuppressionAppliesToRecord",
             "applyApplicationOverlaySuppressionToRecord",
             "setApplicationOverlaySuppression",
         )
@@ -274,15 +285,15 @@ const visibility=[];
 let focusRestores=0;
 const webContents={{isFocused:()=>true,isDestroyed:()=>false,focus:()=>{{focusRestores+=1;}}}};
 const view={{webContents,isDestroyed:()=>false,setVisible:(value)=>visibility.push(value),setBounds:()=>{{throw new Error('overlay suppression must not resize');}}}};
-const record={{view,visible:true,focusBeforeApplicationOverlay:false}};
+const record={{id:'session-1',view,visible:true,focusBeforeApplicationOverlay:false}};
 const tabs=new Map([['session-1',record]]);
-let applicationOverlaySuppression={{suppressed:false,generation:0,overlayCount:0}};
+let applicationOverlaySuppression={{suppressed:false,generation:0,overlayCount:0,sessionId:''}};
 const setTimeout=(callback)=>callback();
 {functions}
-const opened=setApplicationOverlaySuppression({{suppressed:true,generation:10,overlayCount:2}});
-const staleClose=setApplicationOverlaySuppression({{suppressed:false,generation:9,overlayCount:0}});
-const oneStillOpen=setApplicationOverlaySuppression({{suppressed:true,generation:11,overlayCount:1}});
-const closed=setApplicationOverlaySuppression({{suppressed:false,generation:12,overlayCount:0}});
+const opened=setApplicationOverlaySuppression({{suppressed:true,generation:10,overlayCount:2,sessionId:'session-1'}});
+const staleClose=setApplicationOverlaySuppression({{suppressed:false,generation:9,overlayCount:0,sessionId:'session-1'}});
+const oneStillOpen=setApplicationOverlaySuppression({{suppressed:true,generation:11,overlayCount:1,sessionId:'session-1'}});
+const closed=setApplicationOverlaySuppression({{suppressed:false,generation:12,overlayCount:0,sessionId:'session-1'}});
 process.stdout.write(JSON.stringify({{visibility,focusRestores,opened,staleClose,oneStillOpen,closed}}));
 """
     result = subprocess.run([NODE, "-e", script], text=True, capture_output=True, timeout=30)
@@ -295,6 +306,184 @@ process.stdout.write(JSON.stringify({{visibility,focusRestores,opened,staleClose
     assert data["oneStillOpen"]["suppressed"] is True
     assert data["oneStillOpen"]["overlayCount"] == 1
     assert data["closed"]["suppressed"] is False
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_native_overlay_snapshot_is_ready_before_visibility_suppression():
+    """The app renderer must paint the native page capture before hiding it.
+
+    A second/nested overlay reuses the staged capture, while close restores the
+    live native view without removing the capture underneath it. Keeping that
+    last frame mounted prevents a white compositor gap on close.
+    """
+    sync = _function(WORKBENCH, "syncBrowserWorkbenchNativeOverlaySuppression")
+    script = f"""
+const calls=[];
+let browserWorkbenchNativeOverlaySyncRequest=0;
+let browserWorkbenchNativeOverlaySuppressed=false;
+let hasSnapshot=false;
+let nextPayload={{
+  tabId:'tab-1',sessionId:'session-1',
+  applicationOverlay:{{suppressed:true,overlayCount:1,generation:10}},
+}};
+const canUseElectronNativeBridge=()=>true;
+const getActiveWorkbenchTab=()=>({{id:'tab-1',sessionId:'session-1',renderer:'electron-native'}});
+const currentNativeBoundsPayload=()=>nextPayload;
+const browserWorkbenchHasNativeOverlaySnapshot=()=>hasSnapshot;
+const stageBrowserWorkbenchNativeOverlaySnapshot=async()=>{{calls.push('capture');hasSnapshot=true;return true;}};
+const callDesktopBrowserBridge=async(method,payload)=>{{
+  calls.push(method+':'+String(payload.suppressed));
+  return {{ok:true,suppressed:payload.suppressed===true,sessionId:payload.sessionId||''}};
+}};
+{sync}
+(async()=>{{
+  await syncBrowserWorkbenchNativeOverlaySuppression();
+  nextPayload={{...nextPayload,applicationOverlay:{{suppressed:true,overlayCount:2,generation:11}}}};
+  await syncBrowserWorkbenchNativeOverlaySuppression();
+  nextPayload={{...nextPayload,applicationOverlay:{{suppressed:false,overlayCount:0,generation:12}}}};
+  await syncBrowserWorkbenchNativeOverlaySuppression();
+  process.stdout.write(JSON.stringify({{calls,suppressed:browserWorkbenchNativeOverlaySuppressed,hasSnapshot}}));
+}})().catch(err=>{{console.error(err);process.exit(1);}});
+"""
+    result = subprocess.run([NODE, "-e", script], text=True, capture_output=True, timeout=30)
+    assert result.returncode == 0, result.stderr
+    data = json.loads(result.stdout)
+    assert data == {
+        "calls": [
+            "capture",
+            "setOverlaySuppressed:true",
+            "setOverlaySuppressed:true",
+            "setOverlaySuppressed:false",
+        ],
+        "suppressed": False,
+        "hasSnapshot": True,
+    }
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_native_overlay_snapshot_helper_decodes_mounts_and_paints_captured_page():
+    stage = _function(WORKBENCH, "stageBrowserWorkbenchNativeOverlaySnapshot")
+    script = f"""
+const events=[];
+let browserWorkbenchNativeOverlaySyncRequest=4;
+let snapshot=null;
+const viewportEl={{
+  querySelector:()=>snapshot,
+  appendChild:image=>{{snapshot=image;image.isConnected=true;events.push('mount');}},
+}};
+const wireDom=()=>{{}};
+const document={{createElement:tag=>({{
+  tag,dataset:{{}},className:'',alt:'',isConnected:false,complete:true,
+  setAttribute(name,value){{this[name]=value;}},
+  getAttribute(name){{return this[name]||null;}},
+  decode:async()=>{{events.push('decode');}},
+  remove(){{events.push('remove');this.isConnected=false;}},
+}})}};
+const window={{requestAnimationFrame:callback=>{{events.push('paint');callback();}}}};
+const callDesktopBrowserBridge=async(method,payload)=>{{
+  events.push(method);
+  return {{ok:true,generation:payload.generation,session_id:payload.sessionId,data_url:'data:image/png;base64,cGFnZQ=='}};
+}};
+{stage}
+(async()=>{{
+  const staged=await stageBrowserWorkbenchNativeOverlaySnapshot({{
+    sessionId:'session-1',applicationOverlay:{{generation:7}},
+  }},4);
+  process.stdout.write(JSON.stringify({{
+    staged,events,className:snapshot&&snapshot.className,
+    sessionId:snapshot&&snapshot.dataset.sessionId,src:snapshot&&snapshot.src,
+  }}));
+}})().catch(err=>{{console.error(err);process.exit(1);}});
+"""
+    result = subprocess.run([NODE, "-e", script], text=True, capture_output=True, timeout=30)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == {
+        "staged": True,
+        "events": ["captureOverlaySnapshot", "decode", "mount", "paint"],
+        "className": "browser-workbench-native-overlay-snapshot",
+        "sessionId": "session-1",
+        "src": "data:image/png;base64,cGFnZQ==",
+    }
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_native_overlay_suppression_is_scoped_to_captured_session():
+    """A chat overlay must never globally blank every attached native tab."""
+    functions = "\n".join(
+        _function(DESKTOP, name)
+        for name in (
+            "applicationOverlaySuppressionAppliesToRecord",
+            "applyApplicationOverlaySuppressionToRecord",
+            "setApplicationOverlaySuppression",
+        )
+    )
+    script = f"""
+const visibility={{one:[],two:[]}};
+const makeRecord=(id,key)=>({{
+  id,visible:true,focusBeforeApplicationOverlay:false,
+  view:{{
+    webContents:{{isFocused:()=>false,isDestroyed:()=>false,focus:()=>{{}}}},
+    isDestroyed:()=>false,
+    setVisible:value=>visibility[key].push(value),
+    setBounds:()=>{{throw new Error('overlay suppression must not resize');}},
+  }},
+}});
+const one=makeRecord('session-1','one');
+const two=makeRecord('session-2','two');
+const tabs=new Map([['session-1',one],['session-2',two]]);
+let applicationOverlaySuppression={{suppressed:false,generation:0,overlayCount:0,sessionId:''}};
+const setTimeout=callback=>callback();
+{functions}
+setApplicationOverlaySuppression({{suppressed:true,generation:10,overlayCount:1,sessionId:'session-1'}});
+setApplicationOverlaySuppression({{suppressed:true,generation:11,overlayCount:2,sessionId:'session-1'}});
+setApplicationOverlaySuppression({{suppressed:true,generation:12,overlayCount:1,sessionId:'session-2'}});
+setApplicationOverlaySuppression({{suppressed:false,generation:13,overlayCount:0,sessionId:'session-2'}});
+process.stdout.write(JSON.stringify(visibility));
+"""
+    result = subprocess.run([NODE, "-e", script], text=True, capture_output=True, timeout=30)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == {"one": [False, True], "two": [False, True]}
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_overlay_snapshot_capture_does_not_mutate_browser_lifecycle_state():
+    capture = _function(DESKTOP, "captureApplicationOverlaySnapshot")
+    script = f"""
+const calls=[];
+const record={{
+  id:'session-1',visible:true,url:'https://example.test/page',zoom:1.25,
+  view:{{
+    isDestroyed:()=>false,
+    setVisible:()=>calls.push('setVisible'),
+    setBounds:()=>calls.push('setBounds'),
+    webContents:{{
+      isDestroyed:()=>false,
+      getURL:()=>record.url,
+      capturePage:async()=>({{toDataURL:()=> 'data:image/png;base64,cGFnZQ=='}}),
+      loadURL:()=>calls.push('loadURL'),reload:()=>calls.push('reload'),
+    }},
+  }},
+}};
+const tabs=new Map([['session-1',record]]);
+{capture}
+(async()=>{{
+  const result=await captureApplicationOverlaySnapshot({{sessionId:'session-1',generation:7}});
+  process.stdout.write(JSON.stringify({{result,calls,url:record.url,zoom:record.zoom,visible:record.visible}}));
+}})().catch(err=>{{console.error(err);process.exit(1);}});
+"""
+    result = subprocess.run([NODE, "-e", script], text=True, capture_output=True, timeout=30)
+    assert result.returncode == 0, result.stderr
+    data = json.loads(result.stdout)
+    assert data["calls"] == []
+    assert data["url"] == "https://example.test/page"
+    assert data["zoom"] == 1.25
+    assert data["visible"] is True
+    assert data["result"] == {
+        "ok": True,
+        "generation": 7,
+        "session_id": "session-1",
+        "data_url": "data:image/png;base64,cGFnZQ==",
+    }
 
 
 def test_portal_does_not_replace_existing_dismissal_handlers():

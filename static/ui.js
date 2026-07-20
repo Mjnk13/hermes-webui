@@ -408,8 +408,9 @@ const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&
 // draw above them. Every floating chat surface therefore keeps its original
 // live node/handlers, but is temporarily moved into this one document-level
 // portal. A consolidated, generation-ordered stack event lets Browser Workbench
-// temporarily hide only the intersecting native surface. Its bounds and DOM
-// placeholder never change, so opening an overlay cannot reflow either pane.
+// stage the intersecting native surface's current pixels before temporarily
+// hiding that same surface. Its bounds and DOM viewport never change, so opening
+// an overlay cannot reflow either pane or expose the viewport fallback.
 const _globalOverlayHomes=new WeakMap();
 const _globalOverlayStyles=new WeakMap();
 const _globalOverlayMounted=new Set();

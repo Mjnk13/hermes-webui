@@ -57,6 +57,8 @@
   let browserWorkbenchActionsMenuBounds=null;
   let browserWorkbenchGlobalOverlayRects=[];
   let browserWorkbenchGlobalOverlayGeneration=0;
+  let browserWorkbenchNativeOverlaySyncRequest=0;
+  let browserWorkbenchNativeOverlaySuppressed=false;
   let browserWorkbenchIframeCaptureRequestId=0;
   const browserWorkbenchIframeCapturePending=new Map();
   const BROWSER_WORKBENCH_HOVER_INSPECT_DELAY_MS=90;
@@ -206,7 +208,14 @@
     const target=tab||getActiveWorkbenchTab();
     if(!canUseElectronNativeBridge())return;
     const payload=currentNativeBoundsPayload(target,visible);
-    callDesktopBrowserBridge('setBounds',payload).catch((err)=>{
+    callDesktopBrowserBridge('setBounds',payload).then(()=>{
+      // A tab can become active while an application overlay is already open.
+      // Bounds synchronization deliberately does not suppress it; stage the
+      // correct tab's pixels first, then use the explicit suppression channel.
+      if(payload.visible&&payload.applicationOverlay.suppressed){
+        void syncBrowserWorkbenchNativeOverlaySuppression();
+      }
+    }).catch((err)=>{
       if(target&&target.renderer==='electron-native'){
         setStatus('Browser view could not be displayed.','warning',target,{owner:'renderer',kind:'error'});
       }
@@ -222,15 +231,86 @@
     });
   }
 
-  function syncBrowserWorkbenchNativeOverlaySuppression(){
-    if(!canUseElectronNativeBridge())return;
+  function browserWorkbenchNativeOverlaySnapshotElement(sessionId){
+    wireDom();
+    if(!viewportEl||!viewportEl.querySelector)return null;
+    const snapshot=viewportEl.querySelector('.browser-workbench-native-overlay-snapshot');
+    if(!snapshot)return null;
+    return String(snapshot.dataset.sessionId||'')===String(sessionId||'')?snapshot:null;
+  }
+
+  function browserWorkbenchHasNativeOverlaySnapshot(sessionId){
+    const snapshot=browserWorkbenchNativeOverlaySnapshotElement(sessionId);
+    return !!(snapshot&&snapshot.isConnected&&snapshot.getAttribute('src'));
+  }
+
+  async function stageBrowserWorkbenchNativeOverlaySnapshot(payload,requestId){
+    const sessionId=String(payload&&payload.sessionId||'');
+    if(!sessionId)return false;
+    let result;
+    try{
+      result=await callDesktopBrowserBridge('captureOverlaySnapshot',{
+        sessionId,
+        generation:payload.applicationOverlay.generation,
+      });
+    }catch(_){return false;}
+    if(requestId!==browserWorkbenchNativeOverlaySyncRequest)return false;
+    const dataUrl=String(result&&result.data_url||'');
+    if((result&&result.ok===false)||!/^data:image\/png;base64,/i.test(dataUrl))return false;
+    wireDom();
+    if(!viewportEl)return false;
+    const image=document.createElement('img');
+    image.className='browser-workbench-native-overlay-snapshot';
+    image.dataset.sessionId=sessionId;
+    image.alt='';
+    image.setAttribute('aria-hidden','true');
+    image.src=dataUrl;
+    try{
+      if(typeof image.decode==='function')await image.decode();
+      else if(!image.complete)await new Promise((resolve,reject)=>{
+        image.onload=resolve;
+        image.onerror=reject;
+      });
+    }catch(_){return false;}
+    if(requestId!==browserWorkbenchNativeOverlaySyncRequest)return false;
+    const previous=viewportEl.querySelector('.browser-workbench-native-overlay-snapshot');
+    viewportEl.appendChild(image);
+    if(previous&&previous!==image)previous.remove();
+    // Give Chromium a paint boundary with the decoded frame in the DOM before
+    // the native child view is made invisible. The live page still owns all
+    // URL/scroll/zoom/session/navigation state underneath this visual handoff.
+    await new Promise(resolve=>window.requestAnimationFrame(()=>resolve()));
+    return requestId===browserWorkbenchNativeOverlaySyncRequest;
+  }
+
+  async function syncBrowserWorkbenchNativeOverlaySuppression(){
+    if(!canUseElectronNativeBridge())return null;
+    const requestId=++browserWorkbenchNativeOverlaySyncRequest;
     const active=getActiveWorkbenchTab();
     const payload=currentNativeBoundsPayload(active,!!active&&active.renderer==='electron-native');
-    callDesktopBrowserBridge('setOverlaySuppressed',{
+    const applicationOverlay=payload.applicationOverlay;
+    if(applicationOverlay.suppressed&&(
+      !browserWorkbenchNativeOverlaySuppressed
+      ||!browserWorkbenchHasNativeOverlaySnapshot(payload.sessionId)
+    )){
+      const staged=await stageBrowserWorkbenchNativeOverlaySnapshot(payload,requestId);
+      // Never trade the native page for the white DOM fallback when capture is
+      // unavailable or when a newer open/close generation superseded this one.
+      if(!staged||requestId!==browserWorkbenchNativeOverlaySyncRequest)return null;
+    }
+    const result=await callDesktopBrowserBridge('setOverlaySuppressed',{
       ...payload.applicationOverlay,
       tabId:payload.tabId,
       sessionId:payload.sessionId,
-    }).catch(()=>{});
+    }).catch(()=>null);
+    if(requestId!==browserWorkbenchNativeOverlaySyncRequest)return result;
+    browserWorkbenchNativeOverlaySuppressed=applicationOverlay.suppressed===true
+      &&!!result
+      &&result.suppressed===true
+      &&String(result.sessionId||'')===String(payload.sessionId||'');
+    // Keep the last decoded frame mounted behind the now-visible native view on
+    // close. Removing it immediately can expose one white compositor frame.
+    return result;
   }
 
   function handleBrowserWorkbenchGlobalOverlayChange(event){
@@ -241,7 +321,7 @@
     browserWorkbenchGlobalOverlayGeneration=Number.isFinite(incomingGeneration)&&incomingGeneration>0
       ?incomingGeneration
       :Math.max(browserWorkbenchGlobalOverlayGeneration+1,Date.now());
-    syncBrowserWorkbenchNativeOverlaySuppression();
+    void syncBrowserWorkbenchNativeOverlaySuppression();
   }
 
 
