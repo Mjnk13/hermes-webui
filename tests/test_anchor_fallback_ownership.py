@@ -599,6 +599,12 @@ def test_render_messages_keeps_anchor_owned_turn_out_of_legacy_activity_rebuilds
         function _compressionAnchorIndex() {{ return null; }}
         function _assistantTurnFinalVisibleContentMap() {{ return new Map(); }}
         function _assistantTurnVisibleContentMap() {{ return new Map(); }}
+        function _assistantTurnModifiedFilesByFinalRawIdx() {{ return new Map(); }}
+        function _assistantMessageHasAnchorMutationFiles() {{ return false; }}
+        function _assistantModifiedFilesSummaryHtml() {{ return ''; }}
+        function _browserWorkbenchContextPartsHaveElement() {{ return false; }}
+        function parseBrowserWorkbenchContext() {{ return []; }}
+        function _browserContextMessageHtml() {{ return ''; }}
         function _isPreservedCompressionTaskListMessage() {{ return false; }}
         function _preservedCompressionTaskListCardsHtml() {{ return ''; }}
         function _isContextCompactionMessage() {{ return false; }}

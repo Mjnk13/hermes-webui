@@ -1,5 +1,6 @@
 import os
 import shutil
+import socket
 import subprocess
 import sys
 import textwrap
@@ -12,6 +13,12 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[1]
 CTL = REPO_ROOT / "ctl.sh"
 HEALTH_PROBE = REPO_ROOT / "scripts" / "lib" / "health_probe.sh"
+
+
+def free_tcp_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
 
 
 def _seed_ctl_repo(repo_root: Path) -> None:
@@ -199,6 +206,10 @@ def assert_process_exits(pid: int, timeout: float = 3.0) -> None:
     raise AssertionError(f"process {pid} did not exit")
 
 
+
+
+
+
 def test_start_writes_pid_under_hermes_home_runs_foreground_no_browser_and_logs(tmp_path):
     fake_python = tmp_path / "fake-python"
     fake_log = tmp_path / "fake-python.log"
@@ -247,6 +258,8 @@ def test_start_uses_nohup_so_daemon_survives_launcher_exit():
 
     assert "trap '' HUP" in ctl_text
     assert 'exec nohup "${python_exe}"' in ctl_text
+
+
 
 
 def test_start_can_ignore_repo_dotenv_for_authoritative_test_env(tmp_path):
@@ -429,6 +442,76 @@ def test_stale_pid_file_is_removed_without_killing_unrelated_process(tmp_path):
             sleeper.kill()
 
 
+def test_stop_recovers_and_kills_repo_owned_listener_without_pid_file(tmp_path):
+    if sys.platform == "win32":
+        pytest.skip("lsof-based orphan listener recovery is a POSIX/macOS path")
+    if not shutil.which("lsof"):
+        pytest.skip("requires lsof to discover the orphan listener")
+
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    _seed_ctl_repo(repo_root)
+    port = free_tcp_port()
+    (repo_root / "server.py").write_text(
+        textwrap.dedent(
+            """
+            import signal
+            import socket
+            import sys
+            import time
+
+            alive = True
+            def stop(*_args):
+                global alive
+                alive = False
+            signal.signal(signal.SIGTERM, stop)
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind(('127.0.0.1', int(sys.argv[1])))
+            sock.listen(1)
+            while alive:
+                time.sleep(0.05)
+            sock.close()
+            """
+        ).lstrip(),
+        encoding="utf-8",
+    )
+    listener = subprocess.Popen(
+        [sys.executable, str(repo_root / "server.py"), str(port)],
+        **({"creationflags": subprocess.CREATE_NO_WINDOW} if sys.platform == "win32" else {}),
+    )
+    try:
+        deadline = time.time() + 3
+        while time.time() < deadline:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                if sock.connect_ex(("127.0.0.1", port)) == 0:
+                    break
+            time.sleep(0.05)
+        else:
+            raise AssertionError("fake server.py did not listen")
+
+        result = run_ctl(
+            tmp_path,
+            "stop",
+            env={"HERMES_WEBUI_PORT": str(port)},
+            repo_root=repo_root,
+            timeout=10,
+        )
+
+        combined = result.stdout + result.stderr
+        assert result.returncode == 0, combined
+        assert "Stopping Hermes WebUI orphan" in combined
+        assert str(listener.pid) in combined
+        listener.wait(timeout=3)
+    finally:
+        if listener.poll() is None:
+            listener.terminate()
+            try:
+                listener.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                listener.kill()
+
+
 def _write_fake_launchctl(fake_bin, pid):
     launchctl = fake_bin / "launchctl"
     launchctl.write_text(
@@ -537,6 +620,28 @@ def test_start_allows_alternate_port_while_launchd_job_runs_on_default(tmp_path)
             sleeper.wait(timeout=3)
         except subprocess.TimeoutExpired:
             sleeper.kill()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 
 
 def test_logs_supports_non_following_line_count(tmp_path):

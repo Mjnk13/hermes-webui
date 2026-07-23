@@ -118,7 +118,7 @@ def test_render_surfaces_reasoning_field_for_empty_content_turn():
     # echo-strip) AND empty-content turns with no inline thinkingText, so an
     # answer-bearing message's rendering is unchanged and a Worklog echo is not
     # double-rendered (Codex gate catch).
-    assert "!isUser&&!m._live&&!isSimplifiedToolCalling()&&!thinkingText&&!String(content||'').trim()&&!filesHtml&&!statusHtml" in body, (
+    assert "!isUser&&!m._live&&!isSimplifiedToolCalling()&&!thinkingText&&!String(content||'').trim()&&!filesHtml&&!contextHtml&&!statusHtml" in body, (
         "the reasoning fallback must be scoped to legacy-mode empty-content/no-inline-thinking turns"
     )
 
@@ -143,4 +143,3 @@ def test_assistant_reasoning_payload_reads_reasoning_fields():
     payload_fn = _function_body(UI_JS, "_assistantReasoningPayloadText")
     # Reads the direct reasoning fields off the message object.
     assert "m.reasoning_content||m.reasoning||m.thinking||m._reasoning" in payload_fn
-

@@ -12,7 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 EXPECTED_GIT_RUNS = Counter(
     {
         "api/agent_runtime.py": 3,
-        "api/rollback.py": 4,
+        "api/rollback.py": 5,
         "api/updates.py": 1,
         "api/workspace.py": 1,
         "api/workspace_git.py": 2,

@@ -21,7 +21,7 @@ def test_navigateSession_calls_loadSession():
     start = SESSIONS_JS.index("function navigateSession(dir)")
     end = SESSIONS_JS.index("}", start) + 1
     func_body = SESSIONS_JS[start:end]
-    assert "loadSession(next)" in func_body
+    assert "loadSession(next" in func_body
 
 
 def test_navigateSession_queries_session_items():

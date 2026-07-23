@@ -81,7 +81,7 @@ def test_lineage_open_uses_is_external_session():
         r'if\s*\(\s*_isExternalSession\s*\(\s*session\s*\)\s*\)',
         body,
     ), 'Shared sidebar helper must keep _isExternalSession(session) import gate'
-    assert "await _openSidebarSession(seg, {skipLineageResolve:true});" in js
+    assert "await _openSidebarSession(seg, {skipLineageResolve:true" in js
 
 
 def test_child_session_open_uses_is_external_session():
@@ -92,4 +92,4 @@ def test_child_session_open_uses_is_external_session():
         r'if\s*\(\s*_isExternalSession\s*\(\s*session\s*\)\s*\)',
         body,
     ), 'Shared sidebar helper must keep _isExternalSession(session) import gate'
-    assert "await _openSidebarSession(childSession, {skipLineageResolve:true});" in js
+    assert "await _openSidebarSession(childSession, {skipLineageResolve:true" in js

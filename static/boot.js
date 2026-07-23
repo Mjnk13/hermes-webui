@@ -2233,6 +2233,10 @@ function _applySessionContextMetadataUpdate(data){
   S.session.context_length=data.session.context_length||0;
   S.session.threshold_tokens=data.session.threshold_tokens||0;
   S.session.last_prompt_tokens=data.session.last_prompt_tokens||0;
+  S.session.compression_count=Math.max(
+    Number(S.session.compression_count)||0,
+    Number(data.session.compression_count)||0,
+  );
   S.session.post_compression_context_tokens_estimate=data.session.post_compression_context_tokens_estimate||null;
   if(typeof _syncCtxIndicator==='function'){
     const u=S.lastUsage||{};
@@ -2243,6 +2247,7 @@ function _applySessionContextMetadataUpdate(data){
       estimated_cost:_pick(u.estimated_cost,S.session.estimated_cost),
       context_length:S.session.context_length||0,
       last_prompt_tokens:_pick(u.last_prompt_tokens,S.session.last_prompt_tokens),
+      compression_count:_pick(u.compression_count,S.session.compression_count),
       post_compression_context_tokens_estimate:S.session.post_compression_context_tokens_estimate,
       threshold_tokens:S.session.threshold_tokens||0,
     });
@@ -2269,6 +2274,7 @@ $('modelSelect').onchange=async()=>{
   S.session.model_provider=modelState.model_provider||null;
   if(typeof syncModelChip==='function') syncModelChip();
   if(typeof syncReasoningChip==='function') syncReasoningChip();
+  if(typeof syncFastChip==='function') syncFastChip();
   syncTopbar();
   // Clarify scope: composer model changes are session-local, not the global default.
   if(typeof showToast==='function'){
@@ -2298,7 +2304,7 @@ $('msg').addEventListener('input',()=>{
   // Persist composer draft to server (debounced in _saveComposerDraft).
   const sid = S && S.session && S.session.session_id;
   if (sid && typeof _saveComposerDraft === 'function') {
-    _saveComposerDraft(sid, $('msg').value, S.pendingFiles ? [...S.pendingFiles] : []);
+    _saveComposerDraft(sid, $('msg').value, S.pendingFiles ? [...S.pendingFiles] : [], S.pendingContextItems ? [...S.pendingContextItems] : []);
   }
   const text=$('msg').value;
   const _slashIdx=typeof _activeSlashCommandOffset==='function'?_activeSlashCommandOffset(text):-1;
@@ -2563,9 +2569,9 @@ $('msg').addEventListener('paste',e=>{
   // with embedded data URIs as images).
   const imageItems=items.filter(i=>i.kind==='file'&&i.type.startsWith('image/'));
   if(imageItems.length){
-    // If text is also present (common when copying images from browsers, Notes,
-    // Slack, etc.), let the browser paste the text normally AND attach the image.
-    // Only preventDefault when the clipboard is image-only (true screenshot paste).
+    // Rich clipboard sources often include both text and a rendered image.
+    // Preserve native text paste while still attaching the image; only suppress
+    // the browser paste for true image-only screenshot payloads.
     const hasText=items.some(i=>i.kind==='string'&&(i.type==='text/plain'||i.type==='text/html'));
     if(!hasText)e.preventDefault();
     const pasteTs=Date.now();
@@ -3316,6 +3322,8 @@ window._mirrorSpeechSettingsFromServer=_mirrorSpeechSettingsFromServer;
     );
     window._workspaceTodosTab=!!s.workspace_todos_tab;
     if(typeof _applyWorkspaceTodosTabVisibility==='function') _applyWorkspaceTodosTabVisibility();
+    window._browserWorkbenchEnabled=s.browser_workbench_enabled!==false;
+    if(typeof applyBrowserWorkbenchAvailability==='function') applyBrowserWorkbenchAvailability(window._browserWorkbenchEnabled);
     window._sidebarDensity=(s.sidebar_density==='detailed'?'detailed':'compact');
     window._pinnedSessionsLimit=parseInt(s.pinned_sessions_limit||3,10)||3;
     window._inflightStateLimits={
@@ -3466,6 +3474,8 @@ window._mirrorSpeechSettingsFromServer=_mirrorSpeechSettingsFromServer;
     window._terminalAutoExpandOnOutput=false;
     window._workspaceTodosTab=false;
     if(typeof _applyWorkspaceTodosTabVisibility==='function') _applyWorkspaceTodosTabVisibility();
+    window._browserWorkbenchEnabled=false;
+    if(typeof applyBrowserWorkbenchAvailability==='function') applyBrowserWorkbenchAvailability(false);
     window._sessionJumpButtonsEnabled=false;
     window._structuredCodeDefaultView='auto';
     window._structuredCodeAutoTreeLines=10;

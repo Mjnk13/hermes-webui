@@ -134,7 +134,7 @@ def _run_send_js(*, command, status, adapter_status=None, hook_result=None, hook
           innerHTML: '',
         }};
         const ctx = {{
-          console,
+          console: {{log(){{}},warn:console.warn,error:console.error}},
           window: {{
             __HERMES_WEBUI_DESKTOP_COMPANION_STATUS__: {json.dumps(adapter_status)},
             addEventListener(){{}},

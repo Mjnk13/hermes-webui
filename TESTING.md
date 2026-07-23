@@ -10,6 +10,10 @@
 >
 > Automated coverage: ~11,500 tests collected via `./scripts/test.sh tests/ --collect-only -q`. Tests run on every PR via GitHub Actions on Python 3.11, 3.12, and 3.13 (3 parallel shards each), alongside a ruff lint gate, a headless browser smoke test, and a Docker smoke test. The suite covers the bootstrap/static wizard, real provider config persistence (`config.yaml` + `.env`), the `/api/onboarding/*` backend, the onboarding skip/existing-config guard, CSS regression coverage for thinking/tool card animation, streaming session persistence, mobile layout breakpoints, locale parity across 14 languages, and hundreds of issue/PR-pinned regression tests.
 > Run: `./scripts/test.sh`
+> The test runner disables AgentPet notifications for pytest and every child
+> process it launches, so integration tests cannot publish false working/done
+> alerts. Focused AgentPet bridge tests opt in explicitly while using a fake
+> helper.
 >
 > Local regression focus: verify that a previously closed workspace panel stays visually closed from first paint through boot completion on desktop refresh; there should be no brief open-then-close flash.
 
@@ -653,6 +657,32 @@ EXPECT:
   - Clicking "Reload" fetches fresh messages from server
   - Clicking "Dismiss" removes the banner
 FAIL: No banner shown, page crashes, banner appears on normal reloads with no in-flight request.
+
+### T9.2: Long Session Refresh Keeps a Bounded Message Window
+SETUP: Open a session with more than 500 visible user/assistant messages.
+STEPS:
+  1. Reload the page and wait for the latest messages to appear
+  2. Trigger the reconnect banner's "Reload" action, or briefly interrupt and restore the connection
+  3. Inspect the `/api/session` request in Network tools
+EXPECT:
+  - The request includes `messages=1`, `resolve_model=0`, `msg_limit`, and `expand_renderable=1`
+  - The chat pane remains responsive and shows the latest chronological tail
+  - Scrolling upward continues to load older messages through pagination
+  - The refresh never replaces the pane from a bare, full-transcript `/api/session?session_id=...` response
+FAIL: The refresh downloads the complete transcript, freezes the pane, loses pagination metadata, or shows messages from the wrong chronological window.
+
+### T9.3: Stored Codex Commentary Remains Visible
+SETUP: Use a Codex-backed session that persisted an assistant update in
+`codex_message_items[].content[].text` with an empty top-level `content` field.
+STEPS:
+  1. Reload the session from a cold page
+  2. Trigger a reconnect/session refresh
+  3. Complete or cancel a later turn so the terminal SSE payload replaces the live pane
+EXPECT:
+  - The stored commentary text renders as an assistant message after every step
+  - `phase=analysis` items remain hidden
+  - Existing non-empty assistant `content` remains authoritative and is not duplicated
+FAIL: The assistant update disappears, renders blank, exposes analysis text, or appears twice after settlement.
 
 ---
 

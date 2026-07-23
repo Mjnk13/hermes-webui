@@ -1104,33 +1104,80 @@ def read_session_lineage_metadata(db_path: Path, session_ids: list[str] | set[st
             # so the query can't raise and collapse the whole lineage metadata.
             messages_has_session_id = False
             messages_has_timestamp = False
+            messages_has_fast_latest_index = False
             if has_messages_table:
                 cur.execute("PRAGMA table_info(messages)")
                 _message_cols = {row[1] for row in cur.fetchall()}
                 messages_has_session_id = 'session_id' in _message_cols
                 messages_has_timestamp = 'timestamp' in _message_cols
+                if messages_has_session_id and messages_has_timestamp:
+                    cur.execute("PRAGMA index_list(messages)")
+                    for index_row in cur.fetchall():
+                        index_name = str(index_row[1]).replace("'", "''")
+                        cur.execute(f"PRAGMA index_info('{index_name}')")
+                        index_cols = [str(info_row[2]) for info_row in cur.fetchall()]
+                        if index_cols[:2] == ['session_id', 'timestamp']:
+                            messages_has_fast_latest_index = True
+                            break
             use_messages_query = has_messages_table and messages_has_session_id
             row_ids = list(rows)
             if use_messages_query:
-                last_at_expr = "MAX(timestamp) AS last_message_at" if messages_has_timestamp else "NULL AS last_message_at"
                 for i in range(0, len(row_ids), IN_CHUNK):
                     chunk = row_ids[i:i + IN_CHUNK]
-                    placeholders = ','.join('?' * len(chunk))
-                    cur.execute(
-                        f"""
-                        SELECT session_id, COUNT(*) AS actual_message_count, {last_at_expr}
-                        FROM messages
-                        WHERE session_id IN ({placeholders})
-                        GROUP BY session_id
-                        """,
-                        chunk,
-                    )
+                    if messages_has_fast_latest_index:
+                        values = ','.join('(?)' for _ in chunk)
+                        # Lineage selection only needs message presence plus
+                        # the newest timestamp.  COUNT(*) + MAX(timestamp)
+                        # walked every matching index entry; on a large
+                        # state.db that made the sidebar API take minutes.
+                        # These correlated probes stop after the first entry
+                        # and seek to the end of the existing
+                        # (session_id, timestamp) index.
+                        cur.execute(
+                            f"""
+                            WITH wanted(session_id) AS (VALUES {values})
+                            SELECT wanted.session_id,
+                                   EXISTS(
+                                       SELECT 1 FROM messages m
+                                       WHERE m.session_id = wanted.session_id
+                                   ) AS has_messages,
+                                   (
+                                       SELECT m.timestamp FROM messages m
+                                       WHERE m.session_id = wanted.session_id
+                                       ORDER BY m.timestamp DESC LIMIT 1
+                                   ) AS last_message_at
+                            FROM wanted
+                            """,
+                            chunk,
+                        )
+                    else:
+                        # Older/minimal databases may not have the composite
+                        # index.  Keep the one-pass aggregate there rather than
+                        # turning it into one full table scan per wanted id.
+                        placeholders = ','.join('?' * len(chunk))
+                        last_at_expr = (
+                            "MAX(timestamp) AS last_message_at"
+                            if messages_has_timestamp
+                            else "NULL AS last_message_at"
+                        )
+                        cur.execute(
+                            f"""
+                            SELECT session_id, 1 AS has_messages, {last_at_expr}
+                            FROM messages
+                            WHERE session_id IN ({placeholders})
+                            GROUP BY session_id
+                            """,
+                            chunk,
+                        )
                     for row in cur.fetchall():
                         message_stats[row['session_id']] = dict(row)
             for sid, row in rows.items():
                 stats = message_stats.get(sid) or {}
                 if use_messages_query:
-                    row['actual_message_count'] = int(stats.get('actual_message_count') or 0)
+                    # Only zero/non-zero is consumed below when choosing a
+                    # materialized continuation tip; avoid implying that this
+                    # fast path computed an exact count.
+                    row['actual_message_count'] = 1 if stats.get('has_messages') else 0
                 else:
                     row['actual_message_count'] = int(row.get('message_count') or 0)
                 row['last_message_at'] = stats.get('last_message_at')
