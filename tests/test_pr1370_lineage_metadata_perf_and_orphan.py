@@ -13,7 +13,6 @@ output, because #1358's frontend `_sessionLineageKey` falls through to
 group orphans by a key no other session shares (cosmetic dead state).
 """
 
-import os
 import sqlite3
 import time
 
@@ -109,6 +108,75 @@ def test_does_not_full_scan_sessions_table(tmp_path, monkeypatch):
         f"session ids (PR #1370 originally did a full scan). Found unscoped "
         f"queries: {bad}"
     )
+
+
+def test_lineage_message_presence_does_not_count_large_session_history(tmp_path, monkeypatch):
+    """Sidebar lineage must not aggregate every message in a long session.
+
+    The lineage resolver only needs to know whether a candidate has any
+    messages and when its newest message was written.  ``COUNT(*) + MAX()``
+    walked every index entry and made ``GET /api/sessions`` take minutes on a
+    multi-gigabyte state.db.  A small SQLite VM-step budget makes that failure
+    deterministic without relying on wall-clock timing.
+    """
+    from api import agent_sessions
+
+    db = tmp_path / "state.db"
+    conn = sqlite3.connect(str(db))
+    conn.executescript("""
+    CREATE TABLE sessions (
+        id TEXT PRIMARY KEY,
+        source TEXT,
+        title TEXT,
+        started_at REAL NOT NULL,
+        message_count INTEGER DEFAULT 0,
+        parent_session_id TEXT,
+        ended_at REAL,
+        end_reason TEXT
+    );
+    CREATE INDEX idx_sessions_parent ON sessions(parent_session_id);
+    CREATE TABLE messages (
+        id INTEGER PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        timestamp REAL NOT NULL
+    );
+    CREATE INDEX idx_messages_session ON messages(session_id, timestamp);
+    """)
+    conn.execute(
+        "INSERT INTO sessions VALUES (?, 'webui', ?, 1, ?, NULL, 2, 'compression')",
+        ("root", "root", 50_000),
+    )
+    conn.execute(
+        "INSERT INTO sessions VALUES (?, 'webui', ?, 3, ?, 'root', NULL, NULL)",
+        ("tip", "tip", 50_000),
+    )
+    conn.executemany(
+        "INSERT INTO messages(session_id, timestamp) VALUES ('tip', ?)",
+        ((float(i),) for i in range(50_000)),
+    )
+    conn.commit()
+    conn.close()
+
+    vm_steps = 0
+
+    def _open_with_budget(path):
+        nonlocal vm_steps
+        limited = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+
+        def _progress():
+            nonlocal vm_steps
+            vm_steps += 100
+            return 1 if vm_steps > 20_000 else 0
+
+        limited.set_progress_handler(_progress, 100)
+        return limited
+
+    monkeypatch.setattr(agent_sessions, "open_state_db_readonly", _open_with_budget)
+
+    result = agent_sessions.read_session_lineage_metadata(db, ["tip"])
+
+    assert result["tip"]["_lineage_tip_id"] == "tip"
+    assert vm_steps <= 20_000
 
 
 def test_orphan_parent_reference_not_exposed_in_metadata(tmp_path):

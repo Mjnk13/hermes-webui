@@ -384,6 +384,29 @@ def test_codex_runtime_invalid_argument_returns_switch_message(monkeypatch):
     assert calls == [("parse_args", "nope")]
 
 
+def test_account_command_lists_and_switches(monkeypatch):
+    """`/account` should list accounts and `/account use` should persist the active account."""
+    from api.commands import execute_agent_command
+
+    calls = []
+
+    class Runtime:
+        name = "codex-lb"
+        provider = "codex-lb"
+        model = "gpt-5.5"
+        base_url = "https://cigro-codex.million.tk/v1"
+
+    monkeypatch.setattr("api.accounts.format_accounts", lambda: "Available accounts:\n\n* openai-pro\n  codex-lb")
+    monkeypatch.setattr("api.accounts.set_active_account", lambda name: calls.append(name) or Runtime())
+
+    assert "Available accounts" in execute_agent_command("/account")
+    output = execute_agent_command("/account use codex-lb")
+
+    assert calls == ["codex-lb"]
+    assert "Switched account to codex-lb" in output
+    assert "https://cigro-codex.million.tk/v1" in output
+
+
 def test_reload_mcp_error_is_generic(monkeypatch):
     """`/reload-mcp` errors must return a generic message, not raw internals."""
     calls = []

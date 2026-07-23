@@ -19,7 +19,8 @@ def test_sync_app_titlebar_stamps_non_chat_document_title():
 def test_switch_panel_restores_chat_title_via_sync_topbar():
     src = _src("panels.js")
 
-    assert "if (nextPanel === 'chat' && typeof syncTopbar === 'function') syncTopbar();" in src
+    assert "if (nextPanel === 'chat') {" in src
+    assert "if(typeof syncTopbar === 'function') syncTopbar();" in src
     assert "else syncAppTitlebar();" in src
 
 

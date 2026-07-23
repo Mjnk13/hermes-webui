@@ -175,4 +175,5 @@ def test_no_native_confirm_calls_remain_in_static_js():
 def test_no_native_prompt_calls_remain_in_static_js():
     for path in (REPO / "static").glob("*.js"):
         src = path.read_text(encoding="utf-8")
+        src = src.replace("Changed files in this prompt (${count})", "")
         assert not re.search(r"\bprompt\s*\(", src), f"native prompt() remains in {path.name}"

@@ -336,6 +336,7 @@ def test_session_compress_roundtrip(monkeypatch, cleanup_test_sessions):
     assert payload["session"]["messages"] == original_messages
     assert payload["session"]["tool_calls"] == settled_tool_calls
     assert payload["session"]["message_count"] == len(original_messages)
+    assert payload["session"]["compression_count"] == 1
     assert payload["session"]["compression_anchor_summary"] is not None
     assert payload["session"]["compression_anchor_visible_idx"] == 3
     assert isinstance(payload["session"]["compression_anchor_message_key"], dict)
@@ -358,6 +359,8 @@ def test_session_compress_roundtrip(monkeypatch, cleanup_test_sessions):
     assert loaded.truncation_watermark is not None
     assert loaded.truncation_boundary == loaded.truncation_watermark
     assert loaded.last_prompt_tokens is not None
+    assert loaded.compression_count == 1
+    assert persisted.compression_count == 1
     assert persisted.compression_anchor_mode == "manual"
     assert persisted.truncation_watermark == loaded.truncation_watermark
     assert persisted.truncation_boundary == loaded.truncation_boundary

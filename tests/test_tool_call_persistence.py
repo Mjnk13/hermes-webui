@@ -6,7 +6,11 @@ import sys
 REPO_ROOT = pathlib.Path(__file__).parent.parent.resolve()
 sys.path.insert(0, str(REPO_ROOT))
 
-from api.streaming import _extract_tool_calls_from_messages, _tool_result_snippet
+from api.streaming import (
+    _extract_tool_calls_from_messages,
+    _tool_result_snippet,
+    _tool_result_structured_payload,
+)
 
 
 def test_extract_tool_calls_from_openai_message_linkage():
@@ -44,6 +48,79 @@ def test_tool_result_snippet_allows_frontend_show_more_threshold_but_stays_bound
     assert len(medium_snippet) == 1200
     assert len(medium_snippet) > 800
     assert len(huge_snippet) == 4000
+
+
+def test_read_file_content_is_unwrapped_before_preview_cap_and_raw_wrapper_is_retained():
+    source = "\n".join(
+        (
+            "108|    canWrite,",
+            "109|    className = '',",
+            "110|    locale,",
+            "111|}: EventPageEditorProps): React.JSX.Element => {",
+            "112|    const { t } = useAdminI18n();",
+        )
+    )
+    raw = json.dumps({"content": source})
+    path = "src/app/admin/(shell)/events/_components/EventPageEditor/impl.tsx"
+    messages = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{
+                "id": "call-read",
+                "function": {
+                    "name": "read_file",
+                    "arguments": json.dumps({"path": path, "offset": 108, "limit": 440}),
+                },
+            }],
+        },
+        {"role": "tool", "tool_call_id": "call-read", "content": raw},
+    ]
+
+    assert _tool_result_snippet(raw) == source
+    assert r"\n" not in _tool_result_snippet(raw)
+
+    result = _extract_tool_calls_from_messages(messages)
+    assert result[0]["snippet"] == source
+    assert result[0]["result"] == raw
+    assert result[0]["args"]["path"] == path
+
+
+def test_structured_result_payload_preserves_exact_json_string_and_rejects_unsafe_fallbacks():
+    raw = ' {\n  "content": "literal \\\\n stays literal"\n} '
+
+    assert _tool_result_structured_payload(raw) == raw
+    assert _tool_result_structured_payload("{'content': 'not json'}") is None
+    assert _tool_result_structured_payload('{"content":"' + ("x" * 100_001) + '"}') is None
+
+
+def test_tool_result_snippet_selects_large_dynamic_multiline_value_without_key_allowlist():
+    lines = [f"{index}: compiler diagnostic {index}" for index in range(1, 260)]
+    report = "\n".join(lines)
+    raw = json.dumps({
+        "ok": False,
+        "target": "src/service.py",
+        "compiler_transcript": report,
+    })
+
+    snippet = _tool_result_snippet(raw)
+
+    assert snippet == report[:4000]
+    assert snippet.startswith("1: compiler diagnostic 1\n2: compiler diagnostic 2")
+    assert not snippet.startswith('{"ok"')
+    assert r"\n" not in snippet
+
+
+def test_tool_result_snippet_recurses_through_transport_wrappers_by_value_shape():
+    report = "migration 1 complete\nmigration 2 complete\nmigration 3 complete"
+    raw = json.dumps({
+        "transport": {
+            "request_id": "req-1",
+            "migration_notes": report,
+        },
+    })
+
+    assert _tool_result_snippet(raw) == report
 
 
 def test_extract_tool_calls_persists_show_more_sized_snippets_with_bounded_cap():

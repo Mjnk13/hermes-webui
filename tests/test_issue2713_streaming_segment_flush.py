@@ -197,11 +197,7 @@ class TestInterimAssistantHandlerFlush:
             "already_streamed interim boundaries must flush pending token DOM "
             "before reset"
         )
-        inactive_guard = "if(!S.session||S.session.session_id!==activeSid){"
-        if inactive_guard in branch:
-            active_branch_start = branch.index(inactive_guard) + branch[branch.index(inactive_guard):].index("}") + 1
-        else:
-            active_branch_start = 0
+        active_branch_start = branch.index("_completeAutomaticCompressionOnLiveProgress(activeSid)")
         flush_pos = branch.index("_flushPendingSegmentRender({force:true})", active_branch_start)
         reset_pos = branch.index("_resetAssistantSegment()", active_branch_start)
         assert flush_pos < reset_pos, (

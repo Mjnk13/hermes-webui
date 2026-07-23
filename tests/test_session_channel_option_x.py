@@ -464,7 +464,8 @@ def test_session_stream_resume_rearms_when_live_stream_registry_clears():
     stream_end teardown must re-attempt resume after deleting that owner entry.
     """
     js = (REPO_ROOT / "static" / "messages.js").read_text()
-    close_src = _js_function_decl(js, "closeLiveStream")
+    close_start = js.index("function closeLiveStream(")
+    close_src = js[close_start:js.index("function closeOtherLiveStreams(", close_start)]
 
     delete_idx = close_src.index("delete LIVE_STREAMS[sessionId];")
     resume_idx = close_src.index("_resumeSessionStreamAfterLiveChat(sessionId);")
@@ -939,7 +940,7 @@ def test_load_session_rearms_stream_on_every_early_return():
     # added inside loadSession pushed the fetch-error catch's stream restart past
     # the old 14000-char cutoff.
     fn_ix = js.index("async function loadSession(")
-    body = js[fn_ix:fn_ix + 16000]
+    body = js[fn_ix:fn_ix + 20000]
 
     # The unconditional teardown must still be there (this is what creates the
     # dead-stream window the re-arm closes).
@@ -973,7 +974,7 @@ def test_load_session_rearms_stream_on_every_early_return():
     # but guarded against the self-healed-current (404'd) case so it never
     # spins the reconnect loop against a dead session_id.
     catch_ix = body.index("const _selfHealedCurrent")
-    catch_src = body[catch_ix:catch_ix + 2200]
+    catch_src = body[catch_ix:catch_ix + 3000]
     assert "!_selfHealedCurrent" in catch_src and "startSessionStream(currentSid)" in catch_src, (
         "fetch-error path must restart the on-screen stream, guarded against "
         "the self-healed-current (deleted/404) session"

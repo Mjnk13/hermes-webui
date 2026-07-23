@@ -70,12 +70,33 @@ def test_full_message_payload_includes_todo_state_snapshot():
     assert payload["todo_state"]["ts"] == 101
 
 
-def test_done_payload_uses_full_message_count_helper():
+def test_full_terminal_payload_materializes_codex_commentary_without_mutating_session():
+    stored_message = {
+        "role": "assistant",
+        "content": "",
+        "codex_message_items": [
+            {
+                "type": "message",
+                "role": "assistant",
+                "phase": "commentary",
+                "content": [{"type": "output_text", "text": "Visible progress"}],
+            }
+        ],
+    }
+    session = _FakeSession(session_id="codex-commentary", messages=[stored_message])
+
+    payload = _session_payload_with_full_messages(session, tool_calls=[])
+
+    assert payload["messages"][0]["content"] == "Visible progress"
+    assert stored_message["content"] == ""
+
+
+def test_done_payload_uses_bounded_terminal_message_window():
     done_idx = STREAMING_SOURCE.index("put('done', _done_payload)")
     block_start = STREAMING_SOURCE.rfind("raw_session =", 0, done_idx)
     block = STREAMING_SOURCE[block_start:done_idx]
 
-    assert "_session_payload_with_full_messages(s, tool_calls=tool_calls)" in block
+    assert "_session_payload_with_terminal_window(s, tool_calls=tool_calls)" in block
     assert "s.compact() | {'messages': s.messages" not in block
 
 
@@ -88,7 +109,7 @@ def test_apperror_payload_uses_full_message_count_helper():
     assert "s.compact() | {'messages': s.messages" not in block
 
 
-def test_gateway_done_payload_uses_full_message_count_helper():
+def test_gateway_done_payload_uses_bounded_terminal_message_window():
     """The gateway-routed chat `done` SSE shares the settled-payload path and
     must also report a message_count matching the embedded transcript (sibling
     of the two streaming.py sites)."""
@@ -97,5 +118,5 @@ def test_gateway_done_payload_uses_full_message_count_helper():
     block_start = gateway_source.rfind("gateway_session_payload =", 0, done_idx)
     block = gateway_source[block_start:done_idx]
 
-    assert "_session_payload_with_full_messages(s, tool_calls=[])" in block
+    assert "_session_payload_with_terminal_window(s, tool_calls=[])" in block
     assert 's.compact() | {"messages": s.messages' not in block

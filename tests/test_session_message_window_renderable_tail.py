@@ -1,4 +1,60 @@
+from api import routes
 from api.routes import _message_window_for_display
+
+
+def test_display_payload_materializes_empty_codex_commentary_assistant_content():
+    stored = {
+        "role": "assistant",
+        "content": "",
+        "codex_message_items": [
+            {
+                "type": "message",
+                "role": "assistant",
+                "phase": "commentary",
+                "content": [
+                    {"type": "output_text", "text": "First update."},
+                    {"type": "output_text", "text": " More detail."},
+                ],
+            },
+            {
+                "type": "message",
+                "role": "assistant",
+                "phase": "analysis",
+                "content": [{"type": "output_text", "text": "hidden scratchpad"}],
+            },
+            {
+                "type": "message",
+                "role": "assistant",
+                "phase": "commentary",
+                "content": [{"type": "output_text", "text": "Second update."}],
+            },
+        ],
+    }
+
+    projected = routes._messages_for_display_payload([stored])
+
+    assert projected[0]["content"] == "First update. More detail.\n\nSecond update."
+    assert stored["content"] == "", "display projection must not mutate persisted/model context"
+
+
+def test_display_payload_preserves_existing_assistant_content():
+    stored = {
+        "role": "assistant",
+        "content": "canonical answer",
+        "codex_message_items": [
+            {
+                "type": "message",
+                "role": "assistant",
+                "phase": "commentary",
+                "content": [{"type": "output_text", "text": "interim update"}],
+            }
+        ],
+    }
+
+    projected = routes._messages_for_display_payload([stored])
+
+    assert projected[0]["content"] == "canonical answer"
+    assert projected[0] is stored
 
 
 def test_initial_msg_limit_skips_trailing_tool_only_rows():

@@ -88,7 +88,7 @@ function makeSeg() {{
 }}
 
 const ordinaryBlock = extractBlock(
-  "const hasVisibleBody=!!(String(content||'').trim()||filesHtml||recoveryHtml);",
+  "const hasVisibleBody=!!(",
   "_assistantTurnBlocks(currentAssistantTurn).appendChild(seg);"
 );
 const orderedBlock = extractBlock(
@@ -122,8 +122,10 @@ function runHeadOrdinary(opts) {{
   const seg = makeSeg();
   const content = opts.content || '';
   const filesHtml = opts.filesHtml || '';
+  const contextHtml = opts.contextHtml || '';
   const statusHtml = opts.statusHtml || '';
   const recoveryHtml = opts.recoveryHtml || '';
+  const modifiedFilesHtml = opts.modifiedFilesHtml || '';
   const bodyHtml = opts.bodyHtml || '';
   const footHtml = opts.footHtml || '';
   const thinkingText = opts.thinkingText || '';
@@ -307,6 +309,33 @@ def test_ordered_transparent_branch_keeps_single_status_card_boundary():
     assert ordered["statusCount"] == 1
     assert ordered["bodyCount"] == 1
     assert ordered["html"] == "<status-card>limit</status-card><div class=\"msg-body\"><p>Final report</p></div><footer>meta</footer>"
+
+
+def test_status_card_does_not_replace_a_settled_assistant_summary():
+    """Terminal status is supplemental UI, never a replacement for answer text."""
+    render_body = _function_body(UI_JS, "renderMessages")
+    status_branch_end = render_body.index(
+        "}else if(!(thinkingText&&window._showThinking!==false&&!isSimplifiedToolCalling())){"
+    )
+    status_branch_start = render_body.rfind("if(statusHtml){", 0, status_branch_end)
+    assert status_branch_start >= 0
+    brace_start = render_body.index("{", status_branch_start)
+    depth = 0
+    branch_close = None
+    for idx in range(brace_start, len(render_body)):
+        if render_body[idx] == "{":
+            depth += 1
+        elif render_body[idx] == "}":
+            depth -= 1
+            if depth == 0:
+                branch_close = idx + 1
+                break
+    assert branch_close is not None
+    status_branch = render_body[status_branch_start:branch_close]
+
+    assert "bodyPart" in status_branch
+    assert '<div class="msg-body">${bodyHtml}</div>' in status_branch
+    assert "statusHtml" in status_branch
 
 
 def test_status_card_styles_exist():

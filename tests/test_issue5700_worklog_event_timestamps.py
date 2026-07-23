@@ -697,6 +697,7 @@ global._assistantTurnBlocks = () => inner;
 global._createAssistantTurn = () => turn;
 global._syncTransparentEventControls = () => {};
 global._toolWorklogListEl = () => null;
+global._replaceLiveToolCardPreservingResultState = (existing, replacement) => existing.replaceWith(replacement);
 appendLiveToolCard({ name: 'lookup', tid: 'tool-1', done: false });
 const initialRow = inner.querySelector('.transparent-event-row[data-live-tid="tool-1"]');
 const initialTime = initialRow && initialRow.querySelector('.transparent-event-time');

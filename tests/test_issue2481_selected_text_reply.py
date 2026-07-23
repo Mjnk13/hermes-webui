@@ -205,8 +205,8 @@ def test_selected_text_reply_queue_path_includes_pending_selection_context():
     assert "function _clearComposerAfterQueuedSelectionSend()" in js
     assert "const _text=_composerTextWithPendingSelections().trim();" in js
     assert "_clearComposerAfterQueuedSelectionSend();" in js
-    assert "if(!text&&!S.pendingFiles.length&&!_pendingSelections.length)" in js
-    assert "_flushSelectionBlocksToComposer();\n  text=$('msg').value.trim();" in js
+    assert "if(!text&&!outgoingPendingFiles.length&&!_pendingSelections.length)" in js
+    assert "if(!queueDrain){\n    _flushSelectionBlocksToComposer();\n    text=$('msg').value.trim();" in js
 
 
 def test_selection_only_reply_enables_primary_send_button():

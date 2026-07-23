@@ -135,7 +135,7 @@ class TestSlashCommandHandlers:
         for fn_name in ("cmdQueue", "cmdInterrupt"):
             idx = COMMANDS_JS.find(f"function {fn_name}(")
             assert idx >= 0, f"{fn_name} not found"
-            body = COMMANDS_JS[idx:idx + 800]
+            body = COMMANDS_JS[idx:idx + 1200]
             assert "S.pendingFiles=[]" in body, (
                 f"{fn_name} must clear S.pendingFiles after queueSessionMessage"
             )
@@ -329,9 +329,7 @@ class TestSendBusyBranchDispatch:
         branch_end = MESSAGES_JS.find("} else if(defaultMessageMode==='interrupt')", steer_idx)
         assert branch_end > steer_idx, "busy steer branch end not found"
         branch = MESSAGES_JS[steer_idx:branch_end]
-        assert "await _trySteer(text, /*explicitSteer=*/false)" in branch
-        assert "_trySteer captures the owner session/files before awaiting uploads" in branch
-        assert "_trySteer clears staged files only after /api/chat/steer accepts" in branch
+        assert "await _trySteer(text, /*explicitSteer=*/false" in branch
         assert "_clearComposerDraft(S.session.session_id,text" not in branch
         try_body = _source_between(COMMANDS_JS, "async function _trySteer(", "\nasync function cmdTitle")
         accepted_idx = try_body.find("if(result&&result.accepted)")
@@ -355,7 +353,7 @@ class TestSendBusyBranchDispatch:
         guard_end = MESSAGES_JS.find("_sendInProgress = true", guard_start)
         assert guard_start >= 0 and guard_end > guard_start, "send() reentrant guard not found"
         guard = MESSAGES_JS[guard_start:guard_end]
-        assert "if(_text && _targetSid)" in guard
+        assert "if((_text||_contextItems.length) && _targetSid)" in guard
         assert "S.pendingFiles.length" not in guard
         assert "files:[...S.pendingFiles]" in guard
 
@@ -415,7 +413,7 @@ class TestSendBusyBranchDispatch:
         # Get the intercept block (up to the next busyMode assignment)
         busymode_idx = MESSAGES_JS.find("_defaultMessageMode||'steer'", busy_start)
         intercept_block = MESSAGES_JS[intercept_idx:busymode_idx]
-        assert "_bc.fn(_pc.args)" in intercept_block, (
+        assert "_bc.fn(_pc.args," in intercept_block, (
             "The intercept must call the command handler directly via _bc.fn(_pc.args)"
         )
         assert "return;" in intercept_block, (

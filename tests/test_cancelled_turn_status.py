@@ -155,10 +155,11 @@ class TestCancelledTurnPersistenceGuards:
 
         assert "_is_agent_result_terminal = _agent_result_terminal_failure(result)" in block
         assert "_is_agent_result_terminal" in block
-        assert "if _terminal_failure or (not _assistant_added and not _token_sent):" in block, (
-            "Explicit terminal failures, including compression/tool-tail failures, must report "
-            "an error even when interim progress already streamed."
+        assert "if _terminal_failure or not _turn_outcome.has_usable_output:" in block, (
+            "Explicit terminal failures must still settle, while the authoritative "
+            "turn outcome distinguishes partial output from a genuinely empty provider response."
         )
+        assert "'type': 'interrupted'" in block
 
     def test_exception_path_classifies_after_cancel_event_before_generic_error(self):
         src = _read("api/streaming.py")
@@ -179,7 +180,7 @@ class TestCancelledTurnPersistenceGuards:
 
     def test_post_run_cancel_guard_runs_before_normal_success_merge(self):
         src = _read("api/streaming.py")
-        run_idx = src.find("result = agent.run_conversation(")
+        run_idx = src.find("result = _run_conversation_once(")
         merge_idx = src.find("_result_messages = result.get", run_idx)
         assert run_idx != -1 and merge_idx != -1, "run/merge path not found"
         block = src[run_idx:merge_idx]
@@ -219,8 +220,9 @@ class TestCancelledTurnPersistenceGuards:
         assert "const _applyCancelSessionPayload=(sessionPayload)=>" in block
         assert "const _cancelSessionPayload=_cancelData&&typeof _cancelData.session==='object'?_cancelData.session:null;" in block
         assert "if(_applyCancelSessionPayload(_cancelSessionPayload)) return;" in block
-        assert "const data=await api(`/api/session?session_id=${encodeURIComponent(activeSid)}`);" in block
-        assert block.index("if(_applyCancelSessionPayload(_cancelSessionPayload)) return;") < block.index("const data=await api("), (
+        assert "?_sessionDisplayRefreshUrl(activeSid)" in block
+        assert "const data=await api(refreshUrl,{timeoutMs:120000});" in block
+        assert block.index("if(_applyCancelSessionPayload(_cancelSessionPayload)) return;") < block.index("const data=await api(refreshUrl"), (
             "Cancel handler must apply the terminal SSE session payload before falling back "
             "to /api/session so captured _partial reasoning/tool rows are visible immediately."
         )

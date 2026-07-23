@@ -1397,6 +1397,60 @@ def test_anchor_scene_hydration_merges_missing_args_after_content_tool_match():
     }
 
 
+def test_anchor_scene_promotes_completed_mutation_over_positionless_legacy_preview():
+    from api import routes
+
+    args = {
+        "mode": "replace",
+        "path": "src/sample.ts",
+        "old_string": "old",
+        "new_string": "new",
+    }
+    positionless = "--- src/sample.ts\n+++ src/sample.ts\n@@\n-old\n+new\n"
+    completed = "--- a/src/sample.ts\n+++ b/src/sample.ts\n@@ -155,1 +155,1 @@\n-old\n+new\n"
+    messages = [
+        {"role": "user", "content": "edit it"},
+        {
+            "role": "assistant",
+            "content": "",
+            "_partial_tool_calls": [
+                {
+                    "name": "patch",
+                    "args": args,
+                    "mutation_preview": {"files": [{"path": "src/sample.ts", "diff": positionless}]},
+                    "done": False,
+                },
+                {
+                    "name": "patch",
+                    "tid": "call-positioned",
+                    "args": args,
+                    "snippet": json.dumps({"success": True, "diff": completed}),
+                    "mutation_preview": {"files": [{"path": "src/sample.ts", "diff": completed}]},
+                    "done": True,
+                },
+            ],
+        },
+    ]
+    scene = {
+        "version": "activity_scene_v1",
+        "mode": "compact_worklog",
+        "final_answer": "",
+        "activity_rows": [],
+    }
+
+    hydrated = routes._complete_hydrated_anchor_scene(
+        messages,
+        scene,
+        1,
+        stream_id="stream-positioned",
+    )
+    tools = [row for row in hydrated["activity_rows"] if row.get("role") == "tool"]
+
+    assert len(tools) == 1
+    assert json.loads(tools[0]["tool"]["snippet"])["diff"] == completed
+    assert tools[0]["tool"]["mutation_preview"]["files"][0]["diff"] == completed
+
+
 def test_anchor_scene_hydration_keeps_consumed_different_name_tool_distinct():
     from api import routes
 
