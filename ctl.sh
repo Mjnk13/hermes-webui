@@ -17,7 +17,7 @@ Usage: ./ctl.sh <command> [args]
 
 Commands:
   start [bootstrap args...]   Start Hermes WebUI as a background daemon
-  stop                        Stop the daemon started by ctl.sh
+  stop                        Stop Hermes WebUI
   restart [bootstrap args...] Stop, then start again
   status                      Show daemon, host/port, log, and health status
   logs [--lines N] [--follow|--no-follow]
@@ -360,6 +360,38 @@ _is_owned_webui_pid() {
      ( -n "${state_python_bash}" && "${args_slash}" == *"${state_python_bash}"* ) ]]
 }
 
+_is_repo_webui_pid() {
+  local pid="$1" args args_slash repo_slash repo_win="" repo_win_slash=""
+  args="$(_proc_args "${pid}")"
+  [[ -n "${args}" ]] || return 1
+  args_slash="${args//\\//}"
+  repo_slash="${REPO_ROOT//\\//}"
+  if _is_windows_bash; then
+    repo_win="$(cygpath -w "${REPO_ROOT}" 2>/dev/null || true)"
+    repo_win_slash="${repo_win//\\//}"
+  fi
+  [[ "${args_slash}" == *"${repo_slash}/bootstrap.py"* ||
+     "${args_slash}" == *"${repo_slash}/server.py"* ||
+     "${args_slash}" == *"${repo_slash}/start.sh"* ||
+     ( -n "${repo_win_slash}" && "${args_slash}" == *"${repo_win_slash}/bootstrap.py"* ) ||
+     ( -n "${repo_win_slash}" && "${args_slash}" == *"${repo_win_slash}/server.py"* ) ||
+     ( -n "${repo_win_slash}" && "${args_slash}" == *"${repo_win_slash}/start.sh"* ) ]]
+}
+
+_webui_listener_pid_for_port() {
+  local port="$1" pid
+  [[ "${port}" =~ ^[0-9]+$ ]] || return 1
+  command -v lsof >/dev/null 2>&1 || return 1
+  while IFS= read -r pid; do
+    [[ "${pid}" =~ ^[0-9]+$ ]] || continue
+    if _is_alive "${pid}" && _is_repo_webui_pid "${pid}"; then
+      printf '%s\n' "${pid}"
+      return 0
+    fi
+  done < <(lsof -nP -tiTCP:"${port}" -sTCP:LISTEN 2>/dev/null || true)
+  return 1
+}
+
 _current_pid() {
   local pid
   pid="$(_pid_from_file)" || return 1
@@ -405,6 +437,95 @@ _pid_listens_on_port() {
     return 2                              # listener present but unattributable
   fi
   return 2       # can't determine
+}
+
+_launchd_service_target() {
+  local label="${HERMES_WEBUI_LAUNCHD_LABEL:-${DEFAULT_LAUNCHD_LABEL}}"
+  printf 'gui/%s/%s\n' "$(id -u)" "${label}"
+}
+
+_launchd_plist_path() {
+  local label="${HERMES_WEBUI_LAUNCHD_LABEL:-${DEFAULT_LAUNCHD_LABEL}}"
+  printf '%s/Library/LaunchAgents/%s.plist\n' "${HOME}" "${label}"
+}
+
+_launchd_job_loaded() {
+  [[ "${HERMES_WEBUI_CTL_ALLOW_LAUNCHD_CONFLICT:-0}" == "1" ]] && return 1
+  command -v launchctl >/dev/null 2>&1 || return 1
+  launchctl print "$(_launchd_service_target)" >/dev/null 2>&1
+}
+
+_launchd_configured_port() {
+  command -v launchctl >/dev/null 2>&1 || return 1
+  local target launchd_out port="" plist
+  target="$(_launchd_service_target)"
+  launchd_out="$(launchctl print "${target}" 2>/dev/null || true)"
+  if [[ -n "${launchd_out}" ]]; then
+    port="$(printf '%s\n' "${launchd_out}" | awk '/HERMES_WEBUI_PORT => / { print $3; exit }')"
+  fi
+
+  plist="$(_launchd_plist_path)"
+  if [[ ! "${port}" =~ ^[0-9]+$ && -f "${plist}" ]] && command -v plutil >/dev/null 2>&1; then
+    port="$(plutil -extract EnvironmentVariables.HERMES_WEBUI_PORT raw -o - "${plist}" 2>/dev/null || true)"
+  fi
+  [[ "${port}" =~ ^[0-9]+$ ]] || return 1
+  printf '%s\n' "${port}"
+}
+
+_launchd_job_manages_port() {
+  local wanted_port="$1" configured_port=""
+  [[ "${HERMES_WEBUI_CTL_ALLOW_LAUNCHD_CONFLICT:-0}" == "1" ]] && return 1
+  configured_port="$(_launchd_configured_port 2>/dev/null)" || return 1
+  [[ "${configured_port}" == "${wanted_port}" ]]
+}
+
+_stop_launchd_webui_job() {
+  local target
+  target="$(_launchd_service_target)"
+  if _launchd_job_loaded; then
+    echo "[ctl] Stopping launchd-managed Hermes WebUI (${target})"
+    if ! launchctl bootout "${target}" >/dev/null 2>&1; then
+      echo "[ctl] Failed to stop launchd job ${target}" >&2
+      return 1
+    fi
+  fi
+
+  # The plist's ExitTimeOut is commonly 5 seconds. Give launchd enough time to
+  # finish that graceful shutdown plus scheduling overhead before declaring a
+  # failure; the old 4-second window routinely expired just before removal.
+  local i wait_steps="${HERMES_WEBUI_LAUNCHD_STOP_WAIT_STEPS:-100}"
+  [[ "${wait_steps}" =~ ^[0-9]+$ ]] || wait_steps=100
+  (( wait_steps > 0 )) || wait_steps=100
+  for ((i = 0; i < wait_steps; i++)); do
+    _launchd_job_loaded || return 0
+    sleep 0.1
+  done
+  echo "[ctl] launchd job ${target} did not stop" >&2
+  return 1
+}
+
+_start_launchd_webui_job() {
+  local target plist domain
+  target="$(_launchd_service_target)"
+  plist="$(_launchd_plist_path)"
+  domain="gui/$(id -u)"
+
+  if ! _launchd_job_loaded; then
+    if [[ ! -f "${plist}" ]]; then
+      echo "[ctl] launchd plist not found: ${plist}" >&2
+      return 1
+    fi
+    echo "[ctl] Loading launchd-managed Hermes WebUI (${target})"
+    if ! launchctl bootstrap "${domain}" "${plist}" >/dev/null 2>&1; then
+      echo "[ctl] Failed to load launchd job ${target}" >&2
+      return 1
+    fi
+  fi
+
+  # bootstrap starts RunAtLoad jobs itself. kickstart is still needed for a
+  # loaded-but-idle job, and is harmless when launchd has already scheduled it.
+  launchctl kickstart "${target}" >/dev/null 2>&1 || true
+  echo "[ctl] Started launchd-managed Hermes WebUI (${target})"
 }
 
 _launchd_webui_pid() {
@@ -595,12 +716,39 @@ start_cmd() {
   export HERMES_WEBUI_HOST="${CTL_HOST}"
   export HERMES_WEBUI_PORT="${CTL_PORT}"
 
-  local existing_pid
+  local existing_pid launchd_pid
+  if _launchd_job_manages_port "${CTL_PORT}"; then
+    if existing_pid="$(_webui_listener_pid_for_port "${CTL_PORT}" 2>/dev/null)"; then
+      launchd_pid="$(_launchd_webui_pid 2>/dev/null || true)"
+      if [[ -n "${launchd_pid}" && "${launchd_pid}" == "${existing_pid}" ]]; then
+        echo "[ctl] launchd-managed Hermes WebUI is already running (PID ${existing_pid})"
+        return 0
+      fi
+      if _launchd_job_loaded; then
+        echo "[ctl] A standalone Hermes WebUI (PID ${existing_pid}) conflicts with the loaded launchd job on port ${CTL_PORT}." >&2
+        echo "[ctl] Run ./ctl.sh restart to reconcile them into one launchd-managed instance." >&2
+        return 2
+      fi
+      echo "[ctl] Hermes WebUI is already running on ${CTL_HOST}:${CTL_PORT} (PID ${existing_pid})"
+      return 0
+    fi
+    _clear_stale_pid >/dev/null 2>&1 || true
+    _start_launchd_webui_job
+    return 0
+  fi
+
   if existing_pid="$(_current_pid 2>/dev/null)"; then
     echo "[ctl] Hermes WebUI is already running (PID ${existing_pid})"
     return 0
   fi
-  local launchd_pid
+  if existing_pid="$(_webui_listener_pid_for_port "${CTL_PORT}" 2>/dev/null)"; then
+    echo "[ctl] Hermes WebUI is already running on ${CTL_HOST}:${CTL_PORT} (PID ${existing_pid}; recovered missing ctl state)"
+    local python_exe_for_state
+    python_exe_for_state="$(_find_python)"
+    printf '%s\n' "${existing_pid}" > "${PID_FILE}"
+    _write_state "${existing_pid}" "${CTL_HOST}" "${CTL_PORT}" "${python_exe_for_state}"
+    return 0
+  fi
   if launchd_pid="$(_launchd_webui_pid 2>/dev/null)"; then
     echo "[ctl] Refusing to start a second Hermes WebUI while launchd job ${HERMES_WEBUI_LAUNCHD_LABEL:-${DEFAULT_LAUNCHD_LABEL}} is running (PID ${launchd_pid})." >&2
     echo "[ctl] Use launchctl kickstart -k gui/$(id -u)/${HERMES_WEBUI_LAUNCHD_LABEL:-${DEFAULT_LAUNCHD_LABEL}} or disable the launchd job before using ctl.sh start." >&2
@@ -704,8 +852,35 @@ _warn_if_unmanaged_instance_serving() {
 
 stop_cmd() {
   ensure_home
-  local pid
+  _load_repo_dotenv_preserving_env
+  _load_state_if_present
+  local stop_port="${PORT:-${HERMES_WEBUI_PORT:-8787}}" stop_state_dir="${STATE_DIR:-${HERMES_WEBUI_STATE_DIR:-${DEFAULT_STATE_DIR}}}"
+  export HERMES_WEBUI_STATE_DIR="${stop_state_dir}"
+  # Disable KeepAlive before terminating the server. Otherwise launchd can
+  # recreate it while ctl.sh is still stopping it and the command can report
+  # success against a newly running instance.
+  if _launchd_job_manages_port "${stop_port}" && _launchd_job_loaded; then
+    _stop_launchd_webui_job
+  fi
+  local pid listener_pid
   if ! pid="$(_pid_from_file 2>/dev/null)"; then
+    if listener_pid="$(_webui_listener_pid_for_port "${stop_port}" 2>/dev/null)"; then
+      echo "[ctl] Stopping Hermes WebUI orphan on ${stop_port} (PID ${listener_pid})"
+      _stop_webui_pid "${listener_pid}" TERM
+      local j
+      for j in {1..50}; do
+        if ! _is_alive "${listener_pid}"; then
+          rm -f "${PID_FILE}" "${STATE_FILE}"
+          echo "[ctl] Stopped"
+          return 0
+        fi
+        sleep 0.1
+      done
+      echo "[ctl] Orphan process did not exit after SIGTERM; sending SIGKILL" >&2
+      _stop_webui_pid "${listener_pid}" KILL
+      rm -f "${PID_FILE}" "${STATE_FILE}"
+      return 0
+    fi
     echo "[ctl] Hermes WebUI is stopped"
     # Warn BEFORE deleting the state file: it carries the saved host/port
     # binding the probe needs when the instance was started off-default.
@@ -717,6 +892,20 @@ stop_cmd() {
   if ! _is_alive "${pid}" || ! _is_owned_webui_pid "${pid}"; then
     _warn_if_unmanaged_instance_serving
     _clear_stale_pid
+    if listener_pid="$(_webui_listener_pid_for_port "${stop_port}" 2>/dev/null)"; then
+      echo "[ctl] Stopping Hermes WebUI orphan on ${stop_port} (PID ${listener_pid})"
+      _stop_webui_pid "${listener_pid}" TERM
+      local k
+      for k in {1..50}; do
+        if ! _is_alive "${listener_pid}"; then
+          echo "[ctl] Stopped"
+          return 0
+        fi
+        sleep 0.1
+      done
+      echo "[ctl] Orphan process did not exit after SIGTERM; sending SIGKILL" >&2
+      _stop_webui_pid "${listener_pid}" KILL
+    fi
     return 0
   fi
 
@@ -778,6 +967,15 @@ status_cmd() {
     uptime="$(ps -p "${pid}" -o etime= 2>/dev/null | sed 's/^ *//' || true)"
     health="$(_health_line "${host}" "${port}")"
     echo "● hermes-webui — running"
+    echo "  PID:     ${pid}"
+    echo "  Uptime:  ${uptime:-unknown}"
+    echo "  Bound:   ${host}:${port}"
+    echo "  Log:     ${log_path}"
+    echo "  Health:  ${health}"
+  elif pid="$(_webui_listener_pid_for_port "${port}" 2>/dev/null)"; then
+    uptime="$(ps -p "${pid}" -o etime= 2>/dev/null | sed 's/^ *//' || true)"
+    health="$(_health_line "${host}" "${port}")"
+    echo "● hermes-webui — running (untracked by ctl; restart will recover it)"
     echo "  PID:     ${pid}"
     echo "  Uptime:  ${uptime:-unknown}"
     echo "  Bound:   ${host}:${port}"
@@ -846,6 +1044,27 @@ logs_cmd() {
   fi
 }
 
+restart_cmd() {
+  ensure_home
+  _load_repo_dotenv_preserving_env
+  _load_hermes_dotenv
+  _parse_launch_binding "$@"
+
+  # A launchd KeepAlive job must be stopped before any standalone ctl daemon.
+  # Otherwise launchd immediately respawns while ctl.sh is starting its own
+  # process, leaving the two instances racing for the same port.
+  if _launchd_job_manages_port "${CTL_PORT}"; then
+    _stop_launchd_webui_job
+    stop_cmd
+    rm -f "${PID_FILE}" "${STATE_FILE}"
+    _start_launchd_webui_job
+    return 0
+  fi
+
+  stop_cmd
+  start_cmd "$@"
+}
+
 cmd="${1:-}"
 if [[ $# -gt 0 ]]; then
   shift
@@ -854,7 +1073,7 @@ fi
 case "${cmd}" in
   start) start_cmd "$@" ;;
   stop) stop_cmd ;;
-  restart) stop_cmd; start_cmd "$@" ;;
+  restart) restart_cmd "$@" ;;
   status) status_cmd ;;
   logs) logs_cmd "$@" ;;
   -h|--help|help|"") usage ;;

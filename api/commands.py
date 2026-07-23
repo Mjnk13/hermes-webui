@@ -28,7 +28,7 @@ _AGENT_COMMAND_ALIASES = {
     'reload_skills': 'reload-skills',
     'codex_runtime': 'codex-runtime',
 }
-_ALLOWED_AGENT_COMMANDS = frozenset({'reload-mcp', 'reload-skills', 'codex-runtime', 'credits'})
+_ALLOWED_AGENT_COMMANDS = frozenset({'reload-mcp', 'reload-skills', 'codex-runtime', 'credits', 'account'})
 _RELOAD_MCP_LOCK = threading.Lock()
 _RELOAD_SKILLS_LOCK = threading.Lock()
 _CODEX_RUNTIME_LOCK = threading.Lock()
@@ -219,8 +219,36 @@ def execute_agent_command(command: str) -> str:
         return _run_codex_runtime_command(arg_string)
     if canonical == 'credits':
         return _run_credits_command()
+    if canonical == 'account':
+        return _run_account_command(arg_string)
 
     raise KeyError(canonical)
+
+
+def _run_account_command(arg_string: str) -> str:
+    """List or switch account profiles for the active WebUI profile."""
+    parts = str(arg_string or "").strip().split()
+    try:
+        from api.accounts import format_accounts, set_active_account
+    except Exception as exc:
+        logger.warning("Account profile runtime unavailable", exc_info=True)
+        raise RuntimeError("Account profile runtime unavailable") from exc
+
+    if not parts:
+        return format_accounts()
+    if len(parts) == 2 and parts[0].lower() == "use":
+        try:
+            runtime = set_active_account(parts[1])
+        except ValueError as exc:
+            return str(exc)
+        except Exception as exc:
+            logger.warning("Failed to switch account profile", exc_info=True)
+            raise RuntimeError("Failed to switch account profile") from exc
+        provider = runtime.provider or "unknown"
+        model = f" · {runtime.model}" if runtime.model else ""
+        endpoint = f"\nEndpoint: {runtime.base_url}" if runtime.base_url else ""
+        return f"Switched account to {runtime.name} ({provider}{model}).{endpoint}"
+    return "Usage: /account [use <name>]"
 
 
 def _run_codex_runtime_command(arg_string: str) -> str:

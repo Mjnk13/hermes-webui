@@ -70,9 +70,7 @@ def test_send_captures_immutable_snapshot_before_rewrites_and_upload():
     # The snapshot must be captured right after the post-flush trim, BEFORE the
     # busy branch / slash-command rewrites and BEFORE uploadPendingFiles().
     snap_idx = MESSAGES_JS.find("const _failedSendDraftText=text;")
-    files_idx = MESSAGES_JS.find(
-        "const _failedSendFilesSnapshot=Array.isArray(S.pendingFiles)?[...S.pendingFiles]:[];"
-    )
+    files_idx = MESSAGES_JS.find("const _failedSendFilesSnapshot=[...outgoingPendingFiles];")
     moa_idx = MESSAGES_JS.find("text=_moaArgs;")
     upload_idx = MESSAGES_JS.find("uploaded=await uploadPendingFiles(")
     assert snap_idx != -1 and files_idx != -1, "send() must snapshot text + files for #5472"
@@ -98,7 +96,7 @@ def test_send_still_clears_composer_on_the_happy_path():
     # returns, bundle-error paths). This assertion must actually guard the main
     # send path's clear.
     main_clear = (
-        "if (activeSid && typeof _clearComposerDraft === 'function') "
+        "if (!queueDrain && activeSid && typeof _clearComposerDraft === 'function') "
         "_composerDraftClearPromise=_clearComposerDraft(activeSid,_submittedDraftTextForClear,_submittedDraftFilesForClear);"
     )
     assert main_clear in MESSAGES_JS, "main send path must clear the persisted draft at send time"
@@ -108,7 +106,7 @@ def test_send_still_clears_composer_on_the_happy_path():
     # BEFORE `uploadPendingFiles()` / the forced-skill-directive await — so a
     # re-entrant/interrupt-mode send during the async window can't re-read the
     # still-populated DOM and double-submit. Verify that ordering here.
-    capture = "const _submittedDraftTextForClear=$('msg').value||'';"
+    capture = "const _submittedDraftTextForClear=queueDrain?'':($('msg').value||'');"
     assert capture in MESSAGES_JS, "send() must still capture the send-time draft text"
     capture_idx = MESSAGES_JS.index(capture)
     # The textarea wipe sits immediately after the capture (same 120-char window).

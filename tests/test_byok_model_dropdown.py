@@ -12,6 +12,7 @@ Root causes fixed:
      custom_providers entries exist in config.yaml — the live enrichment
      step never added those models.
 """
+import copy
 import pathlib
 import re
 import sys
@@ -32,22 +33,40 @@ def read(rel):
 
 @pytest.fixture(autouse=True)
 def _isolate_models_cache():
-    """Invalidate the TTL model cache before AND after every test.
+    """Restore config state and invalidate the model cache around every test.
 
     ``get_available_models()`` caches its result keyed on config.yaml mtime.
     Tests in this file repoint ``_get_config_path`` to a tmp_path, populate
-    the cache there, then let monkeypatch restore the original path.  The
-    cache, keyed on the tmp_path's mtime, then poisons downstream tests
-    (e.g. test_model_resolver) which see stale data and never hit their
-    mocks.  Clearing the cache around each test breaks that linkage.
+    the cache there, and call ``reload_config()``. Monkeypatch restores the
+    path, but not the module-level ``cfg`` mapping loaded from that temporary
+    file. Preserve both state layers so downstream model tests cannot inherit
+    a BYOK provider/default from this file.
     """
     import api.config as c
+    original_cfg = copy.deepcopy(c.cfg)
+    original_cfg_path = c._cfg_path
+    original_cfg_mtime = c._cfg_mtime
+    original_cfg_fingerprint = c._cfg_fingerprint
+    original_budget = c._LIVE_REBUILD_BUDGET_SECONDS
+    # These tests assert catalog contents, not the bounded async fallback.
+    # Keep rebuilds synchronous so no daemon worker can publish a temporary
+    # BYOK catalog after this fixture has restored the module state.
+    c._LIVE_REBUILD_BUDGET_SECONDS = 0.0
     try:
         c.invalidate_models_cache()
     except Exception:
         pass
     yield
     try:
+        c._cfg_cache.clear()
+        c._cfg_cache.update(original_cfg)
+        c.cfg = c._cfg_cache
+        c.cfg.clear()
+        c.cfg.update(original_cfg)
+        c._cfg_path = original_cfg_path
+        c._cfg_mtime = original_cfg_mtime
+        c._cfg_fingerprint = original_cfg_fingerprint
+        c._LIVE_REBUILD_BUDGET_SECONDS = original_budget
         c.invalidate_models_cache()
     except Exception:
         pass
@@ -384,6 +403,67 @@ class TestLiveModelsCustomProviderFallback:
             }
         ]
         assert [m["id"] for m in resp["models"]] == ["right-live-model"]
+
+    def test_account_provider_live_fetch_uses_named_custom_endpoint_and_headers(self, monkeypatch):
+        """Account provider names must retain identity while probing their custom endpoint."""
+        import json
+        import urllib.request
+
+        requests = []
+
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def read(self):
+                return json.dumps({"data": [
+                    {"id": "gpt-5.6-sol"},
+                    {"id": "gpt-5.6-terra"},
+                    {"id": "gpt-5.6-luna"},
+                    {"id": "gpt-5.5"},
+                ]}).encode("utf-8")
+
+        def fake_urlopen(req, timeout=None):
+            requests.append({
+                "url": req.full_url,
+                "authorization": req.headers.get("Authorization"),
+                "user_agent": req.headers.get("User-agent"),
+                "timeout": timeout,
+            })
+            return Response()
+
+        cfg = {
+            "model": {"provider": "custom:codex-lb", "default": "gpt-5.5"},
+            "accounts": {"codex-lb": {"provider": "codex-lb", "model": "gpt-5.5"}},
+            "active_account": "codex-lb",
+            "custom_providers": [{
+                "name": "codex-lb",
+                "base_url": "https://cigro-codex.million.tk/v1",
+                "api_key": "test-key",
+                "model": "gpt-5.5",
+                "extra_headers": {"User-Agent": "codex-cli"},
+            }],
+        }
+        monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+
+        resp = self._call_live_models(monkeypatch, cfg, "codex-lb")
+
+        assert resp["provider"] == "codex-lb"
+        assert requests == [{
+            "url": "https://cigro-codex.million.tk/v1/models",
+            "authorization": "Bearer test-key",
+            "user_agent": "codex-cli",
+            "timeout": CUSTOM_MODELS_ENDPOINT_TIMEOUT_SECONDS,
+        }]
+        assert [m["id"] for m in resp["models"]] == [
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-5.6-luna",
+            "gpt-5.5",
+        ]
 
     def test_standard_provider_live_fetch_does_not_reuse_active_provider_key(self, monkeypatch):
         """A requested provider must not receive another provider's top-level key."""

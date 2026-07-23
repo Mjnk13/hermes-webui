@@ -236,6 +236,7 @@ function createEnvironment() {
   globalThis.stopClarifyPolling = () => {};
   globalThis.hideClarifyCard = () => {};
   globalThis._saveComposerDraftNow = () => Promise.resolve();
+  globalThis._currentComposerContextItems = () => [];
   globalThis._sessionProfileMismatchFromError = () => null;
   globalThis._switchProfileForSessionLoad = async () => {};
   globalThis._clearSameSessionForceReloadHint = () => { clearHintCalls += 1; };
@@ -284,6 +285,7 @@ function createEnvironment() {
   };
   globalThis.clearVisibleMessageRowCache = () => { visibleCacheClears += 1; };
   globalThis.clearLiveToolCards = () => { liveCardClears += 1; };
+  globalThis._debugLogHydratedBrowserContextParts = () => {};
 
   globalThis._syncCtxIndicator = () => {};
   globalThis._renderPendingPromptsForActiveSession = () => {};

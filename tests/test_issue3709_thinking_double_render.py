@@ -83,7 +83,7 @@ def _function_body(name: str) -> str:
 
 def test_settled_thinking_renders_through_worklog_item_path():
     body = _render_messages_body()
-    assert "_appendWorklogStep(state.group, anchorRow, cards, thinkingText" in body, (
+    assert "_appendWorklogStep(state.group, step.anchor, step.cards, step.thinkingText" in body, (
         "Settled Thinking should render through the #3401 Worklog item path."
     )
     assert "_thinkingActivityNode(thinkingText, false, thinkingDisclosureKey)" in UI_JS, (

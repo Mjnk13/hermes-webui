@@ -387,12 +387,11 @@ def test_token_handler_guards_session_id(cleanup_test_sessions):
     if token_idx < 0:
         token_idx = src.find("es.addEventListener('token'")
     assert token_idx >= 0, "token event handler not found"
-    token_block = src[token_idx:token_idx+300]
-    assert "activeSid" in token_block, \
+    token_block = src[token_idx:token_idx+1000]
+    assert "_claimVisibleActiveStreamOwnership()" in token_block, \
         "token handler must check activeSid before writing to DOM"
-    assert "S.session.session_id!==activeSid" in token_block or \
-           "S.session.session_id===activeSid" in token_block, \
-    "token handler must compare current session to activeSid"
+    assert "if(!ownsActiveThread) return;" in token_block, \
+        "token handler must stop before DOM writes when the active session does not own the stream"
 
 
 def test_tool_handler_guards_session_id(cleanup_test_sessions):
@@ -707,13 +706,15 @@ def test_live_stream_tokens_persist_partial_assistant_for_session_switch(cleanup
         "messages.js must mark the persisted in-flight assistant row so renderMessages can re-anchor it"
     assert "syncInflightAssistantMessage();" in messages_src, \
         "token handler must update INFLIGHT state before checking the active session"
-    token_match = re.search(r"source\.addEventListener\('token',e=>\{(.*?)\n\s*\}\);", messages_src, re.S)
-    assert token_match, "token listener not found"
-    token_fn = token_match.group(1)
-    assert token_fn.find("assistantText+=d.text") < token_fn.find("if(!S.session||S.session.session_id!==activeSid) return;"), (
+    token_marker = "source.addEventListener('token',e=>{"
+    next_marker = "source.addEventListener('interim_assistant'"
+    assert token_marker in messages_src and next_marker in messages_src, "token listener not found"
+    token_fn = messages_src.split(token_marker, 1)[1].split(next_marker, 1)[0]
+    ownership_guard = "if(!ownsActiveThread) return;"
+    assert token_fn.find("assistantText+=d.text") < token_fn.find(ownership_guard), (
         "token events must update the active stream's local state before DOM-only active-session guards"
     )
-    assert token_fn.find("syncInflightAssistantMessage();") < token_fn.find("if(!S.session||S.session.session_id!==activeSid) return;"), (
+    assert token_fn.find("syncInflightAssistantMessage();") < token_fn.find(ownership_guard), (
         "token events must persist INFLIGHT state even while another session is selected"
     )
     assert "assistantRow&&!assistantRow.isConnected" in messages_src, \
@@ -793,7 +794,7 @@ def test_renderMessages_preserves_loading_placeholder_for_session_switch(cleanup
     ui_src = (REPO_ROOT / "static/ui.js").read_text()
     fn_start = ui_src.find("function renderMessages")
     assert fn_start >= 0, "renderMessages() not found in ui.js"
-    fn_body = ui_src[fn_start:fn_start + 1400]
+    fn_body = ui_src[fn_start:fn_start + 30000]
 
     compact = re.sub(r"\s+", "", fn_body)
     assert (

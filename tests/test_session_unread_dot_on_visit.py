@@ -363,6 +363,7 @@ function _clearSameSessionForceReloadHint() {{}}
 function _messageReloadLimitForSession() {{ return 0; }}
 function _syncToolCallsForLoadedMessages() {{}}
 function clearLiveToolCards() {{}}
+function _debugLogHydratedBrowserContextParts() {{}}
 
 // Delayed messages fetch: resolves only when we release it, simulating a slow
 // /api/session?messages=1 response that spans the tab going hidden.

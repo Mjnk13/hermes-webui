@@ -97,6 +97,7 @@ def clean_env(monkeypatch):
         "HERMES_WEBUI_STATE_DIR",
         "HERMES_WEBUI_SERVER_CWD",
         "HERMES_HOME",
+        "CI",
     ):
         monkeypatch.delenv(name, raising=False)
 

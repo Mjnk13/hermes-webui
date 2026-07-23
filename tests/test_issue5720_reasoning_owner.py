@@ -462,6 +462,11 @@ global._decorateTransparentEventRow=(row,opts)=>{
 global._rehydrateTransparentLiveRow=()=>{};
 global._sanitizeThinkingDisplayText=value=>String(value||'').trim();
 global._firstValidTimestampSeconds=()=>null;
+// This harness exercises reasoning ownership, not mutation-card rendering.
+// Keep the production Worklog renderer's newer DiffCard and disclosure
+// dependencies neutral so a missing unrelated helper cannot mask the behavior.
+global._assistantAnchorSceneMutationItemsFromRow=()=>[];
+global._worklogDetailsExpandedDefault=()=>false;
 
 eval(anchorsSrc);
 for(const name of [
@@ -475,6 +480,7 @@ for(const name of [
   '_resetMismatchedLiveAssistantTurnForSession',
   '_liveAnchorReasoningRowForFallback','_updateLiveAnchorReasoningRowForFallback',
   '_anchorSceneNodeForRow','_anchorSceneWorklogGroup','_renderAnchorSceneRowsIntoWorklog',
+  '_anchorSceneReportRenderError','_anchorSceneFallbackNodeForRenderError',
   'isLiveAnchorActivitySceneOwner','_projectLiveAnchorActivitySceneForStream',
   '_restoreLiveAnchorScrollSnapshotAfterRebuild',
   '_renderLiveAnchorActivitySceneTransparent','renderLiveAnchorActivityScene',
@@ -506,8 +512,6 @@ const S=global.S={
 const INFLIGHT=global.INFLIGHT={};
 const LIVE_STREAMS=global.LIVE_STREAMS={};
 const _STREAM_WAS_HIDDEN=global._STREAM_WAS_HIDDEN={};
-const _STREAM_NOTIFICATION_BACKGROUND=global._STREAM_NOTIFICATION_BACKGROUND={};
-const _desktopBackgroundedForNotifications=false;
 global._bindStreamHiddenTracker=()=>{};
 global.closeOtherLiveStreams=()=>{};
 global.closeLiveStream=()=>{};

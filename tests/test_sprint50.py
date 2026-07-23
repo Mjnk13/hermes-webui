@@ -19,7 +19,7 @@ def test_cmd_dropdown_moved_inside_composer_box():
     src = read("static/index.html")
     composer_start = src.index('<div class="composer-box" id="composerBox">')
     dropdown_idx = src.index('<div class="cmd-dropdown" id="cmdDropdown"></div>')
-    textarea_idx = src.index('<textarea id="msg"')
+    textarea_idx = src.index('<div id="msg" class="composer-editor"')
     assert composer_start < dropdown_idx < textarea_idx, (
         "cmdDropdown should live inside composerBox, before the textarea, so its "
         "absolute positioning is scoped to the composer instead of the full chat panel"

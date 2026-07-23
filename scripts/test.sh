@@ -229,4 +229,5 @@ if [[ $# -eq 0 ]]; then
   set -- tests/ -v --timeout=60
 fi
 
+export HERMES_WEBUI_AGENTPET_NOTIFICATIONS=0
 exec "$PYTHON_BIN" -m pytest "$@"

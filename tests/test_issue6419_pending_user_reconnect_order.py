@@ -138,6 +138,7 @@ def test_merge_helper_repairs_malformed_order_and_is_idempotent():
             _function_source(SESSIONS_JS, "_stripForcedSkillEnvelope"),
             _function_source(SESSIONS_JS, "_normalizeUserTranscriptText"),
             _function_source(SESSIONS_JS, "_sameTranscriptMessage"),
+            _function_source(SESSIONS_JS, "_mergeTranscriptMessageMetadata"),
             _function_source(SESSIONS_JS, "_currentTailUserMessage"),
             _function_source(SESSIONS_JS, "_hasCurrentTailUserDuplicate"),
             _function_source(SESSIONS_JS, "_mergePendingSessionMessage"),
@@ -229,6 +230,53 @@ refreshSession().then(()=>process.stdout.write(JSON.stringify({{rendered,status,
     assert result["rendered"] == 1
     assert result["status"] == ""
     assert result["roles"] == ["user", "assistant"]
+
+
+@pytest.mark.skipif(NODE is None, reason="node not on PATH")
+def test_refresh_session_bounds_pathological_transcript_fetch():
+    """Soft reconnect must not replace the pane from an unbounded session GET."""
+    refresh_url = _function_source(SESSIONS_JS, "_sessionDisplayRefreshUrl")
+    refresh = "async " + _function_source(UI_JS, "refreshSession")
+    script = f"""
+let requestedUrl='';
+let rendered=0;
+let status='';
+const _INITIAL_MSG_LIMIT=30;
+const _MSG_LIMIT_MAX=500;
+let _msgLimitMax=500;
+let _messagesTruncated=false;
+let _oldestIdx=0;
+const S={{
+  session:{{session_id:'sid-huge'}},
+  messages:Array.from({{length:9442}},()=>({{role:'user',content:'x'}})),
+}};
+const window={{_restartingForUpdate:false}};
+function _currentLoadedRenderableMessageCount(){{return S.messages.length;}}
+function dismissReconnect(){{}}
+function _mergePendingSessionMessage(){{return false;}}
+async function api(url){{
+  requestedUrl=url;
+  return {{session:{{
+    session_id:'sid-huge',active_stream_id:null,messages:[{{role:'user',content:'tail'}}],
+    _messages_truncated:true,_messages_offset:8942,_msg_limit_max:500,
+  }}}};
+}}
+function syncTopbar(){{}}
+function _renderMessagesWithScrollSnapshot(){{rendered+=1;}}
+function showToast(){{}}
+function setStatus(value){{status=value;}}
+{refresh_url}
+{refresh}
+refreshSession().then(()=>process.stdout.write(JSON.stringify({{requestedUrl,rendered,status}})));
+"""
+    result = _run_node(script)
+
+    assert result["rendered"] == 1
+    assert result["status"] == ""
+    assert "messages=1" in result["requestedUrl"]
+    assert "resolve_model=0" in result["requestedUrl"]
+    assert "msg_limit=500" in result["requestedUrl"]
+    assert "expand_renderable=1" in result["requestedUrl"]
 
 
 @pytest.mark.skipif(NODE is None, reason="node not on PATH")
