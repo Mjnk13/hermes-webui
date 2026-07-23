@@ -95,6 +95,13 @@ const opts = {json.dumps(opts or {})};
 function _composerDraftHasPayload(text, files) {{
   return !!(String(text || '') || (Array.isArray(files) && files.filter(Boolean).length));
 }}
+function _composerDraftContextItems(items) {{
+  return Array.isArray(items) ? items.filter(Boolean) : [];
+}}
+function _composerDraftBrowserContextParts(parts) {{
+  return Array.isArray(parts) ? parts.filter(Boolean) : [];
+}}
+function renderTray() {{}}
 function _rememberComposerDraftPayloadState(sid, text, files) {{
   state.rememberedDraft = {{sid, text, files}};
   if (S.session && S.session.session_id === sid) {{

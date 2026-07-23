@@ -59,6 +59,22 @@ def test_draft_files_clamped_to_50_entries():
     )
 
 
+def test_draft_context_items_are_normalized_and_clamped():
+    """Browser Workbench context pills in drafts must be bounded/sanitized."""
+    src = Path(__file__).parents[1].joinpath("api", "routes.py").read_text(encoding="utf-8")
+    assert "_MAX_DRAFT_CONTEXT_ITEMS = 8" in src
+    assert "_normalize_browser_context_items(context_items)" in src
+    assert 'next_draft["context_items"] = context_items' in src
+
+
+def test_draft_browser_context_parts_are_normalized_before_persist():
+    """Ordered text/browser-element composer parts must be bounded/sanitized."""
+    src = Path(__file__).parents[1].joinpath("api", "routes.py").read_text(encoding="utf-8")
+    assert "def _normalize_browser_context_parts_for_session" in src
+    assert "browser_context_parts = _normalize_browser_context_parts_for_session(browser_context_parts)" in src
+    assert 'next_draft["browser_context_parts"] = browser_context_parts' in src
+
+
 def test_draft_text_type_coerced_to_string():
     """Non-string text must be coerced to empty string, not stored as-is."""
     src = Path(__file__).parents[1].joinpath("api", "routes.py").read_text(encoding="utf-8")

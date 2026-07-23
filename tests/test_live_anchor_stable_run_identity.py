@@ -238,6 +238,7 @@ const _anchorApi={{
   }},
 }};
 eval(extractFunc('_sourceEventTypeForSnapshotAnchorRow'));
+eval(extractFunc('_resetAnchorRegistryActivityForRecoveryScene'));
 eval(extractFunc('_hydrateAnchorRegistryFromActivityScene'));
 
 function scene(identity,rowId){{

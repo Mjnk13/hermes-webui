@@ -35,6 +35,10 @@ def _directives(policy: str):
 
 def test_security_helper_sends_enforcing_csp_with_hardening_directives(monkeypatch):
     monkeypatch.delenv("HERMES_WEBUI_CSP_CONNECT_EXTRA", raising=False)
+    monkeypatch.setenv(
+        "HERMES_WEBUI_CSP_FRAME_EXTRA",
+        "http://127.0.0.1:* http://localhost:*",
+    )
 
     headers = _headers_from_security_helper()
 
@@ -49,6 +53,7 @@ def test_security_helper_sends_enforcing_csp_with_hardening_directives(monkeypat
     assert "font-src 'self' data: https://fonts.gstatic.com" in policy
     assert "object-src 'none'" in policy
     assert "frame-ancestors 'none'" in policy
+    assert "frame-src 'self' http://127.0.0.1:* http://localhost:*" in policy
     assert "media-src 'self' data: blob:" in policy
     assert "connect-src 'self' http://127.0.0.1:* http://localhost:* http://ipc.localhost https://127.0.0.1:* https://localhost:* ws://127.0.0.1:* ws://localhost:* https://cdn.jsdelivr.net" in policy
 

@@ -51,8 +51,11 @@ def _run_artifact_open(path: str, workspace: str, entries_by_dir: dict) -> dict:
     of entry names /api/list would return, so the existence check is exercised
     with realistic data. Returns the recorded calls (openFile / setStatus).
     """
-    open_artifact = _extract_function(WORKSPACE_JS, "openArtifactPath")
     path_exists = _extract_function(WORKSPACE_JS, "_workspacePathExists")
+    open_diagnostic = _extract_function(WORKSPACE_JS, "_workspaceOpenFileDiagnostic")
+    normalize_path = _extract_function(WORKSPACE_JS, "_workspaceNormalizeOpenArtifactPath")
+    show_diagnostic = _extract_function(WORKSPACE_JS, "_showWorkspaceOpenFileDiagnostic")
+    open_artifact = _extract_function(WORKSPACE_JS, "openArtifactPath")
     entries_json = json.dumps(entries_by_dir)
     driver = f"""
 const S = {{ session: {{ session_id: 't', workspace: {json.dumps(workspace)} }} }};
@@ -60,6 +63,7 @@ const calls = [];
 function switchWorkspacePanelTab() {{}}
 function t(key) {{ return key; }}
 function setStatus(msg) {{ calls.push({{status: msg}}); }}
+function showToast() {{}}
 function openFile(rel) {{ calls.push({{open: rel}}); }}
 const ENTRIES_BY_DIR = {entries_json};
 async function api(url) {{
@@ -69,6 +73,9 @@ async function api(url) {{
   return {{ entries: (ENTRIES_BY_DIR[dir] || []).map(name => ({{name, path: name}})) }};
 }}
 {path_exists}
+{open_diagnostic}
+{normalize_path}
+{show_diagnostic}
 {open_artifact}
 (async () => {{
   await openArtifactPath({json.dumps(path)});
@@ -93,7 +100,7 @@ def test_windows_backslash_subdir_artifact_opens():
         WS,
         {".": ["readme.md"], "src": ["report.pdf"]},
     )
-    assert calls[-1] == {"open": "src/report.pdf"}, calls
+    assert {"open": "src/report.pdf"} in calls, calls
 
 
 def test_windows_backslash_root_artifact_opens():
@@ -103,7 +110,7 @@ def test_windows_backslash_root_artifact_opens():
         WS,
         {".": ["readme.md"], "src": ["report.pdf"]},
     )
-    assert calls[-1] == {"open": "readme.md"}, calls
+    assert {"open": "readme.md"} in calls, calls
 
 
 def test_forward_slash_relative_behavior_unchanged():
@@ -113,14 +120,16 @@ def test_forward_slash_relative_behavior_unchanged():
         WS,
         {".": ["readme.md"], "src": ["report.pdf"]},
     )
-    assert calls[-1] == {"open": "src/report.pdf"}, calls
+    assert {"open": "src/report.pdf"} in calls, calls
 
 
 def test_missing_artifact_still_reports_failure():
-    """A genuinely missing artifact still surfaces file_open_failed."""
+    """A genuinely missing artifact still surfaces the custom diagnostic."""
     calls = _run_artifact_open(
         r"D:\proj\src\missing.md",
         WS,
         {".": ["readme.md"], "src": ["report.pdf"]},
     )
-    assert calls[-1] == {"status": "file_open_failed"}, calls
+    statuses = [call["status"] for call in calls if "status" in call]
+    assert any("Could not open this file." in status for status in statuses), calls
+    assert any("reason: file not found" in status for status in statuses), calls

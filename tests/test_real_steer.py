@@ -123,6 +123,41 @@ class TestHandleChatSteerHappyPath:
         body = _captured_response(handler)
         assert body == {"accepted": True, "fallback": None, "stream_id": stream_id}
 
+    def test_browser_element_context_is_formatted_into_steer_payload(self, _clear_caches):
+        from api.streaming import _handle_chat_steer
+        from api.config import SESSION_AGENT_CACHE, SESSION_AGENT_CACHE_LOCK, STREAMS, STREAMS_LOCK
+        sid, stream_id = "sid_context", "stream_context"
+        agent = MagicMock()
+        agent.steer = MagicMock(return_value=True)
+        with SESSION_AGENT_CACHE_LOCK:
+            SESSION_AGENT_CACHE[sid] = (agent, "sig")
+        with STREAMS_LOCK:
+            import queue as _q
+            STREAMS[stream_id] = _q.Queue()
+
+        sess = MagicMock()
+        sess.active_stream_id = stream_id
+        context_item = {
+            "kind": "browser-element",
+            "displayLabel": "PolicyEditor • button",
+            "url": "http://localhost/policy",
+            "selector": "button[data-save]",
+            "component": "PolicyEditor",
+            "tag": "button",
+        }
+        with patch("api.streaming.get_session", return_value=sess):
+            handler = _make_handler()
+            _handle_chat_steer(handler, {
+                "session_id": sid,
+                "text": "Use this control",
+                "context_items": [context_item],
+            })
+
+        delivered = agent.steer.call_args.args[0]
+        assert delivered.startswith("Use this control\n\n<browser_workbench_context>")
+        assert "<selector>button[data-save]</selector>" in delivered
+        assert "<component>PolicyEditor</component>" in delivered
+
 
 class TestHandleChatSteerFallbacks:
     """Each gate that fails returns a structured fallback the frontend can branch on."""
@@ -295,7 +330,7 @@ class TestFrontendWiring:
     def test_cmd_steer_calls_endpoint(self):
         idx = self.cmds.find("async function cmdSteer(")
         assert idx >= 0
-        body = self.cmds[idx:idx + 600]
+        body = _source_between(self.cmds, "async function cmdSteer(", "\nfunction _steerFailureMessageKey")
         # Should call _trySteer (which calls the endpoint), not directly cancelStream
         assert "_trySteer" in body, "cmdSteer must delegate to _trySteer"
 
@@ -337,9 +372,11 @@ class TestFrontendWiring:
         assert "const ownerSid=(typeof S!=='undefined'&&S.session&&S.session.session_id)||null;" in body
         assert "const pendingFilesSnapshot=typeof S!=='undefined'&&Array.isArray(S.pendingFiles)?[...S.pendingFiles]:[];" in body
         assert "steerText=await _steerTextWithPendingFiles(originalMsg,ownerSid,pendingFilesSnapshot)" in body
-        assert "body:JSON.stringify({session_id:ownerSid,text:steerText})" in body, (
+        assert "body:JSON.stringify({session_id:ownerSid,text:steerText,context_items:" in body, (
             "steer endpoint must receive the captured owner session id and attachment-enriched text"
         )
+        assert "browser_context_parts:pendingBrowserContextPartsSnapshot" in body
+        assert "parts:pendingMessagePartsSnapshot" in body
         assert "_clearComposerDraft(ownerSid,_steerRestoreText(originalMsg,explicitSteer),pendingFilesSnapshot)" in body
         assert "if(_steerOwnerIsCurrent(ownerSid))" in body
         assert "S.pendingFiles=_remaining" in body, "accepted steer should clear the delivered files (by identity) after paths are injected"
@@ -370,7 +407,7 @@ class TestFrontendWiring:
         assert "_steerSetComposerStatusForOwner(ownerSid,t('uploading')||'Uploading…')" in steer_helpers
         assert "_steerSetComposerStatusForOwner(ownerSid,'')" in steer_helpers
         assert "function _steerIndicatorText" in steer_helpers
-        assert "_showSteerIndicator(_steerIndicatorText(originalMsg,pendingFilesSnapshot))" in try_body, (
+        assert "_showSteerIndicator(_steerIndicatorText(originalMsg,pendingFilesSnapshot),pendingContextItemsSnapshot,pendingBrowserContextPartsSnapshot)" in try_body, (
             "visible steer indicator must use original text or a file-only display label, not attachment tool instructions"
         )
         assert "_showSteerIndicator(steerText)" not in try_body
@@ -844,7 +881,7 @@ class TestFrontendWiring:
         idx = self.msgs.find("if(S.busy||compressionRunning)")
         assert idx >= 0
         block = self.msgs[idx:idx + 500]
-        assert "if(text||S.pendingFiles.length)" in block, (
+        assert "if(text||S.pendingFiles.length||outgoingContextItems.length)" in block, (
             "busy send must route file-only composer submissions through queue/interrupt/steer"
         )
         assert "_trySteer uploads with clearPending=false" in self.msgs
@@ -902,7 +939,11 @@ class TestFrontendWiring:
         script = textwrap.dedent(
             f"""
             const assert = require('assert');
+            globalThis.window = globalThis;
             let S = {{session:{{session_id:'A'}}}};
+            function addFiles(){{}}
+            function renderTray(){{}}
+            function _showUploadTooLarge(){{}}
             const bar = {{style:{{width:''}}}};
             const barWrap = {{
               dataset: {{}},

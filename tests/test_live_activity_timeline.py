@@ -262,7 +262,7 @@ def test_inactive_interim_assistant_still_records_activity_boundary():
     wire_fn = MESSAGES_JS.split("function _wireSSE(source)", 1)[1].split("source.addEventListener('reasoning'", 1)[0]
     inactive_returns = [
         idx for idx in range(len(wire_fn))
-        if wire_fn.startswith("if(!S.session||S.session.session_id!==activeSid){", idx)
+        if wire_fn.startswith("if(!_claimVisibleActiveStreamOwnership()){", idx)
     ]
     assert len(inactive_returns) >= 2
     for idx in inactive_returns[:2]:
@@ -296,7 +296,7 @@ def test_pending_text_flush_syncs_existing_worklog_reason():
     assert "function _syncLiveWorklogReasonsForAnchor(anchor, displayTextOverride)" in UI_JS
     flush_fn = MESSAGES_JS.split("function _flushPendingSegmentRender(options={})", 1)[1].split("function _resetAssistantSegment", 1)[0]
     assert "_syncLiveWorklogReasonsForAnchor(assistantRow, displayText)" in flush_fn
-    render_fn = MESSAGES_JS.split("const _doRender=()=>{", 1)[1].split("scrollIfPinned();", 1)[0]
+    render_fn = MESSAGES_JS.split("const _doRender=(trigger='animation-frame')=>{", 1)[1].split("scrollIfPinned();", 1)[0]
     assert "_syncLiveWorklogReasonsForAnchor(assistantRow, displayText)" in render_fn
 
 
@@ -312,7 +312,7 @@ def test_pending_text_flush_passes_display_text_to_worklog_reason_sync():
     assert "_syncWorklogReasonFromAnchor(group, anchor, displayTextOverride)" in sync_fn
     flush_fn = MESSAGES_JS.split("function _flushPendingSegmentRender(options={})", 1)[1].split("function _resetAssistantSegment", 1)[0]
     assert "_syncLiveWorklogReasonsForAnchor(assistantRow, displayText)" in flush_fn
-    render_fn = MESSAGES_JS.split("const _doRender=()=>{", 1)[1].split("scrollIfPinned();", 1)[0]
+    render_fn = MESSAGES_JS.split("const _doRender=(trigger='animation-frame')=>{", 1)[1].split("scrollIfPinned();", 1)[0]
     assert "_syncLiveWorklogReasonsForAnchor(assistantRow, displayText)" in render_fn
 
 
@@ -325,10 +325,10 @@ def test_tool_event_does_not_create_blank_text_segment_without_pending_text():
     polling turns.
     """
     tool_handler = MESSAGES_JS.split("source.addEventListener('tool',e=>{", 1)[1].split("source.addEventListener('tool_complete'", 1)[0]
-    upsert_pos = tool_handler.find("const tc=upsertLiveToolCall(d,'start');")
+    upsert_pos = tool_handler.find("const tc=upsertLiveToolCall(d,'start',reconnecting);")
     guard_pos = tool_handler.find("String(pendingDisplayText||'').trim()")
     force_pos = tool_handler.find("ensureAssistantRow(true);")
-    append_pos = tool_handler.find("appendLiveToolCard(tc")
+    append_pos = tool_handler.find("appendLiveToolCard(tc,")
     assert upsert_pos != -1 and guard_pos != -1 and force_pos != -1 and append_pos != -1
     assert upsert_pos < guard_pos < force_pos < append_pos
     assert "if(!assistantRow||!assistantBody) ensureAssistantRow(true);" not in tool_handler

@@ -124,7 +124,8 @@ def test_gateway_action_contention_returns_409_without_spawning(monkeypatch, tmp
     # After the lock is released, a normal action proceeds (lock is reusable).
     handler2, data2 = _call_post(monkeypatch, "/api/gateway/restart", {})
     assert handler2.status == 200
-    assert len(spawned) == 1
+    gateway_commands = [cmd for cmd in spawned if "gateway" in cmd]
+    assert len(gateway_commands) == 1
 
 
 def test_gateway_stop_failure_returns_bounded_error(monkeypatch, tmp_path):

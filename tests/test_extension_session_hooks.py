@@ -344,7 +344,7 @@ def test_no_early_closemobilesidebar_before_sidebar_open():
     # must NOT contain a closeMobileSidebar() before the await.
     tap_block = _extract_block(SESSIONS_JS, "_tapTimer=setTimeout(async()=>{")
     # Find the _openSidebarSession call inside the tap handler.
-    idx_open = tap_block.index("await _openSidebarSession(s)")
+    idx_open = tap_block.index("await _openSidebarSession(s")
     before_open = tap_block[:idx_open]
     assert "closeMobileSidebar()" not in before_open, (
         "tap-to-open handler must not closeMobileSidebar() before veto"

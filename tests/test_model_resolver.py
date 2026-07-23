@@ -3,6 +3,9 @@ Tests for resolve_model_provider() model routing logic.
 Verifies that model IDs are correctly resolved to (model, provider, base_url)
 tuples for different provider configurations.
 """
+import threading
+import time
+
 import pytest
 import api.config as config
 
@@ -107,6 +110,60 @@ def test_openai_prefix_stripped_for_direct_api():
     )
     assert model == 'gpt-5.4-mini'
     assert provider == 'openai'
+
+
+def test_active_account_overlays_model_provider_base_url(monkeypatch):
+    """active_account should route the WebUI through the account endpoint."""
+    old_cfg = dict(config.cfg)
+    config.cfg.clear()
+    config.cfg.update({
+        'model': {'default': 'gpt-5.4', 'provider': 'openai-codex'},
+        'accounts': {
+            'codex-lb': {
+                'provider': 'codex-lb',
+                'base_url': 'https://cigro-codex.million.tk/v1',
+                'key_env': 'CODEX_LB_API_KEY',
+                'api_mode': 'codex_responses',
+                'model': 'gpt-5.5',
+            },
+        },
+        'active_account': 'codex-lb',
+    })
+    try:
+        assert config.get_effective_default_model() == 'gpt-5.5'
+        model, provider, base_url = config.resolve_model_provider('gpt-5.5')
+    finally:
+        config.cfg.clear()
+        config.cfg.update(old_cfg)
+
+    assert model == 'gpt-5.5'
+    assert provider == 'codex-lb'
+    assert base_url == 'https://cigro-codex.million.tk/v1'
+
+
+def test_openai_pro_account_routes_through_codex_oauth_provider():
+    """Legacy openai-pro account config must use the existing Codex auth pool."""
+    old_cfg = dict(config.cfg)
+    config.cfg.clear()
+    config.cfg.update({
+        'model': {'default': 'gpt-5.4', 'provider': 'openai-codex'},
+        'accounts': {
+            'openai-pro': {
+                'provider': 'openai',
+                'model': 'gpt-5.4',
+            },
+        },
+        'active_account': 'openai-pro',
+    })
+    try:
+        model, provider, base_url = config.resolve_model_provider('gpt-5.4')
+    finally:
+        config.cfg.clear()
+        config.cfg.update(old_cfg)
+
+    assert model == 'gpt-5.4'
+    assert provider == 'openai-codex'
+    assert base_url is None
 
 
 # ── Cross-provider routing ───────────────────────────────────────────────
@@ -905,7 +962,7 @@ def test_custom_remote_foreign_profile_catalog_ignored_5979():
     )
 
 
-def test_resolver_provenance_read_does_not_block_on_cache_lock_5979():
+def test_resolver_provenance_read_does_not_block_on_cache_lock_5979(monkeypatch):
     """Regression: the resolver's per-send provenance read must be LOCK-FREE
     with respect to ``_available_models_cache_lock``.
 
@@ -924,6 +981,26 @@ def test_resolver_provenance_read_does_not_block_on_cache_lock_5979():
         'provider': 'custom', 'default': 'x-ai/grok-4.5',
         'base_url': 'https://proxy.example/v1', 'models': {'x-ai/grok-4.5': {}},
     }})
+    # Keep the lock-contract test hermetic. A real cold catalog rebuild can now
+    # exceed the bounded foreground budget and continue out-of-band, which
+    # legitimately keeps this lock held after get_available_models() returns.
+    # This test needs a completed cache publication, not a provider/network probe.
+    monkeypatch.setattr(config, "_load_models_cache_from_disk", lambda: None)
+    monkeypatch.setattr(
+        config,
+        "_invoke_models_rebuild",
+        lambda _builder: {
+            'active_provider': 'custom',
+            'default_model': 'x-ai/grok-4.5',
+            'configured_model_badges': {},
+            'groups': [{
+                'provider': 'Custom',
+                'provider_id': 'custom',
+                'models': [{'id': 'x-ai/grok-4.5', 'label': 'x-ai/grok-4.5'}],
+            }],
+            'aliases': {},
+        },
+    )
     config.invalidate_models_cache()
     config.get_available_models()  # warm the catalog + publish provenance
     try:
@@ -1043,7 +1120,7 @@ def test_custom_slug_cold_stale_not_picked_still_strips_5979():
     assert model == bare, f"unmarked stale cold custom:slug id must strip (legacy), got {model!r}"
 
 
-def test_warm_models_catalog_provenance_if_cold_publishes_from_disk_5979():
+def test_warm_models_catalog_provenance_if_cold_publishes_from_disk_5979(monkeypatch):
     """The send-path warm helper publishes provenance from a valid disk cache
     when memory is cold — restoring the endpoint-advertised signal so #433
     strips and #5979 preserves — WITHOUT a live rebuild.
@@ -1057,6 +1134,30 @@ def test_warm_models_catalog_provenance_if_cold_publishes_from_disk_5979():
                               'key_env': 'LLM_PROXY_API_KEY',
                               'models': ['x-ai/grok-4.5', 'x-ai/grok-composer-2.5-fast']}],
     })
+    # This contract starts at the persisted cache boundary. Keep its priming
+    # rebuild deterministic so the bounded live-catalog worker cannot outlive
+    # the test and publish into a later test's in-memory config.
+    monkeypatch.setattr(
+        config,
+        "_invoke_models_rebuild",
+        lambda _builder: {
+            'active_provider': 'custom:llm-proxy',
+            'default_model': 'x-ai/grok-4.5',
+            'configured_model_badges': {},
+            'groups': [{
+                'provider': 'llm-proxy',
+                'provider_id': 'custom:llm-proxy',
+                'models': [
+                    {'id': 'x-ai/grok-4.5', 'label': 'x-ai/grok-4.5'},
+                    {
+                        'id': 'x-ai/grok-composer-2.5-fast',
+                        'label': 'x-ai/grok-composer-2.5-fast',
+                    },
+                ],
+            }],
+            'aliases': {},
+        },
+    )
     try:
         # Build + persist to disk, then simulate a cold memory cache (restart).
         config.invalidate_models_cache()
@@ -1389,15 +1490,40 @@ def _isolate_models_cache():
     ``test_custom_endpoint_uses_model_config_api_key_for_model_discovery``
     ``KeyError: 'auth'`` on CI where ``urlopen`` is never reached).
     """
+    _wait_for_models_catalog_workers()
     try:
         config.invalidate_models_cache()
     except Exception:
         pass
     yield
+    _wait_for_models_catalog_workers()
     try:
         config.invalidate_models_cache()
     except Exception:
         pass
+
+
+def _wait_for_models_catalog_workers(timeout: float = 30.0) -> None:
+    """Drain catalog workers before resetting shared cache state.
+
+    A bounded rebuild may return its fallback while a daemon worker is still
+    probing. ``invalidate_models_cache()`` cannot cancel that worker; clearing
+    first lets its later publication overwrite the next test's config/cache.
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        workers = [
+            worker
+            for worker in threading.enumerate()
+            if worker.name == "models-catalog-rebuild" and worker.is_alive()
+        ]
+        if not workers:
+            return
+        for worker in workers:
+            remaining = max(0.0, deadline - time.monotonic())
+            worker.join(timeout=remaining)
+        if time.monotonic() >= deadline:
+            pytest.fail("models catalog rebuild worker did not finish during test isolation")
 
 
 def _available_models_with_provider(provider):
@@ -1508,38 +1634,88 @@ def test_provider_config_object_list_catalog_uses_picker_supported_keys_6121(mon
 # that case — the base_url belongs to the active provider.
 
 def _available_models_with_full_cfg(provider, default, base_url):
-    """Helper: set model.provider, model.default, model.base_url at once.
+    """Resolve the picker catalog in a clean, network-free interpreter."""
+    import json
+    import subprocess
+    import sys
+    from pathlib import Path
 
-    Clears model-override env vars (HERMES_MODEL, OPENAI_MODEL, LLM_MODEL)
-    during the call so the real hermes profile environment doesn't leak into
-    the test and override the fixture's default model.
-    """
-    import os
-    import api.config as _cfg
-    old_cfg = dict(_cfg.cfg)
-    _cfg.cfg['model'] = {
-        'provider': provider,
-        'default': default,
-        'base_url': base_url,
-    }
     try:
-        _cfg._cfg_mtime = _cfg.Path(_cfg._get_config_path()).stat().st_mtime
+        from hermes_cli.models import list_available_providers
+
+        detected = [
+            {
+                "id": str(row.get("id") or ""),
+                "authenticated": bool(row.get("authenticated")),
+            }
+            for row in (list_available_providers() or [])
+            if isinstance(row, dict) and row.get("id")
+        ]
     except Exception:
-        # No config.yaml on this machine (e.g. CI); pin to 0.0 so the mtime check
-        # inside get_available_models() sees 0.0 == 0.0 and doesn't call reload_config(),
-        # which would overwrite the in-memory cfg we just set up.
-        _cfg._cfg_mtime = 0.0
-    # Clear model-override env vars to prevent the real profile from leaking in
-    _model_env_keys = ('HERMES_MODEL', 'OPENAI_MODEL', 'LLM_MODEL')
-    _saved_env = {k: os.environ.pop(k, None) for k in _model_env_keys}
-    try:
-        return _cfg.get_available_models()
-    finally:
-        _cfg.cfg.clear()
-        _cfg.cfg.update(old_cfg)
-        for k, v in _saved_env.items():
-            if v is not None:
-                os.environ[k] = v
+        detected = []
+
+    model_config = {
+        "provider": provider,
+        "default": default,
+        "base_url": base_url,
+    }
+    script = f"""
+import json
+import os
+import sys
+import types
+from pathlib import Path
+
+import api.config as config
+
+fake_models = types.ModuleType("hermes_cli.models")
+fake_models.list_available_providers = lambda: {detected!r}
+fake_models.provider_model_ids = lambda _provider: []
+fake_auth = types.ModuleType("hermes_cli.auth")
+fake_auth.get_auth_status = lambda _provider: {{"key_source": "env"}}
+sys.modules["hermes_cli.models"] = fake_models
+sys.modules["hermes_cli.auth"] = fake_auth
+
+for key in ("HERMES_MODEL", "OPENAI_MODEL", "LLM_MODEL"):
+    os.environ.pop(key, None)
+config.cfg = {{"model": {model_config!r}}}
+config._cfg_path = config._get_config_path()
+try:
+    config._cfg_mtime = Path(config._cfg_path).stat().st_mtime
+except OSError:
+    config._cfg_mtime = 0.0
+config._available_models_cache = None
+config._available_models_cache_ts = 0.0
+config._available_models_live_rebuild_ts = 0.0
+config._cache_build_in_progress = False
+config._LIVE_REBUILD_BUDGET_SECONDS = 0.0
+config._read_live_provider_model_ids = lambda _provider: []
+config._read_visible_codex_cache_model_ids = lambda: []
+config._load_models_cache_from_disk = lambda: None
+config._load_stale_models_cache_from_disk = lambda: None
+config._save_models_cache_to_disk = lambda _result: None
+
+result = config.get_available_models(force_refresh=True)
+print("__WEBUI_MODEL_RESULT__" + json.dumps(result, sort_keys=True))
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=Path(__file__).resolve().parents[1],
+        text=True,
+        capture_output=True,
+        timeout=30,
+    )
+    assert completed.returncode == 0, completed.stderr
+    result_line = next(
+        (
+            line
+            for line in completed.stdout.splitlines()
+            if line.startswith("__WEBUI_MODEL_RESULT__")
+        ),
+        None,
+    )
+    assert result_line is not None, completed.stdout
+    return json.loads(result_line.removeprefix("__WEBUI_MODEL_RESULT__"))
 
 
 def test_no_phantom_custom_group_when_active_provider_is_set(monkeypatch):

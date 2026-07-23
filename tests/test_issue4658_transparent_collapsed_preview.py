@@ -38,6 +38,7 @@ pytestmark = pytest.mark.skipif(NODE is None, reason="node not on PATH")
 
 _FN_NAMES = [
     '_toolDisplayName', '_toolActionKind', '_toolKindIcon', '_toolPathBasename',
+    '_toolOutputSafeJsonParse', '_toolOutputSafeJsonEnvelope',
     '_decodeToolLabelEntities', '_redactToolTargetLabel', '_shortToolLabel', '_toolI18n',
     '_toolTargetLabel', '_toolReadRangeLabel', '_toolVisibleTargetLabel', '_toolCommandTitle', '_toolQueryTitle',
     '_toolActionLabelText', '_toolArgPreviewValue', '_toolArgPreviewKeyIsHidden',
@@ -169,6 +170,13 @@ global._toolDisclosureIdentity = () => '';
 
 // ── EXTRACTED_FUNCTIONS placeholder (replaced by Python) ──
 %%EXTRACTED_FUNCTIONS%%
+
+// This regression exercises the classic collapsed-preview branch only. Newer
+// structured/change/diagnostic renderers are covered by their own test suites;
+// keep them from intercepting these intentionally small fixtures.
+_toolStructuredOutputInfo = () => null;
+global._toolChangeSummaryInfo = () => null;
+global._toolCommandDiagnosticInfo = () => null;
 
 function previewFor(tc){
   const row=_decorateTransparentEventRow(buildToolCard(tc),{

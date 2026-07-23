@@ -609,6 +609,7 @@ const els = {{
   composerReasoningChip: makeEl(), composerMobileReasoningAction: makeEl(),
 }};
 global.$ = id => els[id] || null;
+global.window = {{}};
 global.S = {{ session: {{ model: 'gpt-5', model_provider: 'openai' }} }};
 global._highlightReasoningOption = () => {{}};
 global._applyReasoningOptions = () => {{}};
@@ -787,6 +788,7 @@ const els = {{
   composerMobileReasoningAction: makeEl()
 }};
 global.$ = id => els[id] || null;
+global.window = {{}};
 global.S = {{ activeProfile: 'vops', session: null }};
 global._highlightReasoningOption = () => {{}};
 global._applyReasoningOptions = () => {{}};

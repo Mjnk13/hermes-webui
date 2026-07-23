@@ -240,6 +240,11 @@ def _atomic_write_text(path: Path, text: str, *, encoding: str = "utf-8") -> Non
         with f:
             f.write(text)
             f.flush()
+            # Darwin clears setgid when a non-privileged process writes the
+            # inode. Reapply the captured mode after writing so special bits
+            # survive the atomic replacement just like ordinary permissions.
+            if mode is not None and hasattr(os, "fchmod"):
+                os.fchmod(f.fileno(), mode)
             os.fsync(f.fileno())
         _verify_symlink_target()
         os.replace(tmp, write_path)

@@ -38,7 +38,7 @@ def test_footer_timestamp_uses_richer_format_for_older_messages():
 
 def test_timestamp_footer_stays_on_visible_response_segments():
     assert "if(hasVisibleBody){" in UI_JS
-    assert 'seg.insertAdjacentHTML(\'beforeend\', `${filesHtml}<div class="msg-body">${bodyHtml}</div>${footHtml}`);' in UI_JS, (
+    assert 'const nextRowHtml=`${filesHtml}${contextHtml}<div class="msg-body">${bodyHtml}</div>${footHtml}`;' in UI_JS, (
         "Footer timestamp should stay attached to visible response segments"
     )
     assert "assistantThinking.set(rawIdx, thinkingText);" in UI_JS, (

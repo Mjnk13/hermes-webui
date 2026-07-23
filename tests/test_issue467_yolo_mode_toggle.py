@@ -194,7 +194,7 @@ class TestYoloBusySendPath:
         assert intercept_idx < busymode_idx, "Busy-path intercept must run before busyMode routing"
 
         intercept_block = messages_js[intercept_idx:busymode_idx]
-        assert "_bc.fn(_pc.args)" in intercept_block, (
+        assert "_bc.fn(_pc.args,{contextItems:outgoingContextItems,browserContextParts:outgoingBrowserContextParts,parts:outgoingParts})" in intercept_block, (
             "Busy-path slash intercept should dispatch directly through the command handler"
         )
         assert "await _bc.fn" in intercept_block, (

@@ -110,7 +110,12 @@ def test_start_session_turn_routes_through_adapter_when_enabled(
             assert request.session_id == "sess-test"
             assert request.message == "wakeup msg"
             assert request.source == "process_wakeup"
-            assert request.metadata == {"route": "start_session_turn"}
+            assert request.metadata == {
+                "route": "start_session_turn",
+                "context_items": [],
+                "browser_context_parts": [],
+                "client_message_id": None,
+            }
             return ra_mod.RunStartResult(
                 run_id="run-test",
                 stream_id="stream-via-adapter",
