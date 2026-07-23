@@ -126,6 +126,32 @@ def test_fingerprinted_url_gets_immutable_cache(isolated_static):
     assert h.header("Cache-Control") == "public, max-age=31536000, immutable"
 
 
+def test_dirty_build_fingerprint_revalidates_static_assets(isolated_static):
+    """A process-stable dirty version must not pin edited JS for one year."""
+    from api import routes
+
+    static_file = _make_static_file(isolated_static, "ui.js", b"x" * 2000)
+    query = "v=exp-v0.52.121-78-gf3a34568-dirty-a119d130"
+
+    first = _serve(routes, "/static/ui.js", query=query)
+    first_etag = first.header("ETag")
+
+    assert first.header("Cache-Control") == "no-cache"
+
+    static_file.write_bytes(b"updated formatter" * 160)
+    updated = _serve(
+        routes,
+        "/static/ui.js",
+        query=query,
+        request_headers={"If-None-Match": first_etag},
+    )
+
+    assert updated.status == 200
+    assert updated.header("Cache-Control") == "no-cache"
+    assert updated.header("ETag") != first_etag
+    assert bytes(updated.body) == b"updated formatter" * 160
+
+
 def test_empty_fingerprint_value_gets_short_cache(isolated_static):
     """Only a non-empty version token is an immutable-cache fingerprint."""
     from api import routes

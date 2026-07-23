@@ -113,6 +113,7 @@ global.window = {{
 global.S = {{ session: {{}} }};
 eval(extractFunc('_anchorSceneCleanText'));
 eval(extractFunc('_anchorSceneTextKey'));
+eval(extractFunc('_anchorSceneToolRowSemanticMutationKey'));
 eval(extractFunc('_anchorSceneExistingRowKey'));
 eval(extractFunc('_anchorSceneRowHasLiveIdentity'));
 eval(extractFunc('_anchorSceneSettleLiveRunningRow'));
@@ -438,11 +439,15 @@ def test_live_processed_anchor_starts_before_chat_start_returns_stream_id():
     send = _function_body(MESSAGES_JS, "send")
 
     optimistic_idx = send.index("S.messages.push(userMsg);renderMessages();setBusy(true);")
-    started_idx = send.index("if(S.session&&!S.session.pending_started_at) S.session.pending_started_at=Date.now()/1000;", optimistic_idx)
+    # The optimistic path now resets the turn origin immediately before the
+    # local user row is rendered. A later guarded assignment remains only as a
+    # recovery fallback; anchoring this assertion to that second occurrence
+    # would incorrectly put the timer after the first Worklog shell.
+    started_idx = send.rfind("S.session.pending_started_at=Date.now()/1000;", 0, optimistic_idx)
     ensure_idx = send.index("if(typeof ensureLiveWorklogShell==='function') ensureLiveWorklogShell();", optimistic_idx)
     fallback_idx = send.index("else appendThinking('',{pending:true});", ensure_idx)
     chat_start_idx = send.index("const startData=await api('/api/chat/start'")
-    assert optimistic_idx < started_idx < ensure_idx < fallback_idx < chat_start_idx
+    assert 0 <= started_idx < optimistic_idx < ensure_idx < fallback_idx < chat_start_idx
 
 
 def test_live_processed_anchor_rekeys_when_stream_id_is_known():
@@ -648,7 +653,9 @@ def test_tool_scene_rows_coalesce_by_logical_tool_call_identity():
     merge = _function_body(UI_JS, "_anchorSceneMergeToolRows")
 
     assert "function _anchorSceneToolRowLogicalKey" in UI_JS
-    assert "if(row.role==='tool') return `tool:${_anchorSceneToolRowLogicalKey(row)||row.row_id||row.event_id||row.local_id||out.length}`" in rows
+    assert "const semanticMutationKey=_anchorSceneToolRowSemanticMutationKey(row);" in rows
+    assert "if(semanticMutationKey) return `tool-mutation:${semanticMutationKey}`;" in rows
+    assert "return `tool:${_anchorSceneToolRowLogicalKey(row)||row.row_id||row.event_id||row.local_id||out.length}`" in rows
     assert "row.tool_call_id||tool.id||tool.tid||tool.tool_call_id||tool.tool_use_id||tool.call_id" in key
     assert "payload.tid||payload.id||payload.tool_call_id||payload.tool_use_id||payload.call_id" in key
     assert "mergedTool.args=prevArgs" in merge
@@ -1009,7 +1016,9 @@ def test_transparent_stream_renders_persisted_anchor_scene_after_reload():
     assert "_syncTransparentEventControls(turn)" in transparent
     # tool + thinking rows are rendered as transparent event rows
     assert "_decorateTransparentEventRow(_thinkingActivityNode" in row
-    assert "_decorateTransparentEventRow(buildToolCard(toolCall)" in row
+    assert "baseNode=mutationItems.length" in row
+    assert ": buildToolCard(toolCall);" in row
+    assert "_anchorSceneFallbackNodeForRenderError" in row
     assert "_transparentToolStatus(toolCall,settled)" in row
     assert 'data-anchor-settled-scene-row' in row
     assert "if(anchorOwnedAssistantRawIdxs.has(aIdx)) continue;" in render

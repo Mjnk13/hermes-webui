@@ -8,7 +8,8 @@ Full parity with the CLI experience - everything you can do from a terminal, you
 Layout: three-panel. Left sidebar for sessions and navigation, center for chat,
 right for workspace file browsing. Model, profile, and workspace controls live in
 the **composer footer** — always visible while composing. A circular context ring
-shows token usage at a glance. All settings and session tools are in the
+shows token usage at a glance, with a `🗜️ N` badge after the first successful
+context compression. All settings and session tools are in the
 **Hermes Control Center** (launcher at the sidebar bottom).
 
 Setup Hermes so you can access it natively on every device:
@@ -137,7 +138,9 @@ For self-hosted VM or homelab installs, `ctl.sh` wraps the common daemon lifecyc
 ./ctl.sh stop
 ```
 
-`ctl.sh start` runs the bootstrap in foreground/no-browser mode behind the daemon wrapper, writes logs to `~/.hermes/webui.log`, and respects `.env` plus inline overrides such as `HERMES_WEBUI_HOST=0.0.0.0 ./ctl.sh start`.
+`ctl.sh start` runs the bootstrap in foreground/no-browser mode behind the daemon wrapper, writes logs to `~/.hermes/webui.log`, and respects `.env` plus inline overrides such as `HERMES_WEBUI_HOST=0.0.0.0 ./ctl.sh start`. If the optional Electron Browser Workbench desktop shell is enabled, `ctl.sh start`, `restart`, and `stop` manage that shell by the resolved WebUI port so stale desktop windows from the same `.env` or custom port are closed before a new one opens.
+
+On macOS, when an installed Hermes WebUI launchd job is configured for the same port, `ctl.sh` uses that job as the single process owner. `stop` unloads it before terminating the server, `start` loads it again, and `restart` performs both steps in order. This prevents launchd `KeepAlive` from racing a second standalone daemon for the same port or repeatedly relaunching Electron.
 
 > **Stopping the server.** Each launch method has its own stop path because only `ctl.sh start` writes a PID file (`~/.hermes/webui.pid`):
 >
@@ -145,6 +148,7 @@ For self-hosted VM or homelab installs, `ctl.sh` wraps the common daemon lifecyc
 > |---|---|
 > | `python3 bootstrap.py` | **Ctrl-C** in the terminal (runs in the foreground) |
 > | `./ctl.sh start` | `./ctl.sh stop` (sends SIGTERM, waits, then SIGKILL) |
+> | Hermes WebUI launchd job on the same configured port | `./ctl.sh stop` (unloads the job first); `./ctl.sh start` loads it again |
 > | Detached `bootstrap.py` (no `--foreground`) or `./start.sh` | Find the PID via `lsof -i :8787` (or `ss -tlnp`) and `kill` it |
 >
 > `./ctl.sh stop` cannot stop a server launched by `bootstrap.py` or `start.sh` directly — it only manages processes it started itself.

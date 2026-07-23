@@ -42,8 +42,11 @@ def test_reasoning_chip_html_starts_hidden():
         src
     )
     assert m, "composerReasoningWrap must start with style='display:none'"
-    assert 'data-effort="max"' in src, (
-        "composer reasoning dropdown must include Max option"
+    assert 'id="composerReasoningDropdown"' in src
+    with open("static/ui.js") as f:
+        ui_src = f.read()
+    assert "backendOptions" in ui_src and "replaceChildren()" in ui_src, (
+        "reasoning options must be populated from backend capabilities"
     )
 
 

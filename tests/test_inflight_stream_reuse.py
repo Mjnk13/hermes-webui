@@ -98,7 +98,8 @@ def test_attach_live_stream_closes_other_session_streams_before_opening_new_one(
 
     helper_compact = helper.replace(" ", "")
     assert "Object.keys(LIVE_STREAMS)" in helper
-    assert "if(sid!==activeSid)closeLiveStream(sid)" in helper_compact
+    assert "if(options.skipDomSnapshot)closeLiveStream(sid,null,null,options)" in helper_compact
+    assert "elsecloseLiveStream(sid)" in helper_compact
 
     reuse_pos = body.find("const existingLive=LIVE_STREAMS[activeSid]")
     close_other_pos = body.find("closeOtherLiveStreams(activeSid)")
@@ -179,11 +180,13 @@ def test_load_session_same_sid_noop_does_not_mask_pending_switch_back():
     )
     assert "_loadingSessionId===sid" in guard
     guard_pos = compact.find(guard)
-    assert guard_pos < compact.find("_loadingSessionId=sid;")
+    load_owner_pos = compact.find("_loadingSessionId=sid;", guard_pos)
+    assert guard_pos < load_owner_pos
     # The guarded block must still early-return for the same-session no-op,
     # while now also acknowledging the visit to clear a stale unread dot.
-    assert "_sessionVisitHasUnreadState(sid)" in compact[guard_pos:guard_pos + 600]
-    assert "return;}" in compact[guard_pos:guard_pos + 900]
+    guard_block = compact[guard_pos:load_owner_pos]
+    assert "_sessionVisitHasUnreadState(sid)" in guard_block
+    assert "return;}" in guard_block
 
 
 def test_load_session_preserves_existing_worklog_content_without_destructive_fallback():
@@ -214,7 +217,8 @@ def test_tool_events_are_guarded_against_stale_session_and_stream():
         assert "_terminalStateReached||_streamFinalized" in handler
         assert "S.session.session_id!==activeSid" in handler
         assert "S.activeStreamId!==streamId" in handler
-        assert "appendLiveToolCard(tc,{sessionId:activeSid,streamId})" in handler
+        assert "appendLiveToolCard(tc,{sessionId:activeSid,streamId" in handler
+        assert "anchorAlreadyRendered:" in handler
 
 
 def test_close_live_stream_marks_inflight_for_reattach_on_return():
@@ -255,9 +259,11 @@ def test_close_other_live_streams_triggers_reattach_for_backgrounded_sessions():
     # closeOtherLiveStreams delegates per-session teardown to closeLiveStream,
     # so the reattach flag must be set inside closeLiveStream itself for the
     # chain to work — this guards the indirection.
-    assert "closeLiveStream(sid)" in helper_body.replace(" ", ""), (
+    helper_compact = helper_body.replace(" ", "")
+    assert "closeLiveStream(sid,null,null,options)" in helper_compact, (
         "closeOtherLiveStreams() must delegate teardown to closeLiveStream()"
     )
+    assert "elsecloseLiveStream(sid)" in helper_compact
     assert "reattach" in close_body, (
         "closeLiveStream() must set the reattach flag so closeOtherLiveStreams() "
         "propagates the reattach intent to every backgrounded session"
@@ -642,6 +648,7 @@ def test_upsert_live_tool_call_preserves_start_seq_for_complete():
         _function_decl(MESSAGES_JS, "_coerceLiveToolCallSeq"),
         _function_decl(MESSAGES_JS, "_currentLiveToolAnchor"),
         _function_decl(MESSAGES_JS, "_findPendingLiveToolCallIndex"),
+        _function_decl(MESSAGES_JS, "_mergeLiveToolCallArgs"),
         _function_decl(MESSAGES_JS, "upsertLiveToolCall"),
     ])
     script = (
@@ -683,6 +690,53 @@ def test_upsert_live_tool_call_preserves_start_seq_for_complete():
     assert result.returncode == 0, result.stderr
 
 
+def test_upsert_live_tool_call_preserves_original_command_when_complete_args_are_empty():
+    """Settling stdout must not erase the command received on tool_start."""
+    assert NODE, "node not on PATH"
+    helper_defs = "\n".join([
+        _function_decl(MESSAGES_JS, "_stableStringify"),
+        _function_decl(MESSAGES_JS, "_hashString"),
+        _function_decl(MESSAGES_JS, "_toolCallSignature"),
+        _function_decl(MESSAGES_JS, "_liveToolTid"),
+        _function_decl(MESSAGES_JS, "_coerceLiveToolCallSignature"),
+        _function_decl(MESSAGES_JS, "_coerceLiveToolCallSeq"),
+        _function_decl(MESSAGES_JS, "_currentLiveToolAnchor"),
+        _function_decl(MESSAGES_JS, "_findPendingLiveToolCallIndex"),
+        _function_decl(MESSAGES_JS, "_mergeLiveToolCallArgs"),
+        _function_decl(MESSAGES_JS, "upsertLiveToolCall"),
+    ])
+    script = (
+        "const assert=require('assert');\n"
+        f"{helper_defs}\n"
+        "const uploaded=[]; let activeSid='sid'; const INFLIGHT={};\n"
+        "const S={toolCalls:[],messages:[]}; let assistantRow={getAttribute:()=>\"7\"};\n"
+        "let _assistantSegmentSeq=7; let _currentLiveSegmentSeq=7; let _currentActivityBurstId=1;\n"
+        "const assistantBody=null; global.persistInflightState=()=>{};\n"
+        "const command=\"pnpm exec tsx --test tests/*.test.ts\";\n"
+        "const start=upsertLiveToolCall({name:'terminal',tid:'T1',args:{command,cwd:'/tmp/project'}},'start');\n"
+        "const complete=upsertLiveToolCall({name:'terminal',tid:'T1',args:{},output:'test stdout'},'complete');\n"
+        "assert.strictEqual(complete,start);\n"
+        "assert.strictEqual(complete.args.command,command);\n"
+        "assert.strictEqual(complete.args.cwd,'/tmp/project');\n"
+        "assert.strictEqual(complete.output,'test stdout');\n"
+        "assert.strictEqual(complete.done,true);\n"
+        "const enriched=upsertLiveToolCall({name:'terminal',tid:'T2',args:{command:'partial'}},'start');\n"
+        "upsertLiveToolCall({name:'terminal',tid:'T2',args:{cmd:'bash -lc \\\"echo complete\\\"'}},'complete');\n"
+        "assert.strictEqual(enriched.args.command,'bash -lc \\\"echo complete\\\"');\n"
+        "assert.strictEqual(enriched.args.cmd,'bash -lc \\\"echo complete\\\"');\n"
+        "const topLevel=upsertLiveToolCall({name:'terminal',tid:'T3',command:'git status --short'},'start');\n"
+        "upsertLiveToolCall({name:'terminal',tid:'T3',args:{},output:' M static/messages.js'},'complete');\n"
+        "assert.strictEqual(topLevel.command,'git status --short');\n"
+        "assert.strictEqual(topLevel.args.command,'git status --short');\n"
+        "const topLevelCode=upsertLiveToolCall({name:'execute_code',tid:'T4',code:'print(1)'},'start');\n"
+        "upsertLiveToolCall({name:'execute_code',tid:'T4',args:{code:''},output:'1'},'complete');\n"
+        "assert.strictEqual(topLevelCode.code,'print(1)');\n"
+        "assert.strictEqual(topLevelCode.args.code,'print(1)');\n"
+    )
+    result = subprocess.run([NODE, "-e", script], capture_output=True, text=True, check=False)
+    assert result.returncode == 0, result.stderr
+
+
 def test_upsert_live_tool_call_complete_matches_by_name_burst_without_tid():
     """A complete event without tid must still match the in-flight tool by name+burst.
 
@@ -699,6 +753,7 @@ def test_upsert_live_tool_call_complete_matches_by_name_burst_without_tid():
         _function_decl(MESSAGES_JS, "_coerceLiveToolCallSeq"),
         _function_decl(MESSAGES_JS, "_currentLiveToolAnchor"),
         _function_decl(MESSAGES_JS, "_findPendingLiveToolCallIndex"),
+        _function_decl(MESSAGES_JS, "_mergeLiveToolCallArgs"),
         _function_decl(MESSAGES_JS, "upsertLiveToolCall"),
     ])
     script = (
@@ -750,6 +805,7 @@ def test_upsert_flags_orphan_complete_but_not_normal_start_complete():
         _function_decl(MESSAGES_JS, "_coerceLiveToolCallSeq"),
         _function_decl(MESSAGES_JS, "_currentLiveToolAnchor"),
         _function_decl(MESSAGES_JS, "_findPendingLiveToolCallIndex"),
+        _function_decl(MESSAGES_JS, "_mergeLiveToolCallArgs"),
         _function_decl(MESSAGES_JS, "upsertLiveToolCall"),
     ])
     script = (
@@ -812,8 +868,11 @@ def test_tool_complete_handler_gates_segment_reset_on_orphan_flag():
         "segment reset must be gated behind the orphan-completion branch"
     )
     # The non-orphan branch must still place the card (in place).
-    assert handler.count("appendLiveToolCard(tc,{sessionId:activeSid,streamId})") >= 2, (
+    assert handler.count("appendLiveToolCard(tc,{sessionId:activeSid,streamId") >= 2, (
         "both orphan and in-place branches must append/update the tool card"
+    )
+    assert handler.count("anchorAlreadyRendered:toolCompleteAnchorRender.rendered") >= 2, (
+        "both branches must preserve anchor-render ownership and avoid a duplicate DiffCard paint"
     )
 
 
@@ -917,15 +976,18 @@ def test_load_session_restores_worklog_shell_before_reattach_replay():
 
 
 def test_restore_succeeded_reconnect_replays_tool_cards():
-    """When reconnect replay succeeds in restoring the live turn HTML, tool cards
-    are still repainted from the persisted live-call list instead of waiting for a
-    future SSE event to reintroduce them."""
+    """Legacy live-turn restores still repaint their persisted tool list.
+
+    An authoritative anchor scene already owns those rows and is intentionally
+    excluded: replaying each call there rebuilds the full scene once per tool.
+    """
     body = _function_body(SESSIONS_JS, "loadSession")
     replay_fn = body.find("const replayPersistedLiveToolCards=(opts)=>{")
     reattach_pos = body.find("if(INFLIGHT[sid].reattach&&activeStreamId&&typeof attachLiveStream==='function')")
     restore_pos = body.find("restoreLiveTurnHtmlForSession", reattach_pos if reattach_pos != -1 else 0)
     fallback_pos = body.find("if(!restoredLiveTurn){", restore_pos)
-    restore_replay_pos = body.find("if(restoredLiveTurn&&didReconnect){", restore_pos)
+    restore_replay_guard = "if(_shouldReplayRestoredLiveToolCards(restoredLiveTurn,didReconnect,restoredAnchorScene)){"
+    restore_replay_pos = body.find(restore_replay_guard, restore_pos)
     restore_replay_block = body[restore_replay_pos:fallback_pos]
     helper_replay_call = restore_replay_block.find("replayPersistedLiveToolCards({skipUnkeyedRestoredDuplicates:true});")
     assert reattach_pos != -1, "loadSession must keep the reconnect reattach branch"
@@ -936,9 +998,9 @@ def test_restore_succeeded_reconnect_replays_tool_cards():
     assert restore_replay_pos != -1, "restored live turns must explicitly replay tools on reconnect"
     assert helper_replay_call != -1, "replay helper must be executed so reconnect can repopulate tool cards"
     assert replay_fn < restore_replay_pos < fallback_pos, "restore+reconnect replay should run before fallback"
-    assert restore_replay_block.strip().startswith("if(restoredLiveTurn&&didReconnect){")
+    assert restore_replay_block.strip().startswith(restore_replay_guard)
     assert (
-        "if(restoredLiveTurn&&didReconnect){"
+        restore_replay_guard +
         "replayPersistedLiveToolCards({skipUnkeyedRestoredDuplicates:true});"
         "}"
     ) in re.sub(r"\s+", "", restore_replay_block)
@@ -953,7 +1015,9 @@ def test_restore_succeeded_reconnect_skips_unkeyed_restored_tool_duplicates():
     """
     body = _function_body(SESSIONS_JS, "loadSession")
     replay_fn = body.find("const replayPersistedLiveToolCards=(opts)=>{")
-    restore_replay_pos = body.find("if(restoredLiveTurn&&didReconnect){")
+    restore_replay_pos = body.find(
+        "if(_shouldReplayRestoredLiveToolCards(restoredLiveTurn,didReconnect,restoredAnchorScene)){"
+    )
     fallback_pos = body.find("if(!restoredLiveTurn){", restore_replay_pos)
     assert replay_fn != -1, "loadSession should keep replay options on the helper"
     assert "const liveToolReplayId=(tc)=>" in body
@@ -978,10 +1042,11 @@ def test_merge_inflight_tail_preserves_all_segmented_live_progress():
     groups whose burst ids point to those anchors pile up at the bottom.
     """
     assert NODE, "node not on PATH"
+    metadata_start = SESSIONS_JS.index("function _mergeTranscriptMessageMetadata")
     helper_start = SESSIONS_JS.index("function _currentTailUserMessage")
     fn_start = SESSIONS_JS.index("function _mergeInflightTailMessages")
     fn_end = SESSIONS_JS.index("// Load older messages", fn_start)
-    tail_user_helpers = SESSIONS_JS[helper_start:fn_start]
+    tail_user_helpers = SESSIONS_JS[metadata_start:fn_start]
     merge_fn = SESSIONS_JS[fn_start:fn_end]
     script = f"""
 const assert = require('assert');

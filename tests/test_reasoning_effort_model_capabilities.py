@@ -32,6 +32,78 @@ def test_openai_codex_prefixed_gpt5_supports_reasoning_effort_levels():
     assert "max" not in efforts
 
 
+def test_gpt56_exposes_distinct_max_and_ultra_values():
+    efforts = cfg.resolve_model_reasoning_efforts(
+        "gpt-5.6-sol",
+        provider_id="custom:codex-lb",
+    )
+    assert efforts[-3:] == ["xhigh", "max", "ultra"]
+    status = cfg.get_reasoning_status(
+        model_id="gpt-5.6-sol",
+        provider_id="custom:codex-lb",
+    )
+    mappings = {option["label"]: option["backend_value"] for option in status["options"]}
+    assert mappings["Extra High"] == "xhigh"
+    assert mappings["Max"] == "max"
+    assert mappings["Ultra"] == "ultra"
+    assert len({mappings["Extra High"], mappings["Max"], mappings["Ultra"]}) == 3
+    ultra_option = next(option for option in status["options"] if option["label"] == "Ultra")
+    assert ultra_option["provider_value"] == "max"
+
+
+def test_generic_reasoning_capability_does_not_imply_ultra():
+    efforts = cfg.resolve_model_reasoning_efforts(
+        "gpt-5.5",
+        provider_id="custom:codex-lb",
+    )
+    assert "max" in efforts  # existing backend capability remains available
+    assert "ultra" not in efforts
+
+
+def test_explicit_custom_provider_can_opt_model_into_ultra(monkeypatch):
+    original = cfg.cfg.get("custom_providers")
+    monkeypatch.setitem(
+        cfg.cfg,
+        "custom_providers",
+        [{"name": "reasoning-proxy", "reasoning_efforts": ["high", "max", "ultra"]}],
+    )
+    try:
+        assert cfg.resolve_model_reasoning_efforts(
+            "future-reasoner",
+            provider_id="custom:reasoning-proxy",
+        ) == ["high", "max", "ultra"]
+    finally:
+        if original is None:
+            cfg.cfg.pop("custom_providers", None)
+        else:
+            monkeypatch.setitem(cfg.cfg, "custom_providers", original)
+
+
+def test_ultra_status_reports_canonical_and_provider_wire_values(monkeypatch, tmp_path):
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        """
+model:
+  default: gpt-5.6-sol
+  provider: codex-lb
+agent:
+  reasoning_effort: ultra
+custom_providers:
+  - name: codex-lb
+    api_mode: codex_responses
+    models:
+      gpt-5.6-sol: {}
+""".strip(),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(cfg, "_get_config_path", lambda: config_path)
+    status = cfg.get_reasoning_status()
+    assert status["reasoning_effort"] == "ultra"
+    assert status["diagnostics"]["ui_label"] == "Ultra"
+    assert status["diagnostics"]["backend_payload_value"] == "ultra"
+    assert status["diagnostics"]["provider_payload_value"] == "max"
+
+
 def test_openai_codex_max_effort_is_clamped_before_streaming():
     assert cfg.coerce_reasoning_effort_for_model(
         "max",
@@ -447,4 +519,3 @@ def test_datestamped_claude3_not_reasoning_capable_heuristic():
         assert cfg._candidate_supports_reasoning(model) is True, (
             f"{model} must remain reasoning-capable"
         )
-

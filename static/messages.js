@@ -1133,7 +1133,7 @@ const _sessionTitleProvisionalBySid = new Map();
 // their canonical command is registered on the backend (for example
 // /reload-mcp). Keep this intentionally narrow and include underscore variants
 // observed by users so typing either form still routes through executeAgentCommand.
-const _AGENT_COMMANDS_RUN_ON_WEBUI = new Set(['reload-mcp', 'reload_mcp', 'reload-skills', 'reload_skills', 'codex-runtime', 'codex_runtime', 'credits']);
+const _AGENT_COMMANDS_RUN_ON_WEBUI = new Set(['reload-mcp', 'reload_mcp', 'reload-skills', 'reload_skills', 'codex-runtime', 'codex_runtime', 'credits', 'account']);
 
 function _clearStaleBusyStateBeforeSend({compressionRunning=false}={}){
   if(!S||!S.busy||compressionRunning) return false;
@@ -1297,40 +1297,79 @@ function _restoreComposerDraftAfterFailedSend(draftText, filesSnapshot, sid, cle
 }
 
 async function send(){
+  const options=arguments[0]||{};
+  const queuedMessage=options&&options.queuedMessage&&typeof options.queuedMessage==='object'
+    ? options.queuedMessage
+    : null;
+  const queueDrain=!!(options&&options.queueDrain&&queuedMessage);
   // Static guards expect _defaultMessageMode to stay near send() while the actual
   // read remains in the S.busy branch below.
   // _defaultMessageMode
+  // _busyInputMode
+  // Selected chat-text context is stored outside the textarea; flush it before
+  // interactive sends. Queue/agent-continuation payloads already own an
+  // immutable context snapshot and must never consume the visible composer.
+  if(!queueDrain) _flushSelectionBlocksToComposer();
+  if(!queueDrain&&typeof window._syncPendingContextItemsFromComposer==='function')window._syncPendingContextItemsFromComposer();
   // Reject concurrent invocations early — before any await yields control.
   // If a send is already in-flight (e.g. queue drain), re-queue the message
   // instead of silently dropping it.
   if (_sendInProgress) {
+    if(queueDrain){
+      const _queueSid=String(options.queueSessionId||_sendInProgressSid||(S.session&&S.session.session_id)||'');
+      if(_queueSid&&typeof queueSessionMessage==='function'){
+        if(typeof restoreShiftedQueuedSessionMessage==='function') restoreShiftedQueuedSessionMessage(_queueSid,queuedMessage);
+        else queueSessionMessage(_queueSid,queuedMessage);
+        if(typeof updateQueueBadge==='function') updateQueueBadge(_queueSid);
+      }
+      return;
+    }
     const _text=_composerTextWithPendingSelections().trim();
+    const _contextItems=Array.isArray(S.pendingContextItems)?[...S.pendingContextItems]:[];
+    const _browserContextParts=typeof window._composerBrowserContextPartsForSend==='function'?window._composerBrowserContextPartsForSend():[];
     // Use the in-flight session's sid, not the currently viewed session,
     // so the queued message goes to the chat that owns the active stream.
     const _targetSid=_sendInProgressSid||(S.session&&S.session.session_id);
-    if(_text && _targetSid){
+    if((_text||_contextItems.length) && _targetSid){
       const _modelState=_chatPayloadModelState();
-      queueSessionMessage(_targetSid,{text:_text,files:[...S.pendingFiles],model:_modelState.model,model_provider:_modelState.model_provider,profile:S.activeProfile||'default'});
+      const _queuedText=_text||'Please inspect the selected Browser Workbench element.';
+      queueSessionMessage(_targetSid,{text:_queuedText,files:[...S.pendingFiles],context_items:_contextItems,browser_context_parts:_browserContextParts,parts:_browserContextParts,model:_modelState.model,model_provider:_modelState.model_provider,profile:S.activeProfile||'default'});
       _clearComposerAfterQueuedSelectionSend();
       if(_targetSid&&typeof _clearComposerDraft==='function'&&_targetSid!==(S.session&&S.session.session_id)) _clearComposerDraft(_targetSid,_text,S.pendingFiles?[...S.pendingFiles]:[]);
-      S.pendingFiles=[];renderTray();
+      S.pendingFiles=[];S.pendingContextItems=[];renderTray();
       updateQueueBadge(_targetSid);
-      showToast(`Queued: "${_text.slice(0,40)}${_text.length>40?'…':''}"`,2000);
+      // cancelStream remains in the busy interrupt branch below; queue first.
+      showToast(`Queued: "${_queuedText.slice(0,40)}${_queuedText.length>40?'…':''}"`,2000);
     }
     return;
   }
   _sendInProgress = true;
   try{
-  const options=arguments[0]||{};
-  const literalSlash=!!(options&&options.literalSlash);
-  let text=$('msg').value.trim();
-  if(!text&&!S.pendingFiles.length&&!_pendingSelections.length){_sendInProgress=false;_sendInProgressSid=null;return;}
+  const literalSlash=queueDrain||!!(options&&options.literalSlash);
+  let text=queueDrain?String(queuedMessage.text||'').trim():_composerTextWithPendingSelections().trim();
+  const outgoingContextItems=queueDrain
+    ? (Array.isArray(queuedMessage.context_items)?[...queuedMessage.context_items]:[])
+    : (Array.isArray(S.pendingContextItems)?[...S.pendingContextItems]:[]);
+  let outgoingBrowserContextParts=queueDrain
+    ? (Array.isArray(queuedMessage.browser_context_parts)
+      ? [...queuedMessage.browser_context_parts]
+      : (Array.isArray(queuedMessage.parts)?[...queuedMessage.parts]:[]))
+    : (typeof window._composerBrowserContextPartsForSend==='function'?window._composerBrowserContextPartsForSend():[]);
+  const outgoingPendingFiles=queueDrain
+    ? (Array.isArray(queuedMessage.files)?[...queuedMessage.files]:[])
+    : (Array.isArray(S.pendingFiles)?[...S.pendingFiles]:[]);
+  if(!text&&!outgoingPendingFiles.length&&!_pendingSelections.length){
+    if(!outgoingContextItems.length){_sendInProgress=false;_sendInProgressSid=null;return;}
+  }
   // Don't send while an inline message edit is active
-  if(document.querySelector('.msg-edit-area')){_sendInProgress=false;_sendInProgressSid=null;return;}
-  _flushSelectionBlocksToComposer();
-  text=$('msg').value.trim();
-  if(!text&&!S.pendingFiles.length){_sendInProgress=false;_sendInProgressSid=null;return;}
-  if(typeof shouldInterceptCompressionRecoveryContinuation==='function'&&shouldInterceptCompressionRecoveryContinuation(text,S.pendingFiles)){
+  if(!queueDrain&&document.querySelector('.msg-edit-area')){_sendInProgress=false;_sendInProgressSid=null;return;}
+  if(!queueDrain){
+    _flushSelectionBlocksToComposer();
+    text=$('msg').value.trim();
+  }
+  if(!text&&outgoingContextItems.length)text='Please inspect the selected Browser Workbench element.';
+  if(!text&&!outgoingPendingFiles.length&&!outgoingContextItems.length){_sendInProgress=false;_sendInProgressSid=null;return;}
+  if(typeof shouldInterceptCompressionRecoveryContinuation==='function'&&shouldInterceptCompressionRecoveryContinuation(text,outgoingPendingFiles)){
     if(typeof showCompressionRecoveryContinuationHint==='function') showCompressionRecoveryContinuationHint();
     _sendInProgress=false;_sendInProgressSid=null;
     return;
@@ -1343,7 +1382,12 @@ async function send(){
   // staged files back so the user can re-send without retyping. Captured as an
   // immutable snapshot so later reassignments to `text` don't leak into it.
   const _failedSendDraftText=text;
-  const _failedSendFilesSnapshot=Array.isArray(S.pendingFiles)?[...S.pendingFiles]:[];
+  const _failedSendFilesSnapshot=[...outgoingPendingFiles];
+  if(text&&outgoingBrowserContextParts.length&&!outgoingBrowserContextParts.some(part=>part&&part.type==='text'&&String(part.content||part.text||'').trim())){
+    outgoingBrowserContextParts=[{type:'text',content:text+' '},...outgoingBrowserContextParts];
+  }
+  const outgoingParts=outgoingBrowserContextParts.length?[...outgoingBrowserContextParts]:[];
+  try{console.log("submit.parts", outgoingParts);}catch(_){ }
 
   // Dismiss handoff hint when user sends a message (resets seen_at).
   if(S.session&&S.session.session_id&&typeof _dismissHandoffHint==='function'){
@@ -1352,9 +1396,18 @@ async function send(){
 
   const compressionRunning=typeof isCompressionUiRunning==='function'&&isCompressionUiRunning();
   _clearStaleBusyStateBeforeSend({compressionRunning});
+  if(queueDrain&&(S.busy||compressionRunning)){
+    const _queueSid=String(options.queueSessionId||(S.session&&S.session.session_id)||'');
+    if(_queueSid&&typeof queueSessionMessage==='function'){
+      if(typeof restoreShiftedQueuedSessionMessage==='function') restoreShiftedQueuedSessionMessage(_queueSid,queuedMessage);
+      else queueSessionMessage(_queueSid,queuedMessage);
+      if(typeof updateQueueBadge==='function') updateQueueBadge(_queueSid);
+    }
+    return;
+  }
   // If busy or a manual compression is still running, handle based on default_message_mode
   if(S.busy||compressionRunning){
-    if(text||S.pendingFiles.length){
+    if(text||S.pendingFiles.length||outgoingContextItems.length){
       if(!S.session){await newSession();await renderSessionList();}
       // Busy-control slash commands must be intercepted HERE, before the
       // defaultMessageMode routing block, so the user can always type /steer, /interrupt,
@@ -1369,7 +1422,7 @@ async function send(){
           const _bc=COMMANDS.find(c=>c.name===_pc.name);
           if(_bc){
             $('msg').value='';autoResize();
-            await _bc.fn(_pc.args);
+            await _bc.fn(_pc.args,{contextItems:outgoingContextItems,browserContextParts:outgoingBrowserContextParts,parts:outgoingParts});
             return;
           }
         }
@@ -1378,22 +1431,22 @@ async function send(){
       if(defaultMessageMode==='steer'&&S.activeStreamId&&typeof _trySteer==='function'){
         // Real steer: clear the input first so the user gets immediate
         // feedback, then ship the steer payload via /api/chat/steer.
-        // _trySteer captures the owner session/files before awaiting uploads,
+        // _trySteer uploads with clearPending=false and captures the owner
+        // session/files before awaiting uploads,
         // restores/persists the draft on failure, and clears the owner draft
         // only after /api/chat/steer accepts.
         $('msg').value='';autoResize();
-        // Do NOT clear pendingFiles yet — _trySteer uploads with clearPending=false,
-        // and a failed steer must keep staged files available for the user's next explicit action.
-        await _trySteer(text, /*explicitSteer=*/false);
-        // _trySteer clears staged files only after /api/chat/steer accepts, and
-        // only when the visible session still matches the captured owner sid.
+        // Do NOT clear pending files/context yet — a failed steer restores the
+        // draft and must keep staged attachments/context available for the
+        // user's next explicit Queue/Interrupt action.
+        await _trySteer(text, /*explicitSteer=*/false,{contextItems:outgoingContextItems,browserContextParts:outgoingBrowserContextParts,parts:outgoingParts});
       } else if(defaultMessageMode==='interrupt'){
         // Queue the message, then cancel so drain re-sends it.
         const _modelState=_chatPayloadModelState();
-        queueSessionMessage(S.session.session_id,{text,files:[...S.pendingFiles],model:_modelState.model,model_provider:_modelState.model_provider,profile:S.activeProfile||'default'});
+        queueSessionMessage(S.session.session_id,{text,files:[...S.pendingFiles],context_items:outgoingContextItems,browser_context_parts:outgoingBrowserContextParts,parts:outgoingParts,model:_modelState.model,model_provider:_modelState.model_provider,profile:S.activeProfile||'default'});
         updateQueueBadge(S.session.session_id);
         _clearComposerAfterQueuedSelectionSend(S.session&&S.session.session_id);
-        S.pendingFiles=[];renderTray();
+        S.pendingFiles=[];S.pendingContextItems=[];renderTray();
         if(S.activeStreamId&&typeof cancelStream==='function'){
           showToast(t('busy_interrupt_confirm'),2000);
           await cancelStream('busy-interrupt');
@@ -1404,9 +1457,9 @@ async function send(){
         // Default: queue mode (current behavior). Also the fallback for
         // 'steer' mode when no stream is active or _trySteer is unavailable.
         const _modelState=_chatPayloadModelState();
-        queueSessionMessage(S.session.session_id,{text,files:[...S.pendingFiles],model:_modelState.model,model_provider:_modelState.model_provider,profile:S.activeProfile||'default'});
+        queueSessionMessage(S.session.session_id,{text,files:[...S.pendingFiles],context_items:outgoingContextItems,browser_context_parts:outgoingBrowserContextParts,parts:outgoingParts,model:_modelState.model,model_provider:_modelState.model_provider,profile:S.activeProfile||'default'});
         _clearComposerAfterQueuedSelectionSend(S.session&&S.session.session_id);
-        S.pendingFiles=[];renderTray();
+        S.pendingFiles=[];S.pendingContextItems=[];renderTray();
         updateQueueBadge(S.session.session_id);
         showToast(`Queued: "${text.slice(0,40)}${text.length>40?'…':''}"`,2000);
       }
@@ -1425,7 +1478,7 @@ async function send(){
   // their assistant response synchronously.  If we pushed AFTER, S.messages
   // would be [assistant, user] and the chat would show the response above
   // the user's own input — reverse chronological order (#840 ordering bug).
-  if(text.startsWith('/')&&!S.pendingFiles.length&&!literalSlash){
+  if(text.startsWith('/')&&!outgoingPendingFiles.length&&!outgoingContextItems.length&&!literalSlash){
     const _parsedCmd=parseCommand(text);
     const _cmd=_parsedCmd?COMMANDS.find(c=>c.name===_parsedCmd.name):null;
     if(_cmd){
@@ -1562,6 +1615,14 @@ async function send(){
 
   const activeSid=S.session.session_id;
   _sendInProgressSid=activeSid;
+  // One identity follows this exact user turn from queue promotion through the
+  // optimistic row, pending session metadata, and the confirmed transcript.
+  // It is deliberately independent of text so repeated intentional messages
+  // remain separate turns.
+  const clientMessageId=queueDrain
+    ? String(queuedMessage.client_message_id||'').trim()||_newClientMessageId(activeSid,'queue')
+    : _newClientMessageId(activeSid,'message');
+  if(queueDrain&&!queuedMessage.client_message_id) queuedMessage.client_message_id=clientMessageId;
 
   // Salvage of #4750 (@harryazj): capture the composer text and clear the
   // textarea NOW — immediately after capture and BEFORE the uploadPendingFiles()
@@ -1574,8 +1635,8 @@ async function send(){
   // _submittedDraftTextForClear is the sole authority for the send-time draft
   // signature from here down; no code path below re-reads $('msg').value on the
   // happy path.
-  const _submittedDraftTextForClear=$('msg').value||'';
-  $('msg').value='';autoResize();
+  const _submittedDraftTextForClear=queueDrain?'':($('msg').value||'');
+  if(!queueDrain){$('msg').value='';autoResize();}
 
   // #5912 gate CORE fix: snapshot the pending files that belong to THIS send
   // BEFORE the await, and upload exactly that snapshot. Otherwise a re-entrant /
@@ -1583,17 +1644,19 @@ async function send(){
   // S.pendingFiles and later re-uploads the first send's attachment. Detach the
   // snapshot from S.pendingFiles now so files staged AFTER this point belong to
   // the next send only.
-  const _submittedFiles=[...(S.pendingFiles||[])];
+  const _submittedFiles=[...outgoingPendingFiles];
   const _submittedDraftFilesForClear=[..._submittedFiles];
-  S.pendingFiles=[];
-  if(typeof renderTray==='function')renderTray();
+  if(!queueDrain){
+    S.pendingFiles=[];
+    if(typeof renderTray==='function')renderTray();
+  }
 
   // #5912 gate SILENT fix: clear the PERSISTED draft here — alongside the
   // textarea clear, BEFORE any await — so a new draft typed during the upload
   // window is not clobbered by a delayed text:'' post. Keep the promise so the
   // #5472 failed-send restore can chain its re-persist after this clear resolves.
   let _composerDraftClearPromise=null;
-  if (activeSid && typeof _clearComposerDraft === 'function') _composerDraftClearPromise=_clearComposerDraft(activeSid,_submittedDraftTextForClear,_submittedDraftFilesForClear);
+  if (!queueDrain && activeSid && typeof _clearComposerDraft === 'function') _composerDraftClearPromise=_clearComposerDraft(activeSid,_submittedDraftTextForClear,_submittedDraftFilesForClear);
 
   setComposerStatus(_submittedFiles.length?'Uploading…':'');
   let uploaded=[];
@@ -1638,13 +1701,20 @@ async function send(){
   // upload window. _composerDraftClearPromise / _submittedDraftFilesForClear are
   // set there; nothing to re-declare here.
   const displayText=_slashDisplayTextOverride||text||(uploaded.length?`Uploaded: ${uploadedNames.join(', ')}`:'(file upload)');
-  const userMsg={role:'user',content:displayText,attachments:uploaded.length?uploadedNames:undefined,_ts:Date.now()/1000,_pending:true};
+  if(!queueDrain){S.pendingContextItems=[];renderTray();}
+  const userMsg={role:'user',content:displayText,attachments:uploaded.length?uploadedNames:undefined,context_items:outgoingContextItems.length?outgoingContextItems:undefined,browser_context_parts:outgoingBrowserContextParts.length?outgoingBrowserContextParts:undefined,parts:outgoingParts.length?outgoingParts:undefined,client_message_id:clientMessageId,_ts:Date.now()/1000,_pending:true};
+  try{console.log("persisted.parts", userMsg.parts||[]);}catch(_){ }
   S.toolCalls=[];  // clear tool calls from previous turn
   clearLiveToolCards();  // clear any leftover live cards from last turn
   let optimisticMessages;
   try{
+    // A send() call owns a brand-new turn. Always seed a fresh optimistic
+    // timestamp instead of reusing a stale completed turn's pending_started_at;
+    // the /api/chat/start response replaces it with the authoritative server
+    // timestamp a moment later.
+    if(S.session) S.session.pending_started_at=Date.now()/1000;
     S.messages.push(userMsg);renderMessages();setBusy(true);
-    if(S.session&&!S.session.pending_started_at) S.session.pending_started_at=Date.now()/1000;
+    if(typeof showThreadElapsedTimer==='function') showThreadElapsedTimer(activeSid,S.session&&S.session.pending_started_at);
     if(typeof ensureLiveWorklogShell==='function') ensureLiveWorklogShell();
     else appendThinking('',{pending:true});
     // First optimistic pass: make the local user turn visible before /api/chat/start
@@ -1706,6 +1776,7 @@ async function send(){
     INFLIGHT[activeSid]={messages:optimisticMessages,uploaded:uploadedNames,toolCalls:[]};
     try{setBusy(true);}catch(_){S.busy=true;}
     if(S.session&&!S.session.pending_started_at) S.session.pending_started_at=Date.now()/1000;
+    if(typeof showThreadElapsedTimer==='function') showThreadElapsedTimer(activeSid,S.session&&S.session.pending_started_at);
     S.activeStreamId=null;
     if(typeof ensureLiveWorklogShell==='function') ensureLiveWorklogShell();
   }
@@ -1754,6 +1825,10 @@ async function send(){
       model_provider:_modelState.model_provider,
       profile:S.activeProfile||S.session.profile||'default',
       explicit_model_pick:_explicitPick||undefined,
+      client_message_id:clientMessageId,
+      context_items:outgoingContextItems.length?outgoingContextItems:undefined,
+      browser_context_parts:outgoingBrowserContextParts.length?outgoingBrowserContextParts:undefined,
+      parts:outgoingParts.length?outgoingParts:undefined,
       attachments:uploaded.length?uploaded:undefined,
       moa_config:_pendingMoaConfig?true:undefined
     })});
@@ -1796,7 +1871,7 @@ async function send(){
       stopClarifyPolling();
       // Keep the user's attempted turn by queueing it for after the current run.
       const _retryModelState=_chatPayloadModelState();
-      queueSessionMessage(activeSid,{text:msgText,files:[],model:_retryModelState.model,model_provider:_retryModelState.model_provider,profile:S.activeProfile||'default'});
+      queueSessionMessage(activeSid,{text:msgText,files:[],context_items:outgoingContextItems,browser_context_parts:outgoingBrowserContextParts,parts:outgoingParts,model:_retryModelState.model,model_provider:_retryModelState.model_provider,profile:S.activeProfile||'default'});
       updateQueueBadge(activeSid);
       showToast('Current session is still running. Reconnected and queued your message.',2600);
       try{
@@ -1820,7 +1895,7 @@ async function send(){
     // composer text + attachments (cleared at send time) would otherwise be
     // lost. Put back the ORIGINAL captured draft (not the mutated /moa/bundle
     // payload) and re-stage files so the user can re-send without retyping.
-    _restoreComposerDraftAfterFailedSend(_failedSendDraftText, _failedSendFilesSnapshot, activeSid, _composerDraftClearPromise);
+    if(!queueDrain) _restoreComposerDraftAfterFailedSend(_failedSendDraftText, _failedSendFilesSnapshot, activeSid, _composerDraftClearPromise);
     if(typeof clearOptimisticSessionStreaming==='function') clearOptimisticSessionStreaming(activeSid);
     // Reconcile with server truth after immediately clearing the optimistic spinner.
     if(typeof renderSessionList==='function') void renderSessionList();
@@ -1860,6 +1935,11 @@ async function send(){
 
     if(S.session&&typeof startData.pending_started_at==='number'){
       S.session.pending_started_at=startData.pending_started_at;
+    }
+    if(S.session&&S.session.session_id===activeSid){
+      S.session.pending_client_message_id=String(startData.client_message_id||clientMessageId||'').trim()||null;
+      S.session.pending_context_items=outgoingContextItems.length?[...outgoingContextItems]:[];
+      S.session.pending_browser_context_parts=outgoingBrowserContextParts.length?[...outgoingBrowserContextParts]:[];
     }
     if(typeof ensureLiveWorklogShell==='function') ensureLiveWorklogShell();
     else if(typeof appendThinking==='function') appendThinking('',{pending:true});
@@ -1950,11 +2030,18 @@ function _shouldForceCompletionNotification(sid, streamId){
   return wasHidden||wasBackgrounded;
 }
 
-function closeLiveStream(sessionId, streamId, source){
+function closeLiveStream(sessionId, streamId, source, options){
+  options=options||{};
   const live=LIVE_STREAMS[sessionId];
   if(!live) return;
   if(streamId&&live.streamId!==streamId) return;
   if(source&&live.source!==source) return;
+  // The stream closure owns a quiet-connection watchdog. Dispose it with the
+  // same identity guard as the EventSource so a stale/session-switch teardown
+  // cannot leave a timer probing or reconnecting a stream it no longer owns.
+  if(typeof live.dispose==='function'){
+    try{live.dispose();}catch(_){}
+  }
   // Snapshot the current live-turn DOM BEFORE tearing the stream down. The
   // per-event snapshot (snapshotLiveTurn) only fires on content/tool_complete
   // SSE events, so switching away during a quiet window (mid tool-exec, silent
@@ -1963,7 +2050,9 @@ function closeLiveStream(sessionId, streamId, source){
   // rebuilds with an EMPTY appendThinking(), permanently losing the streamed
   // thinking/tool content (only the elapsed clock survives). Capturing here
   // guarantees switch-back restores the exact state shown at switch-away. (#3668)
-  if(typeof snapshotLiveTurnHtmlForSession==='function') snapshotLiveTurnHtmlForSession(sessionId);
+  if(!options.skipDomSnapshot&&typeof snapshotLiveTurnHtmlForSession==='function'){
+    snapshotLiveTurnHtmlForSession(sessionId);
+  }
   // Stop the live footer timer/status for the pane that is being detached; the
   // reattach path will rebuild it from INFLIGHT/server state if the user returns.
   if(typeof _clearLiveRunStatusTimer==='function') _clearLiveRunStatusTimer(sessionId);
@@ -2005,14 +2094,78 @@ function closeLiveStream(sessionId, streamId, source){
   }
 }
 
-function closeOtherLiveStreams(activeSid){
+function closeOtherLiveStreams(activeSid, options={}){
   // Keep the live token SSE connection scoped to the conversation pane the user
   // is actually viewing. Background sessions still show running/finished state
   // through the session list and can reattach when selected, but they should not
   // keep one EventSource each and exhaust the browser connection pool (#2313).
   for(const sid of Object.keys(LIVE_STREAMS)){
-    if(sid!==activeSid) closeLiveStream(sid);
+    if(sid!==activeSid){
+      if(options.skipDomSnapshot) closeLiveStream(sid,null,null,options);
+      else closeLiveStream(sid);
+    }
   }
+}
+
+const _TERMINAL_SESSION_VISIBLE_MESSAGE_LIMIT=30;
+
+function _streamStatusJournalCursor(status){
+  const raw=status&&status.journal&&status.journal.last_seq;
+  const seq=Number(raw);
+  return Number.isFinite(seq)&&seq>=0?seq:null;
+}
+
+function _shouldRecoverSilentLiveStream({
+  status,
+  localSeq,
+  quietMs,
+  quietThresholdMs,
+  isVisibleOwner,
+}={}){
+  if(!isVisibleOwner) return false;
+  if(!Number.isFinite(Number(quietMs))||Number(quietMs)<Number(quietThresholdMs||0)) return false;
+  if(!status||(!status.active&&!status.replay_available)) return false;
+  const serverSeq=_streamStatusJournalCursor(status);
+  const clientSeq=Math.max(0,Number(localSeq)||0);
+  return serverSeq!==null&&serverSeq>clientSeq;
+}
+
+function _terminalSessionDisplayWindow(session, visibleLimit=_TERMINAL_SESSION_VISIBLE_MESSAGE_LIMIT){
+  if(!session||typeof session!=='object'||!Array.isArray(session.messages)) return session;
+  const messages=session.messages;
+  const limit=Math.max(1,Number(visibleLimit)||_TERMINAL_SESSION_VISIBLE_MESSAGE_LIMIT);
+  let renderableCount=0;
+  let start=0;
+  for(let idx=messages.length-1;idx>=0;idx--){
+    const message=messages[idx];
+    const role=String(message&&message.role||'').trim().toLowerCase();
+    if(!role||role==='tool') continue;
+    renderableCount++;
+    if(renderableCount>=limit){start=idx;break;}
+  }
+  if(renderableCount<limit||start<=0) return session;
+  const windowMessages=messages.slice(start);
+  const baseOffset=Math.max(0,Number(session._messages_offset)||0);
+  const fullMessageCount=Math.max(
+    messages.length,
+    Number(session.message_count)||0,
+  );
+  const calls=Array.isArray(session.tool_calls)?session.tool_calls:[];
+  const end=start+windowMessages.length;
+  const windowToolCalls=calls.flatMap(toolCall=>{
+    if(!toolCall||typeof toolCall!=='object') return [];
+    const assistantIdx=toolCall.assistant_msg_idx;
+    if(!Number.isInteger(assistantIdx)||assistantIdx<start||assistantIdx>=end) return [];
+    return [{...toolCall,assistant_msg_idx:assistantIdx-start}];
+  });
+  return {
+    ...session,
+    messages:windowMessages,
+    message_count:fullMessageCount,
+    tool_calls:windowToolCalls,
+    _messages_truncated:true,
+    _messages_offset:baseOffset+start,
+  };
 }
 
 function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
@@ -2068,6 +2221,11 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       const _startedAt=(S.session&&S.session.pending_started_at)||Date.now()/1000;
       showLiveRunStatus(activeSid,{startedAt:_startedAt});
     }
+    // The transport can remain OPEN while a same-session metadata refresh has
+    // replaced #liveAssistantTurn. In that case the old stream closure still
+    // points at detached assistantRow/assistantBody nodes. Rebind the existing
+    // closure instead of returning with a healthy transport and a silent view.
+    if(reconnecting&&typeof existingLive.rebindView==='function') existingLive.rebindView();
     return;
   }
   closeOtherLiveStreams(activeSid);
@@ -2150,8 +2308,26 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
   function _isActiveSession(){
     return !!(S.session&&S.session.session_id===activeSid);
   }
+  function _claimVisibleActiveStreamOwnership(){
+    if(!_isActiveSession()) return false;
+    if(S.activeStreamId===streamId) return true;
+    // A concrete different owner always wins. This recovery is only for the
+    // null/temporarily-cleared owner produced by a same-session DOM refresh.
+    if(S.activeStreamId&&S.activeStreamId!==streamId) return false;
+    const declaredStreamId=String((S.session&&S.session.active_stream_id)||'');
+    if(declaredStreamId&&declaredStreamId!==String(streamId)) return false;
+    const live=LIVE_STREAMS[activeSid];
+    if(!live||String(live.streamId||'')!==String(streamId)) return false;
+    if(live.source&&typeof EventSource!=='undefined'&&live.source.readyState===EventSource.CLOSED) return false;
+    S.activeStreamId=streamId;
+    S.session.active_stream_id=streamId;
+    S.busy=true;
+    if(typeof updateSendBtn==='function') updateSendBtn();
+    if(typeof syncTopbar==='function') syncTopbar();
+    return true;
+  }
   function _ownsActiveStreamOrBackground(){
-    return !_isActiveSession() || S.activeStreamId===streamId;
+    return !_isActiveSession() || _claimVisibleActiveStreamOwnership();
   }
   function _bailOutOfTerminalEventsFromStaleStream(source){
     if(_ownsActiveStreamOrBackground()) return false;
@@ -2432,13 +2608,34 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     // state stays compact and the thinking card has a proper source field.
     const split=_splitThinkFromContent(assistantText, reasoningText);
     if(assistantIdx>=0){
-      inflight.messages[assistantIdx].content=split.content;
-      inflight.messages[assistantIdx].reasoning=split.reasoning||undefined;
-      inflight.messages[assistantIdx]._ts=inflight.messages[assistantIdx]._ts||ts;
+      // Replace the live message reference and bump an explicit version. Do not
+      // clone the entire transcript array for every token: long sessions can
+      // contain hundreds of messages and that would add avoidable streaming CPU.
+      const previous=inflight.messages[assistantIdx]||{};
+      inflight.messages[assistantIdx]={
+        ...previous,
+        content:split.content,
+        reasoning:split.reasoning||undefined,
+        _ts:previous._ts||ts,
+      };
+      _streamContentVersion++;
+      inflight.streamContentVersion=_streamContentVersion;
+      _streamDiagnostic('store-update-committed',{
+        stored_message_index:assistantIdx,
+        stored_content_length:String(split.content||'').length,
+        stored_reasoning_length:String(split.reasoning||'').length,
+      });
       _throttledPersist();
       return;
     }
     inflight.messages.push({role:'assistant',content:split.content,reasoning:split.reasoning||undefined,_live:true,_ts:ts});
+    _streamContentVersion++;
+    inflight.streamContentVersion=_streamContentVersion;
+    _streamDiagnostic('store-update-committed',{
+      stored_message_index:inflight.messages.length-1,
+      stored_content_length:String(split.content||'').length,
+      stored_reasoning_length:String(split.reasoning||'').length,
+    });
     _throttledPersist();
   }
   function recordActivityBoundary(){
@@ -2466,7 +2663,8 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     if(existing) existing.textEnd=textEnd;
     else inflight.activityBurstAnchors.push({id:_currentActivityBurstId,textEnd});
     if(assistantRow) assistantRow.setAttribute('data-activity-burst-id',String(_currentActivityBurstId));
-    persistInflightState();
+    if(reconnecting) _throttledPersist();
+    else persistInflightState();
   }
   function ensureAssistantRow(force=false){
     if(!_isActiveSession()) return;
@@ -2589,6 +2787,29 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
   // the final answer or the response to render twice.
   let _streamFinalized=false;
   let _pendingRafHandle=null;
+  let _pendingRenderDelayHandle=null;
+  let _pendingRenderWatchdogHandle=null;
+  let _renderScheduleGeneration=0;
+  let _streamContentVersion=Number((INFLIGHT[activeSid]&&INFLIGHT[activeSid].streamContentVersion)||0)||0;
+  function _streamDiagnostic(event,details){
+    if(typeof _streamUiDiagnostic!=='function') return;
+    _streamUiDiagnostic('live-stream',event,{
+      session_id:activeSid,
+      stream_id:streamId,
+      content_version:_streamContentVersion,
+      assistant_length:String(assistantText||'').length,
+      reasoning_length:String(reasoningText||'').length,
+      ...(details&&typeof details==='object'?details:{}),
+    });
+  }
+  function _streamEventDiagnostic(eventType,event,source){
+    _streamDiagnostic('stream-event-received',{
+      event_type:eventType,
+      event_id:event&&event.lastEventId||'',
+      ready_state:source&&source.readyState,
+      payload_length:String(event&&event.data||'').length,
+    });
+  }
   let _streamFadeVisibleText='';
   let _streamFadeLastTickMs=0;
   let _streamFadeWordCarry=0;
@@ -2613,6 +2834,153 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
   let _lastRunJournalEventId=reconnecting
     ? String((INFLIGHT[activeSid]&&INFLIGHT[activeSid].lastRunJournalEventId)||'')
     : '';
+  // Chromium can occasionally leave a long-lived EventSource reporting OPEN
+  // while no more frames reach the renderer. The server run journal remains
+  // authoritative in that state. Probe only after a quiet window and reconnect
+  // only when its cursor is provably ahead, so normal silent model/tool work
+  // never causes speculative reconnects.
+  const _STREAM_LIVENESS_QUIET_MS=12000;
+  const _STREAM_LIVENESS_POLL_MS=8000;
+  let _lastRunJournalEventAt=typeof performance!=='undefined'&&typeof performance.now==='function'
+    ? performance.now()
+    : Date.now();
+  let _streamLivenessTimer=null;
+  let _streamLivenessProbePending=false;
+  let _streamLivenessGeneration=0;
+  function _streamLivenessNow(){
+    return typeof performance!=='undefined'&&typeof performance.now==='function'
+      ? performance.now()
+      : Date.now();
+  }
+  function _noteRunJournalActivity(){
+    _lastRunJournalEventAt=_streamLivenessNow();
+  }
+  function _clearStreamLivenessWatchdog(){
+    _streamLivenessGeneration+=1;
+    if(_streamLivenessTimer!==null){
+      clearTimeout(_streamLivenessTimer);
+      _streamLivenessTimer=null;
+    }
+    _streamLivenessProbePending=false;
+  }
+  function _scheduleStreamLivenessProbe(source,delayMs=_STREAM_LIVENESS_POLL_MS){
+    if(_terminalStateReached||_streamFinalized) return;
+    if(_streamLivenessTimer!==null) clearTimeout(_streamLivenessTimer);
+    const generation=_streamLivenessGeneration;
+    _streamLivenessTimer=setTimeout(()=>{
+      _streamLivenessTimer=null;
+      void _probeSilentOpenStream(source,generation);
+    },Math.max(250,Number(delayMs)||_STREAM_LIVENESS_POLL_MS));
+  }
+  function _startStreamLivenessWatchdog(source){
+    _clearStreamLivenessWatchdog();
+    if(_terminalStateReached||_streamFinalized) return;
+    _noteRunJournalActivity();
+    _scheduleStreamLivenessProbe(source);
+  }
+  async function _probeSilentOpenStream(source,generation){
+    if(generation!==_streamLivenessGeneration||_terminalStateReached||_streamFinalized) return;
+    const live=LIVE_STREAMS[activeSid];
+    const sourceIsOpen=!!(
+      source&&
+      (typeof EventSource==='undefined'||source.readyState===EventSource.OPEN)
+    );
+    const documentVisible=!(
+      typeof document!=='undefined'&&
+      (document.hidden||document.visibilityState==='hidden'||document.wasDiscarded===true)
+    );
+    const isVisibleOwner=!!(
+      documentVisible&&
+      sourceIsOpen&&
+      _isSessionCurrentPane(activeSid)&&
+      S.activeStreamId===streamId&&
+      live&&live.streamId===streamId&&live.source===source
+    );
+    if(!isVisibleOwner){
+      // A hidden tab or a pane that no longer owns this source must not issue
+      // recovery traffic. Keep a cheap timer only while this closure still owns
+      // the registered source so it can resume after visibility/focus returns.
+      if(live&&live.streamId===streamId&&live.source===source){
+        _scheduleStreamLivenessProbe(source);
+      }
+      return;
+    }
+    const quietMs=Math.max(0,_streamLivenessNow()-_lastRunJournalEventAt);
+    if(quietMs<_STREAM_LIVENESS_QUIET_MS){
+      _scheduleStreamLivenessProbe(
+        source,
+        Math.max(_STREAM_LIVENESS_POLL_MS,_STREAM_LIVENESS_QUIET_MS-quietMs),
+      );
+      return;
+    }
+    if(_streamLivenessProbePending){
+      _scheduleStreamLivenessProbe(source);
+      return;
+    }
+    _streamLivenessProbePending=true;
+    try{
+      const status=await api(
+        `/api/chat/stream/status?stream_id=${encodeURIComponent(streamId)}`,
+        {timeoutMs:5000,timeoutToast:false,retries:0},
+      );
+      const currentLive=LIVE_STREAMS[activeSid];
+      if(
+        generation!==_streamLivenessGeneration||
+        _terminalStateReached||
+        _streamFinalized||
+        !currentLive||
+        currentLive.streamId!==streamId||
+        currentLive.source!==source
+      ) return;
+      const shouldRecover=_shouldRecoverSilentLiveStream({
+        status,
+        localSeq:_lastRunJournalSeq,
+        quietMs,
+        quietThresholdMs:_STREAM_LIVENESS_QUIET_MS,
+        isVisibleOwner,
+      });
+      _streamDiagnostic('silent-open-stream-probe',{
+        quiet_ms:Math.round(quietMs),
+        local_journal_seq:_lastRunJournalSeq,
+        server_journal_seq:_streamStatusJournalCursor(status),
+        server_active:!!(status&&status.active),
+        replay_available:!!(status&&status.replay_available),
+        recovery_required:shouldRecover,
+      });
+      if(shouldRecover){
+        setComposerStatus('Restoring live updates…');
+        _streamDiagnostic('silent-open-stream-recovery',{
+          quiet_ms:Math.round(quietMs),
+          local_journal_seq:_lastRunJournalSeq,
+          server_journal_seq:_streamStatusJournalCursor(status),
+          ready_state:source&&source.readyState,
+        });
+        _wireSSE(new EventSource(new URL(
+          `api/chat/stream?stream_id=${encodeURIComponent(streamId)}${_runJournalReplayParams()}`,
+          document.baseURI||location.href,
+        ).href,{withCredentials:true}));
+        return;
+      }
+    }catch(error){
+      _streamDiagnostic('silent-open-stream-probe-failed',{
+        message:String(error&&error.message||error||'status probe failed'),
+      });
+    }finally{
+      if(generation===_streamLivenessGeneration){
+        _streamLivenessProbePending=false;
+        const currentLive=LIVE_STREAMS[activeSid];
+        if(
+          !_terminalStateReached&&
+          !_streamFinalized&&
+          currentLive&&
+          currentLive.streamId===streamId&&
+          currentLive.source===source
+        ){
+          _scheduleStreamLivenessProbe(source);
+        }
+      }
+    }
+  }
   const _STREAM_FADE_MS=620;
   const _STREAM_FADE_MAX_MS=900;
   const _STREAM_FADE_DONE_MAX_MS=1000;
@@ -2634,18 +3002,37 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
   let _anchorShadowWarned=false;
   let _anchorReasoningFlushed=false;
   let _anchorLocalSeq=0;
+  let _anchorRegistryCleanupTimer=null;
   if(_anchorRegistryMap&&_anchorRegistry) _anchorRegistryMap.set(streamId,_anchorRegistry);
+  function _anchorRegistryStreamIsActive(){
+    if(_terminalStateReached||_streamFinalized) return false;
+    const live=LIVE_STREAMS[activeSid];
+    if(!live||String(live.streamId||'')!==String(streamId)) return false;
+    if(live.source&&typeof EventSource!=='undefined'&&live.source.readyState===EventSource.CLOSED) return false;
+    return true;
+  }
   function _scheduleAnchorRegistryCleanup(delayMs=600000){
     if(!_anchorRegistryMap||!_anchorRegistry) return;
-    setTimeout(()=>{
-      if(_anchorRegistryMap.get(streamId)===_anchorRegistry) _anchorRegistryMap.delete(streamId);
+    // There must be only one lease timer for this closure. Terminal paths may
+    // shorten the lease; replacing the old timer prevents an earlier creation
+    // backstop from deleting a registry that is still serving a long run.
+    if(_anchorRegistryCleanupTimer!==null) clearTimeout(_anchorRegistryCleanupTimer);
+    _anchorRegistryCleanupTimer=setTimeout(()=>{
+      _anchorRegistryCleanupTimer=null;
+      if(_anchorRegistryStreamIsActive()){
+        _streamDiagnostic('anchor-registry-lease-renewed',{delay_ms:delayMs});
+        _scheduleAnchorRegistryCleanup(delayMs);
+        return;
+      }
+      if(_anchorRegistryMap.get(streamId)===_anchorRegistry){
+        _anchorRegistryMap.delete(streamId);
+        _streamDiagnostic('anchor-registry-cleaned');
+      }
     },delayMs);
   }
-  // Backstop: schedule an identity-guarded cleanup at creation so this shadow
-  // registry self-expires no matter which teardown path the stream takes
-  // (incl. external ones like sidebar cancelSessionStream() that bypass the
-  // in-closure SSE handlers). Explicit terminal-path calls above just expire it
-  // sooner; this guarantees window._liveAnchorRegistries can't grow unbounded.
+  // Backstop for teardown paths outside this closure. This is a renewable lease,
+  // not a fixed lifetime: a healthy stream can run for hours without losing the
+  // registry that projects new activity into the currently mounted chat view.
   _scheduleAnchorRegistryCleanup(600000);
   // Applying an event and painting it are separate outcomes. Reasoning uses the
   // optional holder to decide whether a temporary visible fallback is needed.
@@ -2674,7 +3061,11 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
         sourceEvent,
         {session_id:activeSid,stream_id:streamId}
       );
-      const rendered=options&&options.render===false?false:_renderAnchorLiveScene();
+      const rendered=options&&options.render===false
+        ?false
+        :_renderAnchorLiveScene({
+          animateMutationDiffs:sourceEventType==='tool'||sourceEventType==='tool_complete',
+        });
       if(renderOutcome&&typeof renderOutcome==='object') renderOutcome.rendered=rendered;
       return result;
     }catch(err){
@@ -2795,12 +3186,13 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     if(sceneMode==='hide_all_activity') return (hints&&hints.hidden_activity)||'hidden_activity';
     return row&&row.display_hint||'activity_row';
   }
-  function _renderAnchorLiveScene(){
+  function _renderAnchorLiveScene(renderOpts){
     if(!_anchorRegistry||!_isActiveSession()) return false;
     if(typeof window==='undefined'||typeof window._renderLiveAnchorActivitySceneForStream!=='function') return false;
     try{
       return !!window._renderLiveAnchorActivitySceneForStream(streamId, activeSid, {
         mode:_anchorSceneActiveMode(),
+        ...(renderOpts||{}),
       });
     }catch(err){
       if(!_anchorShadowWarned&&typeof console!=='undefined'&&console.warn){
@@ -3010,6 +3402,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     const command=_anchorSceneStringPayload(tool&&(tool.command||tool.raw_command||tool.original_command||tool.display_command))||_anchorSceneStringPayload(args&&(args.cmd||args.command));
     const preview=_anchorSceneStringPayload(tool&&(tool.preview||tool.summary));
     const snippet=_anchorSceneStringPayload(tool&&(tool.snippet||tool.result||tool.output));
+    const mutationPreview=_anchorSceneSafePayload(tool&&(tool.mutation_preview||tool.mutationPreview))??null;
     const isError=!!(tool&&(tool.is_error||tool.error));
     row.row_id=tid?`settled:${activeSid||'session'}:${streamId||'stream'}:tool:${tid}`:row.row_id;
     row.tool_call_id=tid||null;
@@ -3028,6 +3421,17 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       started_at:tool&&tool.started_at!==undefined?tool.started_at:null,
       signature:[name,tid||'',JSON.stringify(args||{})].join('|'),
     };
+    if(mutationPreview){
+      row.tool.mutation_preview=mutationPreview;
+      row.tool.mutationPreview=mutationPreview;
+      row.ui_part={
+        type:'mutation_timeline_event',
+        renderer:'assistant_diff_card',
+        tool_call_id:tid||null,
+        tool_name:name,
+        mutation_preview:mutationPreview,
+      };
+    }
     row.payload={
       ...row.payload,
       tid:tid||undefined,
@@ -3040,6 +3444,9 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       is_error:isError,
       duration:tool&&tool.duration!==undefined?tool.duration:undefined,
       started_at:tool&&tool.started_at!==undefined?tool.started_at:undefined,
+      mutation_preview:mutationPreview||undefined,
+      mutationPreview:mutationPreview||undefined,
+      ui_part:mutationPreview?row.ui_part:undefined,
     };
     return row;
   }
@@ -3454,9 +3861,22 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     }
     return byIdx;
   }
+  function _anchorSceneToolRowSemanticMutationKey(row){
+    if(!row||typeof row!=='object'||row.role!=='tool') return '';
+    const tool=row.tool&&typeof row.tool==='object'?row.tool:{};
+    const payload=row.payload&&typeof row.payload==='object'?row.payload:{};
+    const name=String(tool.name||payload.name||'').replace(/^functions\./,'').toLowerCase();
+    if(!/^(write_file|patch|edit_file|create_file)$/.test(name)) return '';
+    const args=tool.args&&typeof tool.args==='object'?tool.args:(payload.args&&typeof payload.args==='object'?payload.args:{});
+    const path=String(args.path||args.file_path||args.file||args.target||'');
+    if(!path) return '';
+    return [name,path,args.mode||'',args.old_string||'',args.new_string||'',args.content||''].join('\x1f');
+  }
   function _anchorSceneExistingRowKey(row){
     if(!row||typeof row!=='object') return '';
     if(row.role==='tool'){
+      const mutationKey=_anchorSceneToolRowSemanticMutationKey(row);
+      if(mutationKey) return `tool-mutation:${mutationKey}`;
       const tool=row.tool&&typeof row.tool==='object'?row.tool:{};
       return `tool:${row.tool_call_id||tool.id||tool.tid||tool.tool_call_id||tool.tool_use_id||tool.call_id||row.row_id||''}`;
     }
@@ -3638,6 +4058,13 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       turn_duration:_anchorSceneTurnDurationForSettlement(lastAsst,base),
       terminal_state:base.terminal_state||((base.lifecycle&&base.lifecycle.terminal_state)||null),
       activity_rows:rows,
+      ui_parts:rows
+        .filter(row=>row&&row.ui_part&&row.ui_part.type==='mutation_timeline_event')
+        .map(row=>({
+          ...row.ui_part,
+          row_id:row.row_id||'',
+          order_index:row.order_index,
+        })),
     };
     return scene;
   }
@@ -4010,6 +4437,20 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     }
     return '';
   }
+  function _resetAnchorRegistryActivityForRecoveryScene(registry){
+    const anchor=registry&&registry.anchor;
+    if(!anchor||!Array.isArray(anchor.activity_events)) return false;
+    anchor.activity_events.length=0;
+    const eventIndex=registry.event_index&&typeof registry.event_index==='object'
+      ? registry.event_index
+      : null;
+    if(eventIndex){
+      if(Array.isArray(eventIndex.dedupe_keys)) eventIndex.dedupe_keys.length=0;
+      const dedupeSet=eventIndex.dedupe_key_set;
+      if(dedupeSet&&typeof dedupeSet.clear==='function') dedupeSet.clear();
+    }
+    return true;
+  }
   function _hydrateAnchorRegistryFromActivityScene(scene){
     if(!_anchorRegistry||!_anchorApi||typeof _anchorApi.applyAssistantTurnAnchorSourceEvent!=='function') return false;
     if(!scene||scene.version!=='activity_scene_v1'||!Array.isArray(scene.activity_rows)||!scene.activity_rows.length) return false;
@@ -4023,6 +4464,13 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       scene.activity_rows.map(row=>row&&row.row_id||row&&row.local_id||'').join('|'),
     ].join(':');
     if(_anchorRegistry._hydrated_activity_scene_key===sceneKey) return true;
+    // The journal scene is the authoritative, bounded recovery window for a
+    // reattached stream. The registry survives sidebar switches, so appending a
+    // newer snapshot to its old activity makes the projected scene grow on
+    // every return and eventually turns each live event into a large full-DOM
+    // rebuild. Replace only the activity/dedupe window; stream identity and
+    // lifecycle state remain intact and new SSE events append normally below.
+    _resetAnchorRegistryActivityForRecoveryScene(_anchorRegistry);
     const rows=scene.activity_rows;
     for(let i=0;i<rows.length;i+=1){
       const row=rows[i];
@@ -4315,11 +4763,15 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     _streamFadeDomText='';
   }
   function _cancelAnimationFramePendingStreamRender(){
-    if(_pendingRafHandle===null) return;
-    cancelAnimationFrame(_pendingRafHandle);
-    clearTimeout(_pendingRafHandle);
+    _renderScheduleGeneration++;
+    if(_pendingRafHandle!==null) cancelAnimationFrame(_pendingRafHandle);
+    if(_pendingRenderDelayHandle!==null) clearTimeout(_pendingRenderDelayHandle);
+    if(_pendingRenderWatchdogHandle!==null) clearTimeout(_pendingRenderWatchdogHandle);
     _pendingRafHandle=null;
+    _pendingRenderDelayHandle=null;
+    _pendingRenderWatchdogHandle=null;
     _renderPending=false;
+    _streamDiagnostic('render-schedule-cancelled');
   }
   function _shouldUseStreamFade(){
     return window._fadeTextEffect===true;
@@ -4944,6 +5396,10 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     _resetStreamFadeState();
   }
   function _rememberRunJournalCursor(e){
+    // Every journalled frame proves the transport is flowing, including frames
+    // without an id on legacy servers. Cursor advancement remains conditional
+    // below, but the liveness clock must still move.
+    _noteRunJournalActivity();
     const raw=String(e&&e.lastEventId||'').trim();
     if(!raw) return;
     const tail=raw.includes(':')?raw.slice(raw.lastIndexOf(':')+1):raw;
@@ -5099,7 +5555,32 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     };
   }
 
-  function upsertLiveToolCall(d, phase){
+  function _mergeLiveToolCallArgs(currentArgs, incomingArgs){
+    const current=currentArgs&&typeof currentArgs==='object'&&!Array.isArray(currentArgs)?currentArgs:{};
+    if(!incomingArgs||typeof incomingArgs!=='object'||Array.isArray(incomingArgs))return current;
+    const merged={...current,...incomingArgs};
+    // Some adapters only include args on tool_start, while others enrich a
+    // partial command on tool_complete. Treat the executable command as stable
+    // lifecycle metadata: an empty completion snapshot must not erase it, but
+    // a non-empty authoritative completion value may replace a partial start.
+    const currentCommand=String(current.cmd||current.command||'');
+    const incomingCommand=String(incomingArgs.cmd||incomingArgs.command||'');
+    const command=incomingCommand||currentCommand;
+    if(command){
+      if(Object.prototype.hasOwnProperty.call(current,'cmd')||Object.prototype.hasOwnProperty.call(incomingArgs,'cmd'))merged.cmd=command;
+      if(Object.prototype.hasOwnProperty.call(current,'command')||Object.prototype.hasOwnProperty.call(incomingArgs,'command')||!Object.prototype.hasOwnProperty.call(merged,'cmd'))merged.command=command;
+    }
+    const currentCode=String(current.code||current.script||'');
+    const incomingCode=String(incomingArgs.code||incomingArgs.script||'');
+    const code=incomingCode||currentCode;
+    if(code){
+      if(Object.prototype.hasOwnProperty.call(current,'code')||Object.prototype.hasOwnProperty.call(incomingArgs,'code'))merged.code=code;
+      if(Object.prototype.hasOwnProperty.call(current,'script')||Object.prototype.hasOwnProperty.call(incomingArgs,'script'))merged.script=code;
+    }
+    return merged;
+  }
+
+  function upsertLiveToolCall(d, phase, deferPersistence=false){
     if(!d||d.name==='clarify') return null;
     const name=String(d&&d.name||'').trim();
     if(!name) return null;
@@ -5171,6 +5652,17 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       }
     }
 
+    if(isComplete&&tc._liveOutputMetadataOwned&&tc.result_metadata&&typeof tc.result_metadata==='object'){
+      // Live stdout/stderr are only a bounded preview. Remove them before the
+      // completion payload is applied so the final result remains authoritative
+      // (including its last unterminated line and full legacy output shape).
+      delete tc.result_metadata.stdout;
+      delete tc.result_metadata.stderr;
+      if(!Object.keys(tc.result_metadata).length)delete tc.result_metadata;
+      tc._liveOutputMetadataOwned=false;
+      delete tc._liveOutputPreviewState;
+    }
+
     if(isComplete){
       if(d.preview){
         tc.snippet=tc.snippet||String(d.preview||'');
@@ -5179,8 +5671,28 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     } else {
       tc.preview=String(d.preview||tc.preview||'');
     }
-    if(d.args!==undefined) tc.args=d.args;
+    if(d.args!==undefined) tc.args=_mergeLiveToolCallArgs(tc.args,d.args);
+    const eventCommand=[d.command,d.raw_command,d.original_command,d.display_command]
+      .find(value=>typeof value==='string'&&value.length>0);
+    if(eventCommand!==undefined){
+      tc.command=eventCommand;
+      tc.args=_mergeLiveToolCallArgs(tc.args,{command:eventCommand});
+    }
+    const eventCode=[d.code,d.script].find(value=>typeof value==='string'&&value.length>0);
+    if(eventCode!==undefined){
+      tc.code=eventCode;
+      tc.args=_mergeLiveToolCallArgs(tc.args,{code:eventCode});
+    }
     if(d.snippet!==undefined) tc.snippet=d.snippet;
+    if(d.mutation_preview!==undefined) tc.mutation_preview=d.mutation_preview;
+    if(d.mutationPreview!==undefined) tc.mutationPreview=d.mutationPreview;
+    // Preserve result metadata for the shared non-diff command renderer. Shell
+    // start events can paint their stable command immediately; later metadata
+    // and stdout/stderr update only the result portion. Live diff streaming
+    // remains on its separate renderer.
+    for(const key of ['result','output','metadata','result_metadata','resultMetadata','output_kind','outputKind','severity','status','exit_code','exitCode','status_code','statusCode','http_status','httpStatus','success','ok','url','warnings']){
+      if(d[key]!==undefined) tc[key]=d[key];
+    }
     tc._liveToolCallSignature = _toolCallSignature(tc,tc.activityBurstId,tc.activitySegmentSeq);
     tc.activityBurstId = Number.isFinite(Number(tc.activityBurstId))
       ? Number(tc.activityBurstId)
@@ -5214,8 +5726,83 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     }
 
     S.toolCalls=inflight.toolCalls;
-    persistInflightState();
+    // A journal replay can deliver hundreds of historical tool boundaries in
+    // one burst. Persisting the growing recovery object after every replayed
+    // start/complete event repeatedly parses and stringifies up to 1.5 MB on
+    // Electron's renderer thread. The server journal is already durable, so a
+    // trailing browser snapshot is sufficient while reconnecting.
+    if(deferPersistence) _throttledPersist();
+    else persistInflightState();
     return tc;
+  }
+
+  function _appendBoundedLiveOutputPreview(tc,stream,text,maxChars=200000){
+    tc._liveOutputPreviewState=tc._liveOutputPreviewState||{};
+    const state=tc._liveOutputPreviewState[stream]||(
+      tc._liveOutputPreviewState[stream]={parts:[],chars:0,dirty:false}
+    );
+    state.parts.push(text);
+    state.chars+=text.length;
+    while(state.chars>maxChars&&state.parts.length){
+      const overflow=state.chars-maxChars;
+      const first=state.parts[0];
+      if(first.length<=overflow){
+        state.parts.shift();
+        state.chars-=first.length;
+      }else{
+        state.parts[0]=first.slice(overflow);
+        state.chars-=overflow;
+      }
+    }
+    state.dirty=true;
+  }
+
+  function _materializeLiveToolOutputPreview(tc,stream){
+    const state=tc&&tc._liveOutputPreviewState&&tc._liveOutputPreviewState[stream];
+    const metadata=tc&&tc.result_metadata&&typeof tc.result_metadata==='object'
+      ?tc.result_metadata:null;
+    if(!state)return String(metadata&&metadata[stream]||'');
+    if(!state.dirty)return String(metadata&&metadata[stream]||state.parts[0]||'');
+    const value=state.parts.join('');
+    state.parts=[value];
+    state.chars=value.length;
+    state.dirty=false;
+    if(metadata)metadata[stream]=value;
+    return value;
+  }
+
+  function appendLiveToolOutputState(d){
+    if(!d||typeof d!=='object')return null;
+    const tid=String(d.tid||d.id||d.tool_call_id||d.tool_use_id||d.call_id||'').trim();
+    if(!tid)return null;
+    const stream=String(d.stream||'stdout').toLowerCase()==='stderr'?'stderr':'stdout';
+    const text=typeof d.text==='string'?d.text:String(d.text||'');
+    if(!text)return null;
+    const inflight=INFLIGHT[activeSid] || (INFLIGHT[activeSid]={messages:[...S.messages],uploaded:[...uploaded],toolCalls:[]});
+    if(!Array.isArray(inflight.toolCalls))inflight.toolCalls=[];
+    let index=_findPendingLiveToolCallIndex(inflight.toolCalls,{tid,allowDone:false});
+    let tc=index>=0?inflight.toolCalls[index]:null;
+    if(!tc){
+      tc=upsertLiveToolCall({name:d.name||'terminal',tid,args:{}},'start',reconnecting);
+      if(!tc)return null;
+    }
+    const sequence=Number(d.sequence);
+    tc._liveOutputSequences=tc._liveOutputSequences||{};
+    const prior=Number(tc._liveOutputSequences[stream]||0);
+    if(Number.isFinite(sequence)&&sequence>0&&sequence<=prior)return null;
+    if(Number.isFinite(sequence)&&sequence>0)tc._liveOutputSequences[stream]=sequence;
+    const metadata=tc.result_metadata&&typeof tc.result_metadata==='object'
+      ?tc.result_metadata
+      :(tc.result_metadata={});
+    tc._liveOutputMetadataOwned=true;
+    // Keep append work O(chunk) even against an older server that emits one SSE
+    // event per terminal line. Concatenating the growing 200 KB preview here
+    // allocated hundreds of MB during noisy commands and created GC pauses.
+    // Materialize once per paint instead; completion remains authoritative.
+    _appendBoundedLiveOutputPreview(tc,stream,text);
+    tc.done=false;
+    S.toolCalls=inflight.toolCalls;
+    return {tc,stream,text};
   }
 
   let _lastRenderMs=0;
@@ -5226,15 +5813,29 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
   let _cachedParsedText='';
   let _cachedParsedReasoning='';
   function _scheduleRender(parsed){
+    // A full transcript repaint can detach the row while this EventSource and
+    // its closure remain healthy. Detect that state on the next token instead
+    // of continuing to write into an orphaned node until a tab switch remounts.
+    const rendererNode=assistantBody||assistantRow;
+    if(rendererNode&&rendererNode.isConnected===false) _rebindVisibleLiveView();
     // If caller provides a pre-computed parse result, cache it for _doRender.
     if(parsed){
       _cachedParsed=parsed;
       _cachedParsedText=assistantText;
       _cachedParsedReasoning=liveReasoningText;
     }
-    if(_renderPending) return;
+    if(_renderPending){
+      _streamDiagnostic('render-request-coalesced',{
+        raf_pending:_pendingRafHandle!==null,
+        delay_pending:_pendingRenderDelayHandle!==null,
+        watchdog_pending:_pendingRenderWatchdogHandle!==null,
+      });
+      return;
+    }
     if(_streamFinalized) return; // Bug A: don't schedule new rAF after stream finalized
     _renderPending=true;
+    const scheduleGeneration=++_renderScheduleGeneration;
+    let scheduleConsumed=false;
     // Cap render rate to ~15fps. The browser's rAF fires at 60fps, but each DOM
     // update takes 50-150ms on large sessions. During GC pauses, rAF callbacks
     // accumulate and then execute all at once, blocking the main thread for
@@ -5244,8 +5845,14 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     // performance.now() is monotonic so tab suspend/resume and NTP adjustments
     // cannot produce negative or enormous deltas.
     const sinceLastMs=performance.now()-_lastRenderMs;
-    const _doRender=()=>{
+    const _doRender=(trigger='animation-frame')=>{
+      if(scheduleConsumed||scheduleGeneration!==_renderScheduleGeneration) return;
+      scheduleConsumed=true;
+      if(_pendingRenderDelayHandle!==null) clearTimeout(_pendingRenderDelayHandle);
+      if(_pendingRenderWatchdogHandle!==null) clearTimeout(_pendingRenderWatchdogHandle);
       _pendingRafHandle=null;
+      _pendingRenderDelayHandle=null;
+      _pendingRenderWatchdogHandle=null;
       _renderPending=false;
       // Guard: a pending setTimeout+rAF can outlive stream finalization.
       if(_streamFinalized) return;
@@ -5293,13 +5900,49 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       if(anchorProcessText) _upsertAnchorProcessProse(anchorProcessText);
       scrollIfPinned();
       _throttledSnapshotLiveTurn();
+      _streamDiagnostic('render-committed',{
+        trigger,
+        rendered_content_length:String(displayText||'').length,
+        rendered_dom_text_length:assistantBody?String(assistantBody.textContent||'').length:0,
+        renderer_connected:!!(assistantBody&&assistantBody.isConnected),
+      });
     };
     const frameIntervalMs=_shouldUseLiveProseFade()?33:66;
+    const queueAnimationFrame=()=>{
+      _pendingRenderDelayHandle=null;
+      if(scheduleConsumed||scheduleGeneration!==_renderScheduleGeneration||_streamFinalized) return;
+      _pendingRafHandle=requestAnimationFrame(()=>_doRender('animation-frame'));
+      _streamDiagnostic('render-animation-frame-requested',{
+        generation:scheduleGeneration,
+        frame_interval_ms:frameIntervalMs,
+      });
+    };
     if(sinceLastMs>=frameIntervalMs){
-      _pendingRafHandle=requestAnimationFrame(_doRender);
+      queueAnimationFrame();
     } else {
-      _pendingRafHandle=setTimeout(()=>requestAnimationFrame(_doRender), frameIntervalMs-sinceLastMs);
+      _pendingRenderDelayHandle=setTimeout(queueAnimationFrame, frameIntervalMs-sinceLastMs);
     }
+    // A lost rAF must not leave `_renderPending` latched forever. This one-shot
+    // watchdog flushes only the already-pending newest render; it is not a poll
+    // and does not remount or repaint the transcript. The consumed/generation
+    // guards make a late rAF a no-op, so no chunk can be rendered twice.
+    _pendingRenderWatchdogHandle=setTimeout(()=>{
+      if(scheduleConsumed||scheduleGeneration!==_renderScheduleGeneration||!_renderPending) return;
+      if(_pendingRafHandle!==null) cancelAnimationFrame(_pendingRafHandle);
+      _streamDiagnostic('render-watchdog-flush',{
+        generation:scheduleGeneration,
+        raf_pending:_pendingRafHandle!==null,
+        delay_pending:_pendingRenderDelayHandle!==null,
+      });
+      _doRender('watchdog');
+    },1500);
+    _streamDiagnostic('render-scheduled',{
+      generation:scheduleGeneration,
+      delay_ms:Math.max(0,frameIntervalMs-sinceLastMs),
+      raf_pending:_pendingRafHandle!==null,
+      delay_pending:_pendingRenderDelayHandle!==null,
+      watchdog_pending:true,
+    });
   }
 
   function _completeAutomaticCompressionOnLiveProgress(sessionId){
@@ -5319,12 +5962,47 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     return true;
   }
 
+  function _rebindVisibleLiveView(){
+    if(!_claimVisibleActiveStreamOwnership()) return false;
+    // Preserve the latest process prose in the semantic anchor before dropping
+    // renderer references. The next event starts a fresh visual segment in the
+    // replacement DOM; no journal replay and no duplicate command is needed.
+    try{
+      const parsed=_parseStreamState();
+      const displayText=segmentStart===0
+        ? String((parsed&&parsed.displayText)||'')
+        : _stripXmlToolCalls(assistantText.slice(segmentStart));
+      if(String(displayText||'').trim()) _upsertAnchorProcessProse(displayText);
+    }catch(_){ }
+    _cancelAnimationFramePendingStreamRender();
+    assistantRow=null;
+    assistantBody=null;
+    segmentStart=assistantText.length;
+    _freshSegment=true;
+    _smdEndParser();
+    _smdReconnect=false;
+    _resetStreamFadeState();
+    let restored=false;
+    if(typeof window!=='undefined'&&typeof window._renderLiveAnchorActivitySceneForStream==='function'){
+      restored=!!window._renderLiveAnchorActivitySceneForStream(streamId,activeSid);
+    }
+    if(!restored&&typeof ensureLiveWorklogShell==='function') ensureLiveWorklogShell();
+    snapshotLiveTurn();
+    return true;
+  }
+
   function _wireSSE(source){
     const existingLive=LIVE_STREAMS[activeSid];
     if(existingLive&&existingLive.source&&existingLive.source!==source){
+      if(typeof existingLive.dispose==='function'){
+        try{existingLive.dispose();}catch(_){}
+      }
       try{if(existingLive.source.readyState!==2)existingLive.source.close();}catch(_){ }
     }
     LIVE_STREAMS[activeSid]={streamId,source};
+    LIVE_STREAMS[activeSid].rebindView=_rebindVisibleLiveView;
+    LIVE_STREAMS[activeSid].dispose=_clearStreamLivenessWatchdog;
+    _startStreamLivenessWatchdog(source);
 
     // Note on #631 Bug B: the original PR description stated the server
     // "replays buffered token events" on reconnect, and proposed resetting
@@ -5342,11 +6020,18 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     // terminal handlers) address it without needing a reset here.
 
     source.addEventListener('token',e=>{
+      _streamEventDiagnostic('token',e,source);
       if(_terminalStateReached||_streamFinalized) return;
       const d=JSON.parse(e.data);
       assistantText+=d.text;
       syncInflightAssistantMessage();
-      if(!S.session||S.session.session_id!==activeSid) return;
+      const ownsActiveThread=_claimVisibleActiveStreamOwnership();
+      _streamDiagnostic('active-thread-selector-notification',{
+        owns_active_thread:ownsActiveThread,
+        selected_session_id:S.session&&S.session.session_id,
+        selected_stream_id:S.activeStreamId,
+      });
+      if(!ownsActiveThread) return;
       _completeAutomaticCompressionOnLiveProgress(activeSid);
       if(_freshSegment) appendThinking('', _liveThinkingPlacement());
       // Once the assistant row exists its creation gate is already satisfied, and
@@ -5366,6 +6051,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     });
 
     source.addEventListener('interim_assistant',e=>{
+      _streamEventDiagnostic('interim_assistant',e,source);
       if(_terminalStateReached||_streamFinalized) return;
       const d=JSON.parse(e.data);
       const visible=String(d&&d.text?d.text:'').trim();
@@ -5377,7 +6063,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       if(reasoningEcho) _stripLiveReasoningEcho(visible);
       liveReasoningText='';
       if(alreadyStreamed){
-        if(!S.session||S.session.session_id!==activeSid){
+        if(!_claimVisibleActiveStreamOwnership()){
           recordActivityBoundary();
           _resetAssistantSegment();
           return;
@@ -5397,7 +6083,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       assistantText += assistantText ? `\n\n${visible}` : visible;
       visibleInterimSnippets.push(visible);
       syncInflightAssistantMessage();
-      if(!S.session||S.session.session_id!==activeSid){
+      if(!_claimVisibleActiveStreamOwnership()){
         recordActivityBoundary();
         _resetAssistantSegment();
         return;
@@ -5449,6 +6135,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     });
 
     source.addEventListener('reasoning',e=>{
+      _streamEventDiagnostic('reasoning',e,source);
       if(_terminalStateReached||_streamFinalized) return;
       if(!_ownsActiveStreamOrBackground()) return;
       const d=JSON.parse(e.data);
@@ -5472,18 +6159,20 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     });
 
     source.addEventListener('tool',e=>{
+      _streamEventDiagnostic('tool',e,source);
       if(_terminalStateReached||_streamFinalized) return;
-      if(!S.session||S.session.session_id!==activeSid||S.activeStreamId!==streamId) return;
+      if(!S.session||S.session.session_id!==activeSid||(S.activeStreamId!==streamId&&!_claimVisibleActiveStreamOwnership())) return;
       const d=JSON.parse(e.data);
       if(d.name==='clarify') return;
       _completeAutomaticCompressionOnLiveProgress(activeSid);
-      const tc=upsertLiveToolCall(d,'start');
+      const tc=upsertLiveToolCall(d,'start',reconnecting);
       if(!tc) return;
       const pendingDisplayTextBeforeTool=segmentStart===0
         ? (_parseStreamState().displayText||'')
         : _stripXmlToolCalls(assistantText.slice(segmentStart));
       if(String(pendingDisplayTextBeforeTool||'').trim()) _upsertAnchorProcessProse(pendingDisplayTextBeforeTool,{sealed:true});
-      _applyToAnchor('tool',{...d,...tc},e);
+      const toolAnchorRender={rendered:false};
+      _applyToAnchor('tool',{...d,...tc},e,toolAnchorRender);
 
       if(S.session&&S.session.session_id===activeSid&&typeof scheduleRenderSessionArtifacts==='function') scheduleRenderSessionArtifacts();
       if(!S.session||S.session.session_id!==activeSid) return;
@@ -5499,28 +6188,57 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
         ensureAssistantRow(true);
       }
       _flushPendingSegmentRender({force:true});
-      appendLiveToolCard(tc,{sessionId:activeSid,streamId});
-      snapshotLiveTurn();
+      appendLiveToolCard(tc,{sessionId:activeSid,streamId,anchorAlreadyRendered:toolAnchorRender.rendered});
+      if(reconnecting) _throttledSnapshotLiveTurn();
+      else snapshotLiveTurn();
       _freshSegment=true;
       _smdEndParser();
       _resetAssistantSegment();
       scrollIfPinned();
     });
 
+    source.addEventListener('tool_output',e=>{
+      _streamEventDiagnostic('tool_output',e,source);
+      if(_terminalStateReached||_streamFinalized)return;
+      if(!S.session||S.session.session_id!==activeSid||(S.activeStreamId!==streamId&&!_claimVisibleActiveStreamOwnership()))return;
+      let d;
+      try{d=JSON.parse(e.data||'{}');}catch(_){return;}
+      const update=appendLiveToolOutputState(d);
+      if(!update)return;
+      _completeAutomaticCompressionOnLiveProgress(activeSid);
+      if(typeof appendLiveToolOutputChunk==='function'){
+        appendLiveToolOutputChunk(update.tc,update.stream,update.text,{sessionId:activeSid,streamId});
+      }else{
+        // Compatibility with an older cached ui.js asset: the existing full
+        // card renderer still shows the accumulated output.
+        _materializeLiveToolOutputPreview(update.tc,update.stream);
+        appendLiveToolCard(update.tc,{sessionId:activeSid,streamId});
+      }
+    });
+
     source.addEventListener('tool_complete',e=>{
+      _streamEventDiagnostic('tool_complete',e,source);
       if(_terminalStateReached||_streamFinalized) return;
-      if(!S.session||S.session.session_id!==activeSid||S.activeStreamId!==streamId) return;
+      if(!S.session||S.session.session_id!==activeSid||(S.activeStreamId!==streamId&&!_claimVisibleActiveStreamOwnership())) return;
       const d=JSON.parse(e.data);
       if(d.name==='clarify') return;
       _completeAutomaticCompressionOnLiveProgress(activeSid);
-      const tc=upsertLiveToolCall(d,'complete');
+      // Drain the bounded client-side stdout batch before the authoritative
+      // completion payload rebuilds the card. This keeps the running and
+      // completed lifecycle on one visible component and guarantees the last
+      // pending chunk is painted even when it arrived inside the flush window.
+      if(typeof flushLiveToolOutputChunks==='function'){
+        flushLiveToolOutputChunks(d,{sessionId:activeSid,streamId,final:true});
+      }
+      const tc=upsertLiveToolCall(d,'complete',reconnecting);
       if(!tc) return;
       tc.is_error=!!d.is_error;
       const pendingDisplayTextBeforeComplete=segmentStart===0
         ? (_parseStreamState().displayText||'')
         : _stripXmlToolCalls(assistantText.slice(segmentStart));
       if(String(pendingDisplayTextBeforeComplete||'').trim()) _upsertAnchorProcessProse(pendingDisplayTextBeforeComplete,{sealed:true});
-      _applyToAnchor('tool_complete',{...d,...tc,is_error:!!d.is_error},e);
+      const toolCompleteAnchorRender={rendered:false};
+      _applyToAnchor('tool_complete',{...d,...tc,is_error:!!d.is_error},e,toolCompleteAnchorRender);
       if(typeof noteWorkspaceMutationsFromToolCall==='function') noteWorkspaceMutationsFromToolCall(tc);
       if(S.session&&S.session.session_id===activeSid&&typeof scheduleRenderSessionArtifacts==='function') scheduleRenderSessionArtifacts();
       if(!S.session||S.session.session_id!==activeSid) return;
@@ -5534,14 +6252,15 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
           ensureAssistantRow(true);
           _flushPendingSegmentRender({force:true});
         }
-        appendLiveToolCard(tc,{sessionId:activeSid,streamId});
+        appendLiveToolCard(tc,{sessionId:activeSid,streamId,anchorAlreadyRendered:toolCompleteAnchorRender.rendered});
         _freshSegment=true;
         _smdEndParser();
         _resetAssistantSegment();
       } else {
-        appendLiveToolCard(tc,{sessionId:activeSid,streamId});
+        appendLiveToolCard(tc,{sessionId:activeSid,streamId,anchorAlreadyRendered:toolCompleteAnchorRender.rendered});
       }
-      snapshotLiveTurn();
+      if(reconnecting) _throttledSnapshotLiveTurn();
+      else snapshotLiveTurn();
       scrollIfPinned();
     });
 
@@ -5724,9 +6443,11 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     });
 
     source.addEventListener('done',e=>{
+      _streamEventDiagnostic('done',e,source);
       if(_streamFinalized) return;
       _clearStreamEndRecovery();
       if(_bailOutOfTerminalEventsFromStaleStream(source)) return;
+      if(typeof flushAllLiveToolOutputChunks==='function')flushAllLiveToolOutputChunks({final:true});
       // Set _streamFinalized IMMEDIATELY — before any fade delay. Without this,
       // a stream_end event arriving during the fade window sees
       // _streamFinalized=false, calls _restoreSettledSession(), and overwrites
@@ -5735,7 +6456,17 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       _terminalStateReached=true;
       if(_persistTimer){clearTimeout(_persistTimer);_persistTimer=null;}
       _cancelThrottledSnapshotTimer();
-      const _doneData=JSON.parse(e.data);
+      const _parsedDoneData=JSON.parse(e.data);
+      // Mixed-version defense: older WebUI servers embed the entire transcript
+      // in `done`.  Settling a long run would then rebuild hundreds of historic
+      // messages (twice for the height-stable Worklog transition), blocking the
+      // Electron renderer after the agent had already completed.  Keep the
+      // canonical count and pagination cursor, but render the same bounded tail
+      // used by normal session loading.  New servers already send this shape;
+      // applying the helper again is a no-op.
+      const _doneData=(_parsedDoneData&&_parsedDoneData.session)
+        ? {..._parsedDoneData,session:_terminalSessionDisplayWindow(_parsedDoneData.session)}
+        : _parsedDoneData;
       const _doneEvent=e;
       const _finishDone=()=>{
         // Bug A fix: cancel any pending rAF and mark stream finalized before
@@ -5761,7 +6492,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
         const d=_doneData;
         _flushReasoningToAnchor();
         _applyToAnchor('done',{
-          status:d.status||'completed',
+          status:d.turn_status||d.status||'completed',
           usage:d.usage||null,
           created_at:d.created_at||null,
         },_doneEvent);
@@ -5849,7 +6580,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
           if(d.usage){
             const _doneUsageFallback={...(S.lastUsage||{})};
             if(S.session){
-              for(const _usageField of ['context_length','threshold_tokens','last_prompt_tokens','post_compression_context_tokens_estimate']){
+              for(const _usageField of ['context_length','threshold_tokens','last_prompt_tokens','compression_count','post_compression_context_tokens_estimate']){
                 if(_doneUsageFallback[_usageField]==null&&S.session[_usageField]!=null){
                   _doneUsageFallback[_usageField]=S.session[_usageField];
                 }
@@ -5934,8 +6665,10 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
           // delivered the final messages and tool calls.
           if(typeof window!=='undefined') window._streamJustFinished=true;
           setTimeout(()=>{ if(typeof window!=='undefined') window._streamJustFinished=false; }, 5000);
-          // Expand render window to cover all messages so the done render
-          // doesn't hide Activity behind a tiny window (winSize=50).
+          // Expand only across the bounded terminal window. The full canonical
+          // history remains available through _messages_offset/load-earlier;
+          // expanding an old server's full transcript here reintroduces the
+          // completion freeze this window prevents.
           if(typeof _messageRenderableMessageCount==='function'&&typeof _messageRenderWindowSize!=='undefined'){
             _messageRenderWindowSize=Math.max(typeof _currentMessageRenderWindowSize==='function'?_currentMessageRenderWindowSize():50, _messageRenderableMessageCount());
           }
@@ -5958,9 +6691,22 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
           if(typeof _armKeepSettledWorklogOpen==='function') _armKeepSettledWorklogOpen(_settledStreamId);
           syncTopbar();renderMessages({preserveScroll:true});
           if(typeof _disarmKeepSettledWorklogOpen==='function') _disarmKeepSettledWorklogOpen();
-          if(typeof _renderMessagesWithScrollSnapshot==='function') _renderMessagesWithScrollSnapshot();
-          else renderMessages({preserveScroll:true});
-          if(shouldFollowOnDone&&typeof scrollToBottom==='function') scrollToBottom();
+          // The keep-open exception is explicitly a one-frame height-stable
+          // bridge. Running its collapse render synchronously here joined two
+          // full transcript rebuilds into one long task, so Electron appeared
+          // frozen after the agent had already completed. Let the stable first
+          // pass paint, then collapse on the next frame with the existing
+          // same-frame scroll snapshot. A session switch before that frame does
+          // not need a DOM collapse; its next normal render is already disarmed.
+          const _collapseSettledWorklog=()=>{
+            if(!_isSessionCurrentPane(activeSid)) return;
+            if(S.activeStreamId&&S.activeStreamId!==_settledStreamId) return;
+            if(typeof _renderMessagesWithScrollSnapshot==='function') _renderMessagesWithScrollSnapshot();
+            else renderMessages({preserveScroll:true});
+            if(shouldFollowOnDone&&typeof scrollToBottom==='function') scrollToBottom();
+          };
+          if(typeof requestAnimationFrame==='function') requestAnimationFrame(_collapseSettledWorklog);
+          else setTimeout(_collapseSettledWorklog,0);
           if(typeof noteWorkspaceMutationsFromToolCalls==='function') noteWorkspaceMutationsFromToolCalls(S.toolCalls);
           loadDir('.', { preservePreview: true });
           // TTS auto-read: speak the last assistant response if enabled (#499)
@@ -6012,6 +6758,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       }
       _clearStreamEndRecovery();
       if(_bailOutOfTerminalEventsFromStaleStream(source)) return;
+      if(typeof flushAllLiveToolOutputChunks==='function')flushAllLiveToolOutputChunks({final:true});
       try{
         const d=JSON.parse(e.data||'{}');
         if((d.session_id||activeSid)!==activeSid) return;
@@ -6147,7 +6894,13 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     });
 
     source.addEventListener('apperror',e=>{
+      _streamEventDiagnostic('apperror',e,source);
+      // Terminal status is authoritative per stream. In particular, ignore a
+      // late empty/error callback after `done`; otherwise the completed answer
+      // is replaced by a false "No response from provider" state.
+      if(_streamFinalized) return;
       if(_bailOutOfTerminalEventsFromStaleStream(source)) return;
+      if(typeof flushAllLiveToolOutputChunks==='function')flushAllLiveToolOutputChunks({final:true});
       _clearStreamEndRecovery();
       _terminalStateReached=true;
       if(_persistTimer){clearTimeout(_persistTimer);_persistTimer=null;}
@@ -6176,7 +6929,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
         _flushReasoningToAnchor();
         _applyToAnchor('apperror',{
           type:d.type||'error',
-          status:d.status||d.type||'error',
+          status:d.turn_status||d.status||d.type||'error',
           message:d.message||'',
           hint:d.hint||'',
           details:d.details||'',
@@ -6270,6 +7023,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     });
 
     source.addEventListener('error',async e=>{
+      _streamEventDiagnostic('error',e,source);
       if(_bailOutOfTerminalEventsFromStaleStream(source) && !_streamFinalized){
         return;
       }
@@ -6277,6 +7031,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
         _closeSource(source);
         return;
       }
+      if(typeof flushAllLiveToolOutputChunks==='function')flushAllLiveToolOutputChunks({final:false});
       // #3885: if a stream_end recovery is in flight, don't start a competing
       // reconnect — recovery polls server state and owns the terminal decision
       // (else its exhaustion could mute a freshly reconnected stream). Opus stage-LK.
@@ -6388,6 +7143,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
 
     source.addEventListener('cancel',e=>{
       if(_bailOutOfTerminalEventsFromStaleStream(source)) return;
+      if(typeof flushAllLiveToolOutputChunks==='function')flushAllLiveToolOutputChunks({final:true});
       _clearStreamEndRecovery();
       _terminalStateReached=true;
       if(_persistTimer){clearTimeout(_persistTimer);_persistTimer=null;}
@@ -6480,7 +7236,7 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
       _setActivePaneIdleIfOwner();
     });
 
-    for(const _runJournalEventName of ['token','interim_assistant','reasoning','tool','tool_complete','todo_state','approval','clarify','state_saved','title','title_status','context_status','goal','goal_continue','done','stream_end','pending_steer_leftover','compressing','compressed','metering','apperror','warning','error','cancel']){
+    for(const _runJournalEventName of ['token','interim_assistant','reasoning','tool','tool_output','tool_complete','todo_state','approval','clarify','state_saved','title','title_status','context_status','goal','goal_continue','bg_task_complete','done','stream_end','pending_steer_leftover','compressing','compressed','metering','apperror','warning','error','cancel']){
       source.addEventListener(_runJournalEventName,_rememberRunJournalCursor);
     }
   }
@@ -6749,6 +7505,30 @@ function attachLiveStream(activeSid, streamId, uploaded=[], options={}){
     _wireSSE(new EventSource(new URL(`api/chat/stream?stream_id=${encodeURIComponent(streamId)}${replayParams}`,document.baseURI||location.href).href,{withCredentials:true}));
   })();
 
+}
+
+function _resumeVisibleLiveStreamAfterControl(sid){
+  sid=String(sid||'');
+  if(!sid||!S.session||String(S.session.session_id||'')!==sid) return false;
+  const live=LIVE_STREAMS[sid];
+  const streamId=String((live&&live.streamId)||'');
+  if(!streamId||!live.source) return false;
+  if(typeof EventSource!=='undefined'&&live.source.readyState===EventSource.CLOSED) return false;
+  const activeStreamId=String(S.activeStreamId||'');
+  const declaredStreamId=String(S.session.active_stream_id||'');
+  // Never let an old approval or stale EventSource steal a newer live turn.
+  if(activeStreamId&&activeStreamId!==streamId) return false;
+  if(declaredStreamId&&declaredStreamId!==streamId) return false;
+  S.activeStreamId=streamId;
+  S.session.active_stream_id=streamId;
+  S.busy=true;
+  if(typeof updateSendBtn==='function') updateSendBtn();
+  if(typeof syncTopbar==='function') syncTopbar();
+  if(typeof showLiveRunStatus==='function'){
+    showLiveRunStatus(sid,{startedAt:S.session.pending_started_at||Date.now()/1000});
+  }
+  if(typeof live.rebindView==='function') live.rebindView();
+  return true;
 }
 
 function transcript(){
@@ -7219,6 +7999,10 @@ async function respondApproval(choice) {
           })
           .catch(() => {});
       }
+      // Approval is a control-plane pause, not a new run. Reassert the existing
+      // live stream's view binding in case a same-session refresh replaced the
+      // live DOM while the card was open. This never starts/replays a command.
+      _resumeVisibleLiveStreamAfterControl(sid);
       return;
     }
     const errMsg = (result && result.error) || "Approval response not accepted.";
@@ -7369,6 +8153,7 @@ function _attachServerInitiatedStream(sid, streamId, recovered) {
       S.session.active_stream_id = streamId;
       if (!S.session.pending_started_at) S.session.pending_started_at = Date.now()/1000;
     }
+    if(typeof showThreadElapsedTimer==='function') showThreadElapsedTimer(sid,S.session&&S.session.pending_started_at);
     if (typeof ensureLiveWorklogShell === 'function') ensureLiveWorklogShell();
     else if (typeof appendThinking === 'function') appendThinking();
     if (typeof updateSendBtn === 'function') updateSendBtn();
@@ -7671,6 +8456,7 @@ function startSessionStream(sid) {
           if (typeof d.pending_started_at === 'number') S.session.pending_started_at = d.pending_started_at;
           else if (!S.session.pending_started_at) S.session.pending_started_at = Date.now()/1000;
         }
+        if(typeof showThreadElapsedTimer==='function') showThreadElapsedTimer(sid,S.session&&S.session.pending_started_at);
         if (typeof ensureLiveWorklogShell === 'function') ensureLiveWorklogShell();
         else if (typeof appendThinking === 'function') appendThinking();
         if (typeof updateSendBtn === 'function') updateSendBtn();
@@ -7798,6 +8584,7 @@ let _clarifyVisibleSince = 0;
 let _clarifySignature = '';
 let _clarifySessionId = null;
 let _clarifyId = null;
+let _clarifySensitive = false;
 let _clarifyMissingEndpointWarned = false;
 let _clarifyCountdownTimer = null;
 let _clarifyExpiresAt = 0;
@@ -8015,6 +8802,9 @@ function _startClarifyCountdown(pending) {
 
 function _stashClarifyDraft(reason) {
   if (reason !== "expired" && reason !== "terminal") return false;
+  // Never copy terminal passwords/tokens into sessionStorage or the normal
+  // composer when a prompt expires or is dismissed.
+  if (_clarifySensitive) return false;
   const submit = $("clarifySubmit");
   if (submit && submit.classList.contains("loading")) return false;
   const input = $("clarifyInput");
@@ -8051,6 +8841,7 @@ function _resetClarifyCardState() {
   _clarifyVisibleSince = 0;
   _clarifySignature = '';
   _clarifyId = null;
+  _clarifySensitive = false;
 }
 
 function hideClarifyCard(force=false, reason="dismissed") {
@@ -8084,6 +8875,7 @@ function hideClarifyCard(force=false, reason="dismissed") {
   $("clarifyQuestion").textContent = "";
   $("clarifyChoices").innerHTML = "";
   $("clarifyInput").value = "";
+  $("clarifyInput").type = "text";
   $("clarifyInput").disabled = false;
   $("clarifyInput").onkeydown = null;
   const submit = $("clarifySubmit");
@@ -8116,9 +8908,11 @@ function showClarifyCard(pending) {
   const choices = Array.isArray(pending.choices_offered)
     ? pending.choices_offered
     : (Array.isArray(pending.choices) ? pending.choices : []);
+  const sensitive = pending.sensitive === true;
   const sig = JSON.stringify({
     question,
     choices,
+    sensitive,
     sid: pending._session_id || (S.session && S.session.session_id) || null,
     clarify_id: pending.clarify_id || null,
   });
@@ -8130,6 +8924,7 @@ function showClarifyCard(pending) {
   const sameClarify = card.classList.contains("visible") && _clarifySignature === sig;
   _clarifySessionId = sid;
   _clarifyId = pending.clarify_id || null;
+  _clarifySensitive = sensitive;
   _clarifySignature = sig;
   if (Number(pending.timeout_seconds) > 0) {
     _startClarifyCountdown(pending);
@@ -8187,6 +8982,8 @@ function showClarifyCard(pending) {
   }
   if (input) {
     if (!sameClarify) input.value = '';
+    input.type = sensitive ? 'password' : 'text';
+    input.autocomplete = sensitive ? 'new-password' : 'off';
     input.disabled = false;
     input.removeAttribute('readonly');
     input.onkeydown = (e) => {
@@ -8225,6 +9022,7 @@ async function respondClarify(response) {
     return;
   }
   const clarifyId = _clarifyId;
+  const sensitiveResponse = _clarifySensitive;
   // Keep a draft copy so we can restore the input on failure (issue #2639).
   const draft = value;
   _clarifySetControlsDisabled(true, true);
@@ -8244,7 +9042,7 @@ async function respondClarify(response) {
         _clearClarifyPendingForSession(sid);
         hideClarifyCard(true, 'sent');
         // Echo the user's clarify choice as a visible message in the conversation
-        if (S.session && S.session.session_id === sid) {
+        if (!sensitiveResponse && S.session && S.session.session_id === sid) {
           S.messages.push({
             role: 'user',
             content: value,

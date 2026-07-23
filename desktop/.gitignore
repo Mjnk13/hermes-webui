@@ -1,0 +1,6 @@
+node_modules/
+out/
+dist/
+.DS_Store
+electron.vite.config.*
+!electron.vite.config.mjs

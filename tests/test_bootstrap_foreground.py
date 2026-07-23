@@ -97,6 +97,11 @@ def clean_env(monkeypatch):
         "HERMES_WEBUI_STATE_DIR",
         "HERMES_WEBUI_SERVER_CWD",
         "HERMES_HOME",
+        "HERMES_WEBUI_DESKTOP_SHELL",
+        "HERMES_WEBUI_URL",
+        "HERMES_WEBUI_HEALTH_URL",
+        "HERMES_WEBUI_PID",
+        "CI",
     ):
         monkeypatch.delenv(name, raising=False)
 
@@ -244,6 +249,7 @@ class TestMainForegroundRouting:
         monkeypatch.setattr(bs, "ensure_python_has_webui_deps", lambda *a, **kw: a[0])
         monkeypatch.setattr(bs, "wait_for_health", lambda *a, **kw: True)
         monkeypatch.setattr(bs, "open_browser", lambda *a, **kw: None)
+        monkeypatch.setattr(bs, "_start_desktop_shell_sidecar", lambda *a, **kw: None)
         monkeypatch.setenv("HERMES_WEBUI_STATE_DIR", str(tmp_path / "state"))
         # Make agent_dir exist so chdir doesn't fail.
         (tmp_path / "agent").mkdir(parents=True, exist_ok=True)
@@ -389,6 +395,7 @@ class TestForegroundEnvAndCwd:
         monkeypatch.setattr(bs, "ensure_python_has_webui_deps", lambda *a, **kw: a[0])
         monkeypatch.setattr(bs, "wait_for_health", lambda *a, **kw: True)
         monkeypatch.setattr(bs, "open_browser", lambda *a, **kw: None)
+        monkeypatch.setattr(bs, "_start_desktop_shell_sidecar", lambda *a, **kw: None)
         # State-dir + every var we care about is captured.
         monkeypatch.setenv("HERMES_WEBUI_STATE_DIR", str(tmp_path / "state"))
         return bs, agent_dir
@@ -497,6 +504,55 @@ class TestForegroundEnvAndCwd:
         assert len(wait_calls) == 0
 
 
+class TestDesktopShellSidecar:
+    def test_desktop_shell_url_uses_loopback_for_wildcard_binds(self, import_bootstrap):
+        assert import_bootstrap._webui_url_for_desktop_shell("0.0.0.0", 8788) == "http://127.0.0.1:8788"
+        assert import_bootstrap._webui_url_for_desktop_shell("::", 8788) == "http://127.0.0.1:8788"
+        assert import_bootstrap._webui_url_for_desktop_shell("127.0.0.1", 8788) == "http://127.0.0.1:8788"
+        assert import_bootstrap._webui_url_for_desktop_shell("::1", 8788) == "http://[::1]:8788"
+
+    def test_desktop_shell_defaults_off(self, import_bootstrap, clean_env):
+        assert import_bootstrap._desktop_shell_enabled() is False
+
+    @pytest.mark.parametrize("value", ["0", "false", "FALSE"])
+    def test_desktop_shell_can_be_disabled(self, import_bootstrap, clean_env, monkeypatch, value):
+        monkeypatch.setenv("HERMES_WEBUI_DESKTOP_SHELL", value)
+        assert import_bootstrap._desktop_shell_enabled() is False
+
+    @pytest.mark.parametrize("value", ["1", "true", "TRUE"])
+    def test_desktop_shell_can_be_enabled(self, import_bootstrap, clean_env, monkeypatch, value):
+        monkeypatch.setenv("HERMES_WEBUI_DESKTOP_SHELL", value)
+        assert import_bootstrap._desktop_shell_enabled() is True
+
+    def test_desktop_shell_sidecar_spawns_helper_with_webui_env(self, import_bootstrap, clean_env, monkeypatch, tmp_path):
+        bs = import_bootstrap
+        monkeypatch.setenv("HERMES_WEBUI_DESKTOP_SHELL", "1")
+        monkeypatch.delenv("HERMES_WEBUI_STATE_DIR", raising=False)
+        monkeypatch.setattr(sys, "platform", "linux")
+        monkeypatch.setattr(bs.shutil, "which", lambda name: "/bin/bash" if name == "bash" else None)
+        monkeypatch.setattr(bs.os, "getpid", lambda: 4242)
+        spawn_calls = []
+
+        def fake_spawnve(mode, path, argv, env):
+            spawn_calls.append((mode, path, argv, env))
+            return 9999
+
+        monkeypatch.setattr(bs.os, "spawnve", fake_spawnve)
+        bs._start_desktop_shell_sidecar("0.0.0.0", 8788, tmp_path / "state")
+
+        assert len(spawn_calls) == 1
+        mode, path, argv, env = spawn_calls[0]
+        assert mode == bs.os.P_NOWAIT
+        assert path == "/bin/bash"
+        assert argv[0] == "/bin/bash"
+        assert argv[1].endswith("scripts/start-browser-workbench-desktop.sh")
+        assert env["HERMES_WEBUI_URL"] == "http://127.0.0.1:8788"
+        assert env["HERMES_WEBUI_HEALTH_URL"] == "http://127.0.0.1:8788/health"
+        assert env["HERMES_WEBUI_PID"] == "4242"
+        assert env["HERMES_WEBUI_STATE_DIR"] == str(tmp_path / "state")
+        assert env["HERMES_WEBUI_DESKTOP_PID_FILE"] == str(tmp_path / "state" / "desktop-shell-8788.pid")
+
+
 class TestForegroundExecutabilityGuard:
     """If python_exe is missing or non-executable, raise a clear error
     instead of letting os.execv raise OSError → SystemExit(1) → supervisor
@@ -516,6 +572,7 @@ class TestForegroundExecutabilityGuard:
         monkeypatch.setattr(bs, "hermes_command_exists", lambda: True)
         monkeypatch.setattr(bs, "discover_launcher_python", lambda *a: str(bad_python))
         monkeypatch.setattr(bs, "ensure_python_has_webui_deps", lambda *a, **kw: a[0])
+        monkeypatch.setattr(bs, "_start_desktop_shell_sidecar", lambda *a, **kw: None)
         monkeypatch.setenv("HERMES_WEBUI_STATE_DIR", str(tmp_path / "state"))
         return bs
 

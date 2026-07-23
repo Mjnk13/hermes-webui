@@ -172,12 +172,16 @@ def test_stream_done_runs_scroll_preserving_collapse_pass_after_disarm():
     # only for followers to re-settle at the tail. This makes keep-open genuinely
     # one-frame for everyone.
     disarm_idx = MESSAGES_JS.index("_disarmKeepSettledWorklogOpen()")
-    after = MESSAGES_JS[disarm_idx : disarm_idx + 700]
+    after = MESSAGES_JS[disarm_idx : disarm_idx + 1800]
     # The collapse pass must run after disarm for BOTH pin states.
     assert "_renderMessagesWithScrollSnapshot()" in after, (
         "after _disarmKeepSettledWorklogOpen() the STREAM_DONE handler must run a "
         "scroll-preserving collapse pass (_renderMessagesWithScrollSnapshot) so the "
         "forced-open worklog collapses back to the user/live state without the jump."
+    )
+    assert "requestAnimationFrame(_collapseSettledWorklog)" in after, (
+        "the height-stable keep-open pass must be allowed to paint before the "
+        "collapse render; running both synchronously creates one completion long task"
     )
     # The follower re-settle (scrollToBottom) must come AFTER the collapse render —
     # otherwise a pinned follower keeps the forced-open DOM (scrollToBottom does not
@@ -199,4 +203,3 @@ def test_stream_done_runs_scroll_preserving_collapse_pass_after_disarm():
     wrapper = _function_body(UI_JS, "_renderMessagesWithScrollSnapshot")
     assert "_captureMessageScrollSnapshot()" in wrapper
     assert "_restoreMessageScrollSnapshotSameFrame" in wrapper
-

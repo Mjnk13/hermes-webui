@@ -19,6 +19,7 @@ def _run_streaming_with_fake_agent(
     *,
     prior_messages=None,
     prior_context_messages=None,
+    stream_deltas=None,
 ):
     session_dir = tmp_path / "sessions"
     session_dir.mkdir()
@@ -72,6 +73,9 @@ def _run_streaming_with_fake_agent(
             self._last_error = None
 
         def run_conversation(self, **kwargs):
+            for delta in stream_deltas or []:
+                if self.stream_delta_callback:
+                    self.stream_delta_callback(delta)
             return agent_result
 
         def interrupt(self, _message):
@@ -279,6 +283,48 @@ def test_streaming_tool_limit_partial_without_final_answer_emits_no_final_apperr
         message.get("content") != streaming._MAX_ITERATION_SUMMARY_REQUEST
         for message in payload["messages"]
     )
+
+
+def test_streaming_tool_limit_preserves_summary_delivered_only_by_stream_callback(
+    tmp_path,
+    monkeypatch,
+):
+    summary = "I reached the tool limit. Here is what I completed and what remains."
+    result = {
+        "status": "partial",
+        "turn_exit_reason": "max_iterations_reached(30/30)",
+        "messages": [
+            {"role": "user", "content": "Do the long task."},
+            {"role": "assistant", "content": "", "tool_calls": [{"id": "call_1"}]},
+            {"role": "tool", "tool_call_id": "call_1", "content": "result"},
+            {"role": "user", "content": streaming._MAX_ITERATION_SUMMARY_REQUEST},
+        ],
+    }
+
+    events, payload = _run_streaming_with_fake_agent(
+        tmp_path,
+        monkeypatch,
+        result,
+        stream_deltas=[summary],
+    )
+
+    assert not [
+        event_payload
+        for event, event_payload in events
+        if event == "apperror" and event_payload.get("type") == "tool_limit_reached"
+    ], "a streamed summary must settle as usable output, not be replaced by an error"
+    done_payloads = [event_payload for event, event_payload in events if event == "done"]
+    assert done_payloads, "expected a terminal done event for the preserved summary"
+    assert done_payloads[-1]["terminal_state"] == "tool_limit_reached"
+    assert done_payloads[-1]["usable_output"] is True
+
+    assistant = next(
+        message
+        for message in payload["messages"]
+        if message.get("role") == "assistant" and message.get("content") == summary
+    )
+    assert assistant["_terminal_state"] == "tool_limit_reached"
+    assert assistant["_statusCard"]["title"] == "Tool iteration limit reached"
 
 
 def test_streaming_tool_limit_with_fallback_final_response_surfaces_closure_text(tmp_path, monkeypatch):

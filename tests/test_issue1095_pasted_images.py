@@ -18,6 +18,15 @@ def _read_css():
         return f.read()
 
 
+def _render_tray_body():
+    ui = _read_js('ui.js')
+    start = ui.find('function renderTray()')
+    assert start >= 0, 'renderTray() not found in ui.js'
+    end = ui.find('function addFiles(', start)
+    assert end > start, 'addFiles() must follow renderTray() in ui.js'
+    return ui[start:end]
+
+
 # ── Bug 1: Composer tray thumbnail previews ────────────────────────────────
 
 class TestComposerTrayThumbnails:
@@ -25,39 +34,27 @@ class TestComposerTrayThumbnails:
 
     def test_rendertray_checks_image_extension(self):
         """renderTray must branch on _IMAGE_EXTS for the file object in S.pendingFiles."""
-        ui = _read_js('ui.js')
-        # Find renderTray function body
-        idx = ui.find('function renderTray()')
-        assert idx >= 0, 'renderTray() not found in ui.js'
-        body = ui[idx:idx + 800]
+        body = _render_tray_body()
         assert '_IMAGE_EXTS.test(' in body, 'renderTray must check _IMAGE_EXTS for thumbnail vs chip'
 
     def test_rendertray_uses_createobjecturl_for_images(self):
         """Image files must use URL.createObjectURL(f) to generate a blob URL for the thumbnail."""
-        ui = _read_js('ui.js')
-        idx = ui.find('function renderTray()')
-        body = ui[idx:idx + 800]
+        body = _render_tray_body()
         assert 'URL.createObjectURL(' in body, 'renderTray must use URL.createObjectURL for image thumbnails'
 
     def test_rendertray_revokes_blob_url_on_remove(self):
         """Blob URLs must be revoked when a file is removed to prevent memory leaks."""
-        ui = _read_js('ui.js')
-        idx = ui.find('function renderTray()')
-        body = ui[idx:idx + 2500]
+        body = _render_tray_body()
         assert 'URL.revokeObjectURL(' in body, 'renderTray must revoke blob URL when chip is removed'
 
     def test_rendertray_uses_attach_thumb_class(self):
         """Image chips must use attach-thumb class for the thumbnail <img> element."""
-        ui = _read_js('ui.js')
-        idx = ui.find('function renderTray()')
-        body = ui[idx:idx + 800]
+        body = _render_tray_body()
         assert 'attach-thumb' in body, 'renderTray image chip must use attach-thumb class'
 
     def test_rendertray_non_image_still_uses_paperclip(self):
         """Non-image files must still get the paperclip chip (not thumbnail)."""
-        ui = _read_js('ui.js')
-        idx = ui.find('function renderTray()')
-        body = ui[idx:idx + 800]
+        body = _render_tray_body()
         assert 'paperclip' in body, 'non-image files must still use paperclip chip in renderTray'
 
     def test_attach_thumb_css_present(self):
@@ -79,6 +76,13 @@ class TestComposerTrayThumbnails:
         """addFiles() must still exist after renderTray refactor."""
         ui = _read_js('ui.js')
         assert 'function addFiles(' in ui, 'addFiles() must not be removed from ui.js'
+
+    def test_attach_files_to_prompt_bridge_exports_existing_attach_path(self):
+        """External UI modules must use the same composer attachment path as file/paste uploads."""
+        ui = _read_js('ui.js')
+        assert 'function attachFilesToPrompt(files)' in ui
+        assert 'addFiles(list)' in ui
+        assert 'window.attachFilesToPrompt=attachFilesToPrompt' in ui
 
 
 # ── Bug 2: Chat history image rendering ───────────────────────────────────

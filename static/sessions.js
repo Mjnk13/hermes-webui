@@ -208,7 +208,30 @@ async function _restoreRememberedNewChatDraftSession() {
   }
 }
 
-function _saveComposerDraft(sid, text, files) {
+function _composerDraftContextItems(contextItems) {
+  return Array.isArray(contextItems)
+    ? contextItems.filter(item => item && typeof item === 'object').slice(0, 8)
+    : [];
+}
+
+function _composerDraftBrowserContextParts(parts) {
+  return Array.isArray(parts)
+    ? parts.filter(part => part && typeof part === 'object').slice(0, 24)
+    : [];
+}
+
+function _currentComposerContextItems() {
+  if (typeof window !== 'undefined' && typeof window._syncPendingContextItemsFromComposer === 'function') window._syncPendingContextItemsFromComposer();
+  return _composerDraftContextItems(S.pendingContextItems);
+}
+
+function _currentComposerBrowserContextParts() {
+  return (typeof window !== 'undefined' && typeof window._composerBrowserContextPartsForSend === 'function')
+    ? _composerDraftBrowserContextParts(window._composerBrowserContextPartsForSend())
+    : [];
+}
+
+function _saveComposerDraft(sid, text, files, contextItems, browserContextParts) {
   if (!sid) return;
   clearTimeout(_draftSaveTimer);
   const normalizedText = String(text || '');
@@ -217,10 +240,12 @@ function _saveComposerDraft(sid, text, files) {
     _clearComposerDraftRestoreSuppression(sid);
     _composerDraftKnownPayloadSessions.add(sid);
   }
+  const draftContextItems = _composerDraftContextItems(contextItems);
+  const draftBrowserContextParts = _composerDraftBrowserContextParts(browserContextParts || _currentComposerBrowserContextParts());
   _draftSaveTimer = setTimeout(() => {
     api('/api/session/draft', {
       method: 'POST',
-      body: JSON.stringify({ session_id: sid, text: normalizedText, files: normalizedFiles }),
+      body: JSON.stringify({ session_id: sid, text: normalizedText, files: normalizedFiles, context_items: draftContextItems, browser_context_parts: draftBrowserContextParts }),
     }).then(() => {
       _rememberComposerDraftPayloadState(sid, normalizedText, normalizedFiles);
     }).catch(() => {});
@@ -251,7 +276,7 @@ function _rememberComposerDraftPayloadState(sid, text, files) {
 }
 
 // Immediate save used before session switches.
-function _saveComposerDraftNow(sid, text, files) {
+function _saveComposerDraftNow(sid, text, files, contextItems, browserContextParts) {
   if (!sid) return Promise.resolve();
   clearTimeout(_draftSaveTimer);
   const normalizedText = String(text || '');
@@ -259,10 +284,14 @@ function _saveComposerDraftNow(sid, text, files) {
   if (_composerDraftHasPayload(normalizedText, normalizedFiles)) {
     _clearComposerDraftRestoreSuppression(sid);
   }
+  const draftContextItems = _composerDraftContextItems(contextItems);
+  const draftBrowserContextParts = _composerDraftBrowserContextParts(browserContextParts || _currentComposerBrowserContextParts());
   // Most chat switches leave an empty composer. Avoid putting the switch path
   // behind a network POST unless there is new local draft content or an existing
   // server draft that must be cleared.
   if (!_composerDraftHasPayload(normalizedText, normalizedFiles)
+      && !draftContextItems.length
+      && !draftBrowserContextParts.length
       && S.session && S.session.session_id === sid
       && !_sessionComposerDraftHasPayload(S.session)
       && !_composerDraftKnownPayloadSessions.has(sid)) {
@@ -270,7 +299,7 @@ function _saveComposerDraftNow(sid, text, files) {
   }
   return api('/api/session/draft', {
     method: 'POST',
-    body: JSON.stringify({ session_id: sid, text: normalizedText, files: normalizedFiles }),
+    body: JSON.stringify({ session_id: sid, text: normalizedText, files: normalizedFiles, context_items: draftContextItems, browser_context_parts: draftBrowserContextParts }),
   }).then(() => {
     _rememberComposerDraftPayloadState(sid, normalizedText, normalizedFiles);
   }).catch(() => {});
@@ -287,6 +316,8 @@ function _restoreComposerDraft(draft, targetSid, opts={}) {
   if (targetSid && _loadingSessionId !== null && _loadingSessionId !== targetSid) return;
   const text = (draft && typeof draft.text === 'string') ? draft.text : '';
   const files = (draft && Array.isArray(draft.files)) ? draft.files : [];
+  const contextItems = _composerDraftContextItems(draft && draft.context_items);
+  const browserContextParts = _composerDraftBrowserContextParts(draft && draft.browser_context_parts);
   const current = ta.value || '';
   const preserveActiveInput = !!(opts && opts.preserveActiveInput);
   const restoreSid = targetSid || (S.session && S.session.session_id);
@@ -304,20 +335,29 @@ function _restoreComposerDraft(draft, targetSid, opts={}) {
 
   // If there's no text and no files, clear the textarea (a previous session's
   // draft may still be sitting there from a cross-session switch).
-  if (!text && !files.length) {
+  if (!text && !files.length && !contextItems.length && !browserContextParts.length) {
     if (current) {
       ta.value = '';
       if (typeof autoResize === 'function') autoResize();
       if (typeof updateSendBtn === 'function') updateSendBtn();
     }
+    if (Array.isArray(S.pendingContextItems) && S.pendingContextItems.length) {
+      S.pendingContextItems = [];
+      if (typeof renderTray === 'function') renderTray();
+    }
     return;
   }
   // Only update if different to avoid cursor jumps on unrelated session switches.
-  if (current !== text) {
+  const restoredParts = browserContextParts.length && typeof window !== 'undefined' && typeof window._composerSetBrowserContextParts === 'function'
+    ? window._composerSetBrowserContextParts(ta, browserContextParts)
+    : false;
+  if (!restoredParts && current !== text) {
     ta.value = text;
     if (typeof autoResize === 'function') autoResize();
     if (typeof updateSendBtn === 'function') updateSendBtn();
   }
+  S.pendingContextItems = contextItems;
+  if (typeof renderTray === 'function') renderTray();
   // Files restoration is skipped for now (requires S.pendingFiles plumbing).
 }
 
@@ -330,7 +370,7 @@ function _clearComposerDraft(sid, text, files) {
   else _suppressComposerDraftRestoreAfterSubmit(sid);
   return api('/api/session/draft', {
     method: 'POST',
-    body: JSON.stringify({ session_id: sid, text: '' }),
+    body: JSON.stringify({ session_id: sid, text: '', files: [], context_items: [], browser_context_parts: [] }),
   }).then(() => {
     _rememberComposerDraftPayloadState(sid, '', []);
   }).catch(() => {});
@@ -1097,6 +1137,17 @@ function _selectLiveRecoveryInflight(localInflight, serverLiveSnapshot, activeSt
   return serverSeq>=localSeq?selectDurableSnapshot():localInflight;
 }
 
+function _shouldReplayRestoredLiveToolCards(restoredLiveTurn,didReconnect,restoredAnchorScene){
+  // A successfully mounted anchor scene already contains the recovery
+  // snapshot's visible tool rows. Replaying the same persisted list would send
+  // every item through appendLiveToolCard(), whose anchor-owner branch rebuilds
+  // the complete scene. On noisy threads that turns one session selection into
+  // dozens of synchronous DOM rebuilds and multi-second renderer stalls.
+  // Snapshot/legacy HTML restores still need the replay because their tool rows
+  // can be incomplete; only the authoritative anchor-scene path may skip it.
+  return !!restoredLiveTurn&&!!didReconnect&&!restoredAnchorScene;
+}
+
 function _anchorActivitySceneStreamId(scene){
   if(!scene||typeof scene!=='object') return '';
   const identity=scene.identity&&typeof scene.identity==='object'?scene.identity:null;
@@ -1473,7 +1524,7 @@ async function newSession(flash, options={}){
         if(s.startsWith('gpt'))return 'openai';if(s.startsWith('claude'))return 'anthropic';
         if(s.startsWith('gemini'))return 'google';return '';})(newModelState.model);
       const _normProv=p=>{const s=String(p||'').toLowerCase();
-        if(s.startsWith('openai'))return 'openai';if(s.startsWith('anthropic')||s.startsWith('claude'))return 'anthropic';
+        if(s.startsWith('openai')||s==='codex-lb')return 'openai';if(s.startsWith('anthropic')||s.startsWith('claude'))return 'anthropic';
         if(s.startsWith('google')||s.startsWith('gemini'))return 'google';return s;};
       const _familyMismatch=_familyProvider&&_fallbackProvider&&_normProv(_fallbackProvider)!==_familyProvider;
       const _fallbackIsNamedCustom=String(_fallbackProvider||'').toLowerCase().startsWith('custom:');
@@ -1540,6 +1591,7 @@ async function newSession(flash, options={}){
         cache_hit_percent:data.session.cache_hit_percent,
         context_length:data.session.context_length||0,
         last_prompt_tokens:data.session.last_prompt_tokens||0,
+        compression_count:data.session.compression_count||0,
         post_compression_context_tokens_estimate:data.session.post_compression_context_tokens_estimate||null,
         threshold_tokens:data.session.threshold_tokens||0,
       });
@@ -1666,6 +1718,21 @@ async function _switchProfileForSessionLoad(profile){
   }
 }
 
+function _activateChatBodyForSessionSelection(){
+  const mainEl=typeof document!=='undefined'?document.querySelector('main.main'):null;
+  const showingBrowser=!!(mainEl&&mainEl.classList&&mainEl.classList.contains('showing-browser'));
+  const alreadyChat=!showingBrowser&&(typeof _currentPanel==='undefined'||_currentPanel==='chat');
+  if(alreadyChat) return;
+  if(typeof switchPanel==='function'){
+    try{
+      // A session row/child/lineage click is an explicit request to return to the
+      // conversation body.  Browser Workbench tabs stay preserved; switchPanel('chat')
+      // only hides the active native/browser surface instead of closing it.
+      void switchPanel('chat',{fromSessionSelection:true,bypassSettingsGuard:true});
+    }catch(_){}
+  }
+}
+
 async function loadSession(sid){
   const opts = arguments[1] || {};
   // Resolve canonical lineage SID BEFORE both the direct and sidebar preload
@@ -1686,7 +1753,13 @@ async function loadSession(sid){
   }
   const forceReload = !!opts.force;
   const currentSid = S.session ? S.session.session_id : null;
+  if(typeof _streamUiDiagnostic==='function') _streamUiDiagnostic('lifecycle','chat-thread-change-requested',{
+    previous_session_id:currentSid,
+    next_session_id:sid,
+    force:!!opts.force,
+  });
   const sameSessionForceReload = forceReload && currentSid===sid;
+  if(opts.fromSessionSelection) _activateChatBodyForSessionSelection();
   // Clicking the already-open session in the sidebar is a no-op. Reloading it
   // tears down active pane state and can reset the long-session scroll window
   // to the top even though the user did not navigate anywhere. Explicit
@@ -1708,6 +1781,19 @@ async function loadSession(sid){
         Number(S.session.last_message_at || S.session.updated_at || 0)
       );
     }
+    // The transcript is already current, but the shared queue card may have
+    // been detached/hidden by panel or tab navigation. Reconcile it from this
+    // session's queue before taking the no-op return.
+    if(typeof _reconcileActiveSessionQueueUi==='function') _reconcileActiveSessionQueueUi('same-thread-selection');
+    else{
+      if(typeof _hydrateSessionQueueFromStorage==='function'){
+        try{_hydrateSessionQueueFromStorage(sid);}catch(_){}
+      }
+      if(typeof updateQueueBadge==='function') updateQueueBadge(sid);
+    }
+    if(typeof _streamUiDiagnostic==='function') _streamUiDiagnostic('lifecycle','chat-thread-selection-noop',{
+      session_id:sid,
+    });
     return;
   }
   // Mark this session as the in-flight load. Subsequent loadSession() calls
@@ -1736,7 +1822,7 @@ async function loadSession(sid){
   if (currentSid && currentSid !== sid) {
     if(typeof window._clearPendingSelections==='function') window._clearPendingSelections();
     if(typeof _clearQueueCardDisplay==='function') _clearQueueCardDisplay(currentSid);
-    await _saveComposerDraftNow(currentSid, ($('msg') || {}).value || '', S.pendingFiles ? [...S.pendingFiles] : []);
+    await _saveComposerDraftNow(currentSid, ($('msg') || {}).value || '', S.pendingFiles ? [...S.pendingFiles] : [], _currentComposerContextItems());
     // The awaited draft save above yields the event loop. If another
     // loadSession() started for a different session while we were waiting
     // (rapid switch B→C), _loadingSessionId now points at that newer load —
@@ -1807,7 +1893,12 @@ async function loadSession(sid){
     // for a backgrounded session, preventing leaked connections that would
     // pump token events into an orphaned closure, freezing the main thread.
     if (currentSid && currentSid !== sid && typeof closeOtherLiveStreams === 'function') {
-      closeOtherLiveStreams(sid);
+      // The outgoing live DOM was captured immediately above, before the
+      // loading placeholder can replace it. Avoid serializing that same large
+      // Worklog again inside closeLiveStream; noisy active threads can contain
+      // tens of thousands of nodes and this duplicate synchronous snapshot
+      // blocks Electron during every sidebar selection.
+      closeOtherLiveStreams(sid,{skipDomSnapshot:true});
     }
     _loadingOlder = false;
     const _msgInner = $('msgInner');
@@ -1955,6 +2046,19 @@ async function loadSession(sid){
     return loadSession(continuationSid,{...opts,skipLineageResolve:true,skipContinuationResolve:true,force:true,_preloadNotified:true});
   }
   S.session=data.session;
+  // Restore the complete queued-message list before choosing the live/idle
+  // rendering path. Queue state is browser-owned and session-scoped, so a tab
+  // remount must rebuild SESSION_QUEUES for both active and idle threads. Keep
+  // the durable copy until shift/edit/delete explicitly mutates the queue.
+  if(typeof _hydrateSessionQueueFromStorage==='function'){
+    try{_hydrateSessionQueueFromStorage(sid);}catch(_){}
+  }
+  // Queue UI is independent of transcript loading. Repaint immediately after
+  // accepting the session metadata so both the idle branch and the INFLIGHT
+  // branch restore the list; previously only the idle path reached
+  // updateQueueBadge(), leaving active-agent queues present but invisible.
+  if(typeof _reconcileActiveSessionQueueUi==='function') _reconcileActiveSessionQueueUi('session-metadata-loaded');
+  else if(typeof updateQueueBadge==='function') updateQueueBadge(sid);
   if(typeof _clearEmptyComposerModelOverride==='function') _clearEmptyComposerModelOverride();
   // Loading a real existing session abandons any pre-session toolset override
   // staged on the empty composer before any deferred refresh work runs.
@@ -1977,7 +2081,14 @@ async function loadSession(sid){
   }
   if(typeof _hydrateTodosFromSession==='function') _hydrateTodosFromSession(S.session);
   S.session._modelResolutionDeferred=true;
-  S.lastUsage={...(data.session.last_usage||{})};
+  const _loadedSessionUsage={...(data.session.last_usage||{})};
+  // A same-session refresh can finish after newer live metering events. Do not
+  // replace that browser-live snapshot with the older persisted last_usage;
+  // doing so freezes or moves the context/compression indicator backwards
+  // until the user leaves and re-enters the thread.
+  S.lastUsage=(sameSessionForceReload&&(S.activeStreamId||data.session.active_stream_id)&&typeof _mergeUsageForCtxIndicator==='function')
+    ? _mergeUsageForCtxIndicator(S.lastUsage||{},_loadedSessionUsage)
+    : _loadedSessionUsage;
   // Reset scroll-direction tracker only on real session switches so the new
   // chat's first scroll doesn't compare against the previous chat's scrollTop
   // and false-trigger an unpin (#1731 follow-up — Opus stage-302 SHOULD-FIX).
@@ -2189,7 +2300,7 @@ async function loadSession(sid){
         else restoredLiveTurn=restoreLiveTurnHtmlForSession(sid);
       }
     }
-    if(restoredLiveTurn&&didReconnect){
+    if(_shouldReplayRestoredLiveToolCards(restoredLiveTurn,didReconnect,restoredAnchorScene)){
       replayPersistedLiveToolCards({skipUnkeyedRestoredDuplicates:true});
     }
     if(!restoredLiveTurn){
@@ -2203,6 +2314,7 @@ async function loadSession(sid){
       const liveTurn=document.getElementById('liveAssistantTurn');
       if(!liveTurn||!liveTurn.querySelector('.tool-call-group[data-tool-worklog-group="1"]')) ensureLiveWorklogShell();
     }
+    if(typeof _resumeVisibleLiveStreamAfterControl==='function') _resumeVisibleLiveStreamAfterControl(sid);
     _deferWorkspaceRefreshForSession(sid);
     setBusy(true);setComposerStatus('');
     startApprovalPolling(sid);
@@ -2236,31 +2348,6 @@ async function loadSession(sid){
     }
     // Stale? A newer loadSession() call has already started (#1060).
     if (!_isCurrentLoad()) return;
-
-    // Restore any queued message that survived page refresh or tab restore.
-    if(typeof queueSessionMessage==='function'){
-      try{
-        const _entries=typeof _readPersistedSessionQueue==='function'
-          ? _readPersistedSessionQueue(sid)
-          : [];
-        if(Array.isArray(_entries)&&_entries.length){
-          const _lastMsg=S.messages.slice().reverse()
-            .find(m=>m&&m.role==='assistant');
-          const _lastAsst=_lastMsg?(_lastMsg.timestamp||_lastMsg._ts||0)*1000:0;
-          const _fresh=_entries.filter(e=>!e._queued_at||e._queued_at>_lastAsst);
-          if(_fresh.length){
-            const _first=_fresh[0];
-            const _msg=$&&$('msg');
-            if(_msg&&_first.text&&!_msg.value){
-              _msg.value=_first.text||'';
-              if(typeof autoResize==='function') autoResize();
-              if(typeof showToast==='function') showToast((_fresh.length>1?`${_fresh.length} queued messages restored (showing first)`:'Queued message restored')+' — review and send when ready');
-            }
-          }
-          if(typeof _clearPersistedSessionQueue==='function') _clearPersistedSessionQueue(sid);
-        }
-      }catch(_){if(typeof _clearPersistedSessionQueue==='function') _clearPersistedSessionQueue(sid);}
-    }
 
     // Reconstruct tool calls from message metadata, or fall back to session-level summary.
     // (hasMessageToolMetadata already computed inside _ensureMessagesLoaded; S.toolCalls set there.)
@@ -2302,6 +2389,7 @@ async function loadSession(sid){
         if(typeof ensureLiveWorklogShell==='function') ensureLiveWorklogShell();
         else appendThinking();
       }
+      if(typeof _resumeVisibleLiveStreamAfterControl==='function') _resumeVisibleLiveStreamAfterControl(sid);
       _deferWorkspaceRefreshForSession(sid);
       updateQueueBadge(sid);
       startApprovalPolling(sid);
@@ -2338,6 +2426,7 @@ async function loadSession(sid){
       cache_hit_percent: _pick(u.cache_hit_percent, _s.cache_hit_percent, null),
       context_length:    _pickPositive(u.context_length, _s.context_length),
       last_prompt_tokens:_pick(u.last_prompt_tokens,_s.last_prompt_tokens),
+      compression_count:_pick(u.compression_count,_s.compression_count),
       post_compression_context_tokens_estimate:_s.post_compression_context_tokens_estimate||null,
       threshold_tokens:  _pick(_s.threshold_tokens,  u.threshold_tokens),
     });
@@ -2376,7 +2465,14 @@ async function loadSession(sid){
     );
   }
 
+  if(currentSid!==sid&&typeof resetTurnWorkspaceMutations==='function') resetTurnWorkspaceMutations();
   if(typeof renderSessionArtifacts==='function') renderSessionArtifacts();
+  if(typeof _streamUiDiagnostic==='function') _streamUiDiagnostic('lifecycle','chat-thread-changed',{
+    previous_session_id:currentSid,
+    session_id:sid,
+    message_count:Array.isArray(S.messages)?S.messages.length:0,
+    active_stream_id:S.activeStreamId,
+  });
 
   // ── Cross-channel handoff hint ──
   // After session fully loaded, check if this is a messaging session with
@@ -2961,6 +3057,10 @@ function _resolveSessionModelForDisplaySoon(sid){
       S.session.context_length=resolvedContextLength;
       S.session.threshold_tokens=data.session.threshold_tokens||0;
       S.session.last_prompt_tokens=data.session.last_prompt_tokens||0;
+      S.session.compression_count=Math.max(
+        Number(S.session.compression_count)||0,
+        Number(data.session.compression_count)||0,
+      );
       S.session.post_compression_context_tokens_estimate=data.session.post_compression_context_tokens_estimate||null;
       S.session._modelResolutionDeferred=false;
       syncTopbar();
@@ -2976,6 +3076,7 @@ function _resolveSessionModelForDisplaySoon(sid){
           cache_hit_percent:_pick(u.cache_hit_percent,S.session.cache_hit_percent,null),
           context_length:resolvedContextLength||u.context_length||0,
           last_prompt_tokens:_pick(u.last_prompt_tokens,S.session.last_prompt_tokens),
+          compression_count:_pick(u.compression_count,S.session.compression_count),
           post_compression_context_tokens_estimate:S.session.post_compression_context_tokens_estimate,
           threshold_tokens:data.session.threshold_tokens||0,
         });
@@ -3099,6 +3200,16 @@ function _syncToolCallsForLoadedMessages(messages, sessionToolCalls){
   }
 }
 
+function _debugLogHydratedBrowserContextParts(messages){
+  try{
+    (messages||[]).forEach(m=>{
+      if(!m||m.role!=='user') return;
+      const parts=Array.isArray(m.parts)?m.parts:(Array.isArray(m.browser_context_parts)?m.browser_context_parts:[]);
+      if(parts.length) console.log("hydrated.parts", parts);
+    });
+  }catch(_){ }
+}
+
 async function _ensureMessagesLoaded(sid, opts) {
   // `opts` is an explicit named parameter (vs loadSession's arguments[1]
   // pattern) because _ensureMessagesLoaded is a module-private helper: it is
@@ -3177,6 +3288,7 @@ async function _ensureMessagesLoaded(sid, opts) {
     _pendingCarryForwardSnapshot = null;
   }
   if(typeof clearVisibleMessageRowCache==='function') clearVisibleMessageRowCache();
+  _debugLogHydratedBrowserContextParts(msgs);
   S.messages = msgs;
   // Expand render window to cover all loaded messages so the next
   // renderMessages() doesn't hide most of them behind a tiny window.
@@ -3266,6 +3378,12 @@ function _sameTranscriptMessage(a,b){
   if(!(a&&b)) return false;
   const role=String(a.role||'');
   if(role!==String(b.role||'')) return false;
+  const aClientId=String(a.client_message_id||'').trim();
+  const bClientId=String(b.client_message_id||'').trim();
+  // A client id identifies a submitted turn, not its current rendering. If
+  // either representation has one, never fall back to text equality: two
+  // intentional user turns may contain exactly the same text.
+  if(aClientId||bClientId) return !!(aClientId&&bClientId&&aClientId===bClientId);
   const aText=_messageComparableText(a);
   const bText=_messageComparableText(b);
   if(aText===bText) return true;
@@ -3273,6 +3391,20 @@ function _sameTranscriptMessage(a,b){
     return _normalizeUserTranscriptText(aText)===_normalizeUserTranscriptText(bText);
   }
   return false;
+}
+
+function _mergeTranscriptMessageMetadata(target,source){
+  if(!(target&&source&&typeof target==='object'&&typeof source==='object')) return target;
+  const arrayFields=['attachments','context_items','browser_context_parts','parts','combined_queue_message_ids'];
+  arrayFields.forEach(field=>{
+    const incoming=Array.isArray(source[field])?source[field].filter(Boolean):[];
+    const current=Array.isArray(target[field])?target[field].filter(Boolean):[];
+    if(incoming.length>current.length) target[field]=incoming;
+  });
+  if(!target.client_message_id&&source.client_message_id) target.client_message_id=source.client_message_id;
+  if(!target._ts&&source._ts) target._ts=source._ts;
+  if(!target.timestamp&&source.timestamp) target.timestamp=source.timestamp;
+  return target;
 }
 
 function _currentTailUserMessage(messages){
@@ -3294,7 +3426,9 @@ function _currentTailUserMessage(messages){
 function _hasCurrentTailUserDuplicate(messages,candidate){
   if(!candidate||String(candidate.role||'')!=='user') return false;
   const existing=_currentTailUserMessage(messages);
-  return !!(existing&&_sameTranscriptMessage(existing,candidate));
+  const duplicate=!!(existing&&_sameTranscriptMessage(existing,candidate));
+  if(duplicate) _mergeTranscriptMessageMetadata(existing,candidate);
+  return duplicate;
 }
 
 function _currentTurnAssistantText(messages){
@@ -3847,6 +3981,7 @@ async function _ensureAllMessagesLoaded() {
     if (typeof window._carryForwardEphemeralTurnFields === 'function') {
       _msgsToAssign = window._carryForwardEphemeralTurnFields(S.messages || [], msgs);
     }
+    _debugLogHydratedBrowserContextParts(_msgsToAssign);
     S.messages = _msgsToAssign;
     _messagesTruncated = false;
     _oldestIdx = 0;
@@ -4458,6 +4593,7 @@ async function _copySessionLink(session){
 
 function _mountSessionActionMenu(menu, session, anchorEl){
   _sessionActionPreviousFocus=document.activeElement;
+  menu.dataset.globalOverlay='always';
   document.body.appendChild(menu);
   _sessionActionMenu = menu;
   _sessionActionAnchor = anchorEl;
@@ -8155,7 +8291,9 @@ function renderSessionListFromCache(){
         row.title=t('session_lineage_segment_open');
         row.onclick=async(e)=>{
           e.stopPropagation();
-          await _openSidebarSession(seg, {skipLineageResolve:true});
+          // #5409: close mobile sidebar synchronously before navigation
+          if(typeof closeMobileSidebar==='function')closeMobileSidebar();
+          await _openSidebarSession(seg, {skipLineageResolve:true,fromSessionSelection:true});
         };
         lineageList.appendChild(row);
       }
@@ -8167,7 +8305,9 @@ function renderSessionListFromCache(){
       ['pointerdown','pointerup','click','touchstart','touchmove','touchend','touchcancel'].forEach(ev=>childList.addEventListener(ev,e=>e.stopPropagation()));
       const sortedChildren=[...s._child_sessions].sort((a,b)=>_sessionTimestampMs(b)-_sessionTimestampMs(a));
       const openChildSession=async(childSession)=>{
-        await _openSidebarSession(childSession, {skipLineageResolve:true});
+        // #5409: close mobile sidebar synchronously before navigation
+        if(typeof closeMobileSidebar==='function')closeMobileSidebar();
+        await _openSidebarSession(childSession, {skipLineageResolve:true,fromSessionSelection:true});
       };
       const childLabelFor=(child)=>{
         const childTitle=_sessionDisplayTitle(child)||'Untitled child session';
@@ -8794,7 +8934,12 @@ function renderSessionListFromCache(){
         if(_renamingSid) return;
         try{
           if(($('sessionSearch').value||'').trim()) _hideSearchPreviewsAfterSelect=true;
-          await _openSidebarSession(s);
+          // #5409: close mobile sidebar synchronously BEFORE awaiting _openSidebarSession
+          // so the user gets instant feedback that navigation is happening, even
+          // for large sessions where loadSession can take 3-15s (metadata fetch +
+          // message load + renderMessages DOM build on slow iOS WKWebView).
+          if(typeof closeMobileSidebar==='function')closeMobileSidebar();
+          await _openSidebarSession(s,{fromSessionSelection:true});
         }finally{
           el.classList.remove('loading');
         }
@@ -9352,7 +9497,7 @@ function navigateSession(dir){
   const i=sids.indexOf(cur);
   if(i<0||!sids.length)return;
   const next=sids[Math.min(Math.max(i+dir,0),sids.length-1)];
-  if(next&&next!==cur) loadSession(next);
+  if(next&&next!==cur) loadSession(next,{fromSessionSelection:true});
 }
 
 document.addEventListener('keydown',(e)=>{

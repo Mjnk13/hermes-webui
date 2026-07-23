@@ -38,6 +38,11 @@ First-time contributor RFCs should be discussed in an issue before opening a PR.
 
 ## Current RFCs
 
+- [`browser-workbench.md`](browser-workbench.md) — proposed Cursor-style
+  embedded browser workbench for WebUI: URL bar, interactive browser viewport,
+  inspect/ping-to-prompt, console/network diagnostics, CDP-backed architecture,
+  and security boundaries. Replaces the removed Browser Inspector bookmarklet
+  prototype with an embedded target UX.
 - [`hermes-run-adapter-contract.md`](hermes-run-adapter-contract.md) — #1925
   event/control contract, runtime-state ownership matrix, acceptance catalog,
   and reversible migration gates for moving WebUI execution behind an explicit

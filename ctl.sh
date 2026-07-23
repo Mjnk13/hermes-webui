@@ -17,8 +17,12 @@ Usage: ./ctl.sh <command> [args]
 
 Commands:
   start [bootstrap args...]   Start Hermes WebUI as a background daemon
+  start-electron [bootstrap args...]
+                              Open only the Electron shell for an already-running WebUI
   stop                        Stop the daemon started by ctl.sh
   restart [bootstrap args...] Stop, then start again
+  reset-electron [bootstrap args...]
+                              Stop/reset the Electron desktop shell for the resolved port
   status                      Show daemon, host/port, log, and health status
   logs [--lines N] [--follow|--no-follow]
                               Show the daemon log (defaults to tail -n 100 -f)
@@ -360,6 +364,38 @@ _is_owned_webui_pid() {
      ( -n "${state_python_bash}" && "${args_slash}" == *"${state_python_bash}"* ) ]]
 }
 
+_is_repo_webui_pid() {
+  local pid="$1" args args_slash repo_slash repo_win="" repo_win_slash=""
+  args="$(_proc_args "${pid}")"
+  [[ -n "${args}" ]] || return 1
+  args_slash="${args//\\//}"
+  repo_slash="${REPO_ROOT//\\//}"
+  if _is_windows_bash; then
+    repo_win="$(cygpath -w "${REPO_ROOT}" 2>/dev/null || true)"
+    repo_win_slash="${repo_win//\\//}"
+  fi
+  [[ "${args_slash}" == *"${repo_slash}/bootstrap.py"* ||
+     "${args_slash}" == *"${repo_slash}/server.py"* ||
+     "${args_slash}" == *"${repo_slash}/start.sh"* ||
+     ( -n "${repo_win_slash}" && "${args_slash}" == *"${repo_win_slash}/bootstrap.py"* ) ||
+     ( -n "${repo_win_slash}" && "${args_slash}" == *"${repo_win_slash}/server.py"* ) ||
+     ( -n "${repo_win_slash}" && "${args_slash}" == *"${repo_win_slash}/start.sh"* ) ]]
+}
+
+_webui_listener_pid_for_port() {
+  local port="$1" pid
+  [[ "${port}" =~ ^[0-9]+$ ]] || return 1
+  command -v lsof >/dev/null 2>&1 || return 1
+  while IFS= read -r pid; do
+    [[ "${pid}" =~ ^[0-9]+$ ]] || continue
+    if _is_alive "${pid}" && _is_repo_webui_pid "${pid}"; then
+      printf '%s\n' "${pid}"
+      return 0
+    fi
+  done < <(lsof -nP -tiTCP:"${port}" -sTCP:LISTEN 2>/dev/null || true)
+  return 1
+}
+
 _current_pid() {
   local pid
   pid="$(_pid_from_file)" || return 1
@@ -377,6 +413,265 @@ _clear_stale_pid() {
   fi
 }
 
+_desktop_shell_user_data_dir() {
+  if [[ -n "${HERMES_WEBUI_DESKTOP_USER_DATA_DIR:-}" ]]; then
+    printf '%s\n' "${HERMES_WEBUI_DESKTOP_USER_DATA_DIR}"
+    return 0
+  fi
+  case "$(uname -s 2>/dev/null || echo unknown)" in
+    Darwin) printf '%s\n' "${HOME}/Library/Application Support/hermes-webui-desktop" ;;
+    *) printf '%s\n' "${XDG_CONFIG_HOME:-${HOME}/.config}/hermes-webui-desktop" ;;
+  esac
+}
+
+_desktop_shell_pid_file_for_port() {
+  local port="$1" state_dir="${HERMES_WEBUI_STATE_DIR:-${DEFAULT_STATE_DIR}}"
+  printf '%s\n' "${state_dir}/desktop-shell-${port}.pid"
+}
+
+_desktop_shell_launchd_label_for_port() {
+  local port="$1"
+  printf '%s.electron.%s\n' "${HERMES_WEBUI_LAUNCHD_LABEL:-${DEFAULT_LAUNCHD_LABEL}}" "${port}"
+}
+
+_remove_desktop_shell_launchd_job() {
+  local port="$1" label
+  [[ "${HERMES_WEBUI_DESKTOP_LAUNCH_METHOD:-launchd}" != "background" ]] || return 0
+  [[ "$(uname -s 2>/dev/null || true)" == "Darwin" ]] || return 0
+  command -v launchctl >/dev/null 2>&1 || return 0
+  label="$(_desktop_shell_launchd_label_for_port "${port}")"
+  launchctl remove "${label}" >/dev/null 2>&1 || true
+}
+
+_desktop_shell_enabled() {
+  case "${HERMES_WEBUI_DESKTOP_SHELL:-}" in
+    1 | true | TRUE | True | yes | YES | on | ON | enabled | ENABLED | Enabled) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+_pid_file_process_alive() {
+  local pid_file="$1" pid=""
+  [[ -f "${pid_file}" ]] || return 1
+  pid="$(head -n 1 "${pid_file}" 2>/dev/null | tr -cd '0-9' || true)"
+  [[ "${pid}" =~ ^[0-9]+$ ]] || return 1
+  _is_alive "${pid}"
+}
+
+_ensure_desktop_shell_for_running_webui() {
+  # `start` is also an idempotent ensure operation. If the WebUI server is
+  # already healthy but its optional Electron shell was closed or crashed,
+  # reopen only the shell instead of forcing a server restart.
+  local webui_pid="$1" host="$2" port="$3"
+  _desktop_shell_enabled || return 0
+  _is_windows_bash && return 0
+
+  local sidecar_script="${REPO_ROOT}/scripts/start-browser-workbench-desktop.sh"
+  if [[ ! -f "${sidecar_script}" ]]; then
+    echo "[ctl] Electron desktop shell helper not found: ${sidecar_script}" >&2
+    return 0
+  fi
+
+  local pid_file state_dir connect_host scheme webui_url bash_path
+  state_dir="${HERMES_WEBUI_STATE_DIR:-${DEFAULT_STATE_DIR}}"
+  mkdir -p "${state_dir}"
+  pid_file="$(_desktop_shell_pid_file_for_port "${port}")"
+  if _pid_file_process_alive "${pid_file}.app"; then
+    echo "[ctl] Electron desktop app is already running for ${host}:${port}"
+    return 0
+  fi
+
+  # The helper may be between spawning Electron and writing the app PID, or it
+  # may still be cleaning up after a window crash. Give that transition a
+  # brief chance to settle. This avoids both a duplicate launch and the race
+  # where a second helper sees the old lock, exits, and leaves no app behind.
+  local settle_i
+  if _pid_file_process_alive "${pid_file}.runner" || _pid_file_process_alive "${pid_file}"; then
+    for settle_i in {1..20}; do
+      if _pid_file_process_alive "${pid_file}.app"; then
+        echo "[ctl] Electron desktop app is already running for ${host}:${port}"
+        return 0
+      fi
+      if ! _pid_file_process_alive "${pid_file}.runner" && ! _pid_file_process_alive "${pid_file}"; then
+        break
+      fi
+      sleep 0.1
+    done
+    if _pid_file_process_alive "${pid_file}.runner" || _pid_file_process_alive "${pid_file}"; then
+      echo "[ctl] Electron desktop shell launch is already in progress for ${host}:${port}"
+      return 0
+    fi
+  fi
+
+  connect_host="${host}"
+  case "${connect_host}" in
+    "" | 0.0.0.0 | :: | "[::]") connect_host="127.0.0.1" ;;
+  esac
+  if [[ "${connect_host}" == *:* && "${connect_host}" != \[*\] ]]; then
+    connect_host="[${connect_host}]"
+  fi
+
+  scheme="$(hermes_webui_probe_scheme)"
+  if hermes_webui_probe_health "${host}" "${port}" "/health" 2 >/dev/null 2>&1; then
+    scheme="${_HERMES_WEBUI_PROBE_SCHEME:-${scheme}}"
+  fi
+  webui_url="${scheme}://${connect_host}:${port}"
+  bash_path="$(command -v bash 2>/dev/null || printf '/bin/bash')"
+
+  if [[ "$(uname -s 2>/dev/null || true)" == "Darwin" ]] && command -v launchctl >/dev/null 2>&1 && [[ "${HERMES_WEBUI_DESKTOP_LAUNCH_METHOD:-launchd}" != "background" ]]; then
+    # A plain `nohup ... &` remains in the invoking terminal/process coalition
+    # on macOS and can be reaped as soon as ctl exits. Submit a transient user
+    # LaunchAgent instead, so Electron survives the command that opened it.
+    local desktop_label
+    desktop_label="$(_desktop_shell_launchd_label_for_port "${port}")"
+    launchctl remove "${desktop_label}" >/dev/null 2>&1 || true
+    launchctl submit -l "${desktop_label}" -- /usr/bin/env \
+      "HOME=${HOME}" \
+      "PATH=${PATH}" \
+      "HERMES_WEBUI_URL=${webui_url}" \
+      "HERMES_WEBUI_HEALTH_URL=${webui_url}/health" \
+      "HERMES_WEBUI_PID=${webui_pid}" \
+      "HERMES_WEBUI_STATE_DIR=${state_dir}" \
+      "HERMES_WEBUI_DESKTOP_PID_FILE=${pid_file}" \
+      "HERMES_WEBUI_DESKTOP_RESET=${HERMES_WEBUI_DESKTOP_RESET:-0}" \
+      "HERMES_WEBUI_DESKTOP_DIR=${HERMES_WEBUI_DESKTOP_DIR:-${REPO_ROOT}/desktop}" \
+      "HERMES_WEBUI_DESKTOP_USER_DATA_DIR=${HERMES_WEBUI_DESKTOP_USER_DATA_DIR:-}" \
+      "${bash_path}" "${sidecar_script}"
+  else
+    (
+      trap '' HUP
+      export HERMES_WEBUI_URL="${webui_url}"
+      export HERMES_WEBUI_HEALTH_URL="${webui_url}/health"
+      export HERMES_WEBUI_PID="${webui_pid}"
+      export HERMES_WEBUI_STATE_DIR="${state_dir}"
+      export HERMES_WEBUI_DESKTOP_PID_FILE="${pid_file}"
+      exec nohup "${bash_path}" "${sidecar_script}" >/dev/null 2>&1
+    ) &
+  fi
+  echo "[ctl] Electron desktop shell launch requested for ${webui_url}"
+}
+
+_stop_pid_file_process() {
+  local pid_file="$1" label="${2:-process}" pid=""
+  [[ -f "${pid_file}" ]] || return 0
+  pid="$(head -n 1 "${pid_file}" 2>/dev/null | tr -cd '0-9' || true)"
+  if [[ -n "${pid}" ]] && _is_alive "${pid}"; then
+    echo "[ctl] Stopping ${label} (PID ${pid})"
+    kill -TERM "${pid}" >/dev/null 2>&1 || true
+    local i
+    for i in {1..40}; do
+      if ! _is_alive "${pid}"; then
+        rm -f "${pid_file}"
+        return 0
+      fi
+      sleep 0.1
+    done
+    echo "[ctl] ${label} did not exit after SIGTERM; sending SIGKILL" >&2
+    kill -KILL "${pid}" >/dev/null 2>&1 || true
+  fi
+  rm -f "${pid_file}"
+}
+
+_stop_desktop_shell_pid_file() {
+  local pid_file="$1"
+  _stop_pid_file_process "${pid_file}.app" "Electron desktop app"
+  _stop_pid_file_process "${pid_file}.runner" "Electron desktop shell helper"
+  _stop_pid_file_process "${pid_file}" "Electron desktop shell"
+  rm -f "${pid_file}.app" "${pid_file}.runner" >/dev/null 2>&1 || true
+}
+
+_stop_desktop_shell_for_port() {
+  local port="$1" pid_file
+  [[ "${port}" =~ ^[0-9]+$ ]] || return 0
+  _remove_desktop_shell_launchd_job "${port}"
+  pid_file="$(_desktop_shell_pid_file_for_port "${port}")"
+  _stop_desktop_shell_pid_file "${pid_file}"
+}
+
+_reset_electron_cache_dir() {
+  local user_data_dir="$1"
+  [[ -n "${user_data_dir}" && -d "${user_data_dir}" ]] || return 0
+  rm -rf \
+    "${user_data_dir}/Cache" \
+    "${user_data_dir}/Code Cache" \
+    "${user_data_dir}/GPUCache" \
+    "${user_data_dir}/Service Worker/CacheStorage" \
+    "${user_data_dir}/Service Worker/ScriptCache"
+  echo "[ctl] Reset Electron desktop shell caches: ${user_data_dir}"
+}
+
+reset_electron_cmd() {
+  ensure_home
+  _load_repo_dotenv_preserving_env
+  export HERMES_WEBUI_STATE_DIR="${HERMES_WEBUI_STATE_DIR:-${DEFAULT_STATE_DIR}}"
+  mkdir -p "${HERMES_WEBUI_STATE_DIR}"
+  _parse_launch_binding "$@"
+  local pid_file user_data_dir
+  pid_file="$(_desktop_shell_pid_file_for_port "${CTL_PORT}")"
+  user_data_dir="$(_desktop_shell_user_data_dir)"
+  echo "[ctl] Resetting Electron desktop shell for ${CTL_HOST}:${CTL_PORT}"
+  _stop_desktop_shell_pid_file "${pid_file}"
+  _reset_electron_cache_dir "${user_data_dir}"
+}
+
+start_electron_cmd() {
+  ensure_home
+  _load_repo_dotenv_preserving_env
+  _load_hermes_dotenv
+  export HERMES_WEBUI_STATE_DIR="${HERMES_WEBUI_STATE_DIR:-${DEFAULT_STATE_DIR}}"
+  mkdir -p "${HERMES_WEBUI_STATE_DIR}"
+  _parse_launch_binding "$@"
+
+  # This explicit command is intentionally narrower than `start`: it must
+  # never bootstrap, restart, or otherwise mutate the WebUI backend. Resolve
+  # the existing listener and fail clearly when there is nothing to attach to.
+  local webui_pid
+  if ! webui_pid="$(_webui_listener_pid_for_port "${CTL_PORT}" 2>/dev/null)"; then
+    echo "[ctl] Cannot start Electron: no Hermes WebUI is listening on ${CTL_HOST}:${CTL_PORT}" >&2
+    echo "[ctl] Start the backend first with ./ctl.sh start" >&2
+    return 1
+  fi
+  if ! hermes_webui_probe_health "${CTL_HOST}" "${CTL_PORT}" "/health" 2 >/dev/null 2>&1; then
+    echo "[ctl] Cannot start Electron: Hermes WebUI on ${CTL_HOST}:${CTL_PORT} is not healthy" >&2
+    return 1
+  fi
+
+  # An explicit start-electron request overrides the optional auto-launch
+  # preference for this invocation only. The helper remains idempotent when an
+  # app or launcher is already alive for the resolved port.
+  export HERMES_WEBUI_DESKTOP_SHELL=1
+  _ensure_desktop_shell_for_running_webui "${webui_pid}" "${CTL_HOST}" "${CTL_PORT}"
+
+  # Do not report success merely because the detached helper was requested.
+  # Keeping this command alive until Electron publishes its app PID also avoids
+  # shells/supervisors reaping a just-launched helper before it has crossed the
+  # dependency-check/build phase.
+  local pid_file app_pid="" runner_pid="" i
+  pid_file="$(_desktop_shell_pid_file_for_port "${CTL_PORT}")"
+  for i in {1..300}; do
+    if _pid_file_process_alive "${pid_file}.app"; then
+      app_pid="$(head -n 1 "${pid_file}.app" 2>/dev/null | tr -cd '0-9' || true)"
+      echo "[ctl] Electron desktop app is running (PID ${app_pid})"
+      return 0
+    fi
+    if [[ -f "${pid_file}.runner" ]]; then
+      runner_pid="$(head -n 1 "${pid_file}.runner" 2>/dev/null | tr -cd '0-9' || true)"
+      # The file may still contain the previous helper PID for a few
+      # milliseconds after _ensure_desktop_shell_for_running_webui returns.
+      # Give the newly detached helper time to replace it before treating a
+      # dead PID as a launch failure.
+      if (( i > 20 )) && [[ -n "${runner_pid}" ]] && ! _is_alive "${runner_pid}"; then
+        break
+      fi
+    fi
+    sleep 0.1
+  done
+
+  echo "[ctl] Electron desktop app did not start; see ${HERMES_WEBUI_DESKTOP_LOG_FILE:-${HERMES_WEBUI_STATE_DIR}/desktop-shell-${CTL_PORT}.log}" >&2
+  _stop_desktop_shell_pid_file "${pid_file}"
+  return 1
+}
+
 _pid_listens_on_port() {
   # Best-effort check that PID $1 has a listening socket on TCP port $2.
   # macOS (where launchd exists) ships lsof; if we can't determine ownership we
@@ -391,6 +686,90 @@ _pid_listens_on_port() {
     return 1     # PID is alive but NOT listening on that port → no conflict
   fi
   return 2       # can't determine
+}
+
+_launchd_service_target() {
+  local label="${HERMES_WEBUI_LAUNCHD_LABEL:-${DEFAULT_LAUNCHD_LABEL}}"
+  printf 'gui/%s/%s\n' "$(id -u)" "${label}"
+}
+
+_launchd_plist_path() {
+  local label="${HERMES_WEBUI_LAUNCHD_LABEL:-${DEFAULT_LAUNCHD_LABEL}}"
+  printf '%s/Library/LaunchAgents/%s.plist\n' "${HOME}" "${label}"
+}
+
+_launchd_job_loaded() {
+  [[ "${HERMES_WEBUI_CTL_ALLOW_LAUNCHD_CONFLICT:-0}" == "1" ]] && return 1
+  command -v launchctl >/dev/null 2>&1 || return 1
+  launchctl print "$(_launchd_service_target)" >/dev/null 2>&1
+}
+
+_launchd_configured_port() {
+  command -v launchctl >/dev/null 2>&1 || return 1
+  local target launchd_out port="" plist
+  target="$(_launchd_service_target)"
+  launchd_out="$(launchctl print "${target}" 2>/dev/null || true)"
+  if [[ -n "${launchd_out}" ]]; then
+    port="$(printf '%s\n' "${launchd_out}" | awk '/HERMES_WEBUI_PORT => / { print $3; exit }')"
+  fi
+
+  plist="$(_launchd_plist_path)"
+  if [[ ! "${port}" =~ ^[0-9]+$ && -f "${plist}" ]] && command -v plutil >/dev/null 2>&1; then
+    port="$(plutil -extract EnvironmentVariables.HERMES_WEBUI_PORT raw -o - "${plist}" 2>/dev/null || true)"
+  fi
+  [[ "${port}" =~ ^[0-9]+$ ]] || return 1
+  printf '%s\n' "${port}"
+}
+
+_launchd_job_manages_port() {
+  local wanted_port="$1" configured_port=""
+  [[ "${HERMES_WEBUI_CTL_ALLOW_LAUNCHD_CONFLICT:-0}" == "1" ]] && return 1
+  configured_port="$(_launchd_configured_port 2>/dev/null)" || return 1
+  [[ "${configured_port}" == "${wanted_port}" ]]
+}
+
+_stop_launchd_webui_job() {
+  local target
+  target="$(_launchd_service_target)"
+  if _launchd_job_loaded; then
+    echo "[ctl] Stopping launchd-managed Hermes WebUI (${target})"
+    if ! launchctl bootout "${target}" >/dev/null 2>&1; then
+      echo "[ctl] Failed to stop launchd job ${target}" >&2
+      return 1
+    fi
+  fi
+
+  local i
+  for i in {1..40}; do
+    _launchd_job_loaded || return 0
+    sleep 0.1
+  done
+  echo "[ctl] launchd job ${target} did not stop" >&2
+  return 1
+}
+
+_start_launchd_webui_job() {
+  local target plist domain
+  target="$(_launchd_service_target)"
+  plist="$(_launchd_plist_path)"
+  domain="gui/$(id -u)"
+
+  if ! _launchd_job_loaded; then
+    if [[ ! -f "${plist}" ]]; then
+      echo "[ctl] launchd plist not found: ${plist}" >&2
+      return 1
+    fi
+    echo "[ctl] Loading launchd-managed Hermes WebUI (${target})"
+    if ! launchctl bootstrap "${domain}" "${plist}" >/dev/null 2>&1; then
+      echo "[ctl] Failed to load launchd job ${target}" >&2
+      return 1
+    fi
+  fi
+
+  # bootstrap starts RunAtLoad jobs itself. kickstart is still needed for a
+  # loaded-but-idle job, and is harmless when launchd has already scheduled it.
+  launchctl kickstart "${target}" >/dev/null 2>&1 || true
+  echo "[ctl] Started launchd-managed Hermes WebUI (${target})"
 }
 
 _launchd_webui_pid() {
@@ -435,17 +814,49 @@ start_cmd() {
   export HERMES_WEBUI_HOST="${CTL_HOST}"
   export HERMES_WEBUI_PORT="${CTL_PORT}"
 
-  local existing_pid
-  if existing_pid="$(_current_pid 2>/dev/null)"; then
-    echo "[ctl] Hermes WebUI is already running (PID ${existing_pid})"
+  local existing_pid launchd_pid
+  if _launchd_job_manages_port "${CTL_PORT}"; then
+    if existing_pid="$(_webui_listener_pid_for_port "${CTL_PORT}" 2>/dev/null)"; then
+      launchd_pid="$(_launchd_webui_pid 2>/dev/null || true)"
+      if [[ -n "${launchd_pid}" && "${launchd_pid}" == "${existing_pid}" ]]; then
+        echo "[ctl] launchd-managed Hermes WebUI is already running (PID ${existing_pid})"
+        _ensure_desktop_shell_for_running_webui "${existing_pid}" "${CTL_HOST}" "${CTL_PORT}" || true
+        return 0
+      fi
+      if _launchd_job_loaded; then
+        echo "[ctl] A standalone Hermes WebUI (PID ${existing_pid}) conflicts with the loaded launchd job on port ${CTL_PORT}." >&2
+        echo "[ctl] Run ./ctl.sh restart to reconcile them into one launchd-managed instance." >&2
+        return 2
+      fi
+      echo "[ctl] Hermes WebUI is already running on ${CTL_HOST}:${CTL_PORT} (PID ${existing_pid})"
+      _ensure_desktop_shell_for_running_webui "${existing_pid}" "${CTL_HOST}" "${CTL_PORT}" || true
+      return 0
+    fi
+    _clear_stale_pid >/dev/null 2>&1 || true
+    _start_launchd_webui_job
     return 0
   fi
-  local launchd_pid
+
+  if existing_pid="$(_current_pid 2>/dev/null)"; then
+    echo "[ctl] Hermes WebUI is already running (PID ${existing_pid})"
+    _ensure_desktop_shell_for_running_webui "${existing_pid}" "${CTL_HOST}" "${CTL_PORT}" || true
+    return 0
+  fi
+  if existing_pid="$(_webui_listener_pid_for_port "${CTL_PORT}" 2>/dev/null)"; then
+    echo "[ctl] Hermes WebUI is already running on ${CTL_HOST}:${CTL_PORT} (PID ${existing_pid}; recovered missing ctl state)"
+    local python_exe_for_state
+    python_exe_for_state="$(_find_python)"
+    printf '%s\n' "${existing_pid}" > "${PID_FILE}"
+    _write_state "${existing_pid}" "${CTL_HOST}" "${CTL_PORT}" "${python_exe_for_state}"
+    _ensure_desktop_shell_for_running_webui "${existing_pid}" "${CTL_HOST}" "${CTL_PORT}" || true
+    return 0
+  fi
   if launchd_pid="$(_launchd_webui_pid 2>/dev/null)"; then
     echo "[ctl] Refusing to start a second Hermes WebUI while launchd job ${HERMES_WEBUI_LAUNCHD_LABEL:-${DEFAULT_LAUNCHD_LABEL}} is running (PID ${launchd_pid})." >&2
     echo "[ctl] Use launchctl kickstart -k gui/$(id -u)/${HERMES_WEBUI_LAUNCHD_LABEL:-${DEFAULT_LAUNCHD_LABEL}} or disable the launchd job before using ctl.sh start." >&2
     return 2
   fi
+  _stop_desktop_shell_for_port "${CTL_PORT}"
   _clear_stale_pid >/dev/null 2>&1 || true
 
   local python_exe pid
@@ -474,8 +885,36 @@ start_cmd() {
 
 stop_cmd() {
   ensure_home
-  local pid
+  _load_repo_dotenv_preserving_env
+  _load_state_if_present
+  local stop_port="${PORT:-${HERMES_WEBUI_PORT:-8787}}" stop_state_dir="${STATE_DIR:-${HERMES_WEBUI_STATE_DIR:-${DEFAULT_STATE_DIR}}}"
+  export HERMES_WEBUI_STATE_DIR="${stop_state_dir}"
+  # Disable KeepAlive before terminating either the server or Electron. If the
+  # order is reversed, launchd can recreate both while ctl.sh is still stopping
+  # them and the command reports success against a newly running instance.
+  if _launchd_job_manages_port "${stop_port}" && _launchd_job_loaded; then
+    _stop_launchd_webui_job
+  fi
+  _stop_desktop_shell_for_port "${stop_port}"
+  local pid listener_pid
   if ! pid="$(_pid_from_file 2>/dev/null)"; then
+    if listener_pid="$(_webui_listener_pid_for_port "${stop_port}" 2>/dev/null)"; then
+      echo "[ctl] Stopping Hermes WebUI orphan on ${stop_port} (PID ${listener_pid})"
+      _stop_webui_pid "${listener_pid}" TERM
+      local j
+      for j in {1..50}; do
+        if ! _is_alive "${listener_pid}"; then
+          rm -f "${PID_FILE}" "${STATE_FILE}"
+          echo "[ctl] Stopped"
+          return 0
+        fi
+        sleep 0.1
+      done
+      echo "[ctl] Orphan process did not exit after SIGTERM; sending SIGKILL" >&2
+      _stop_webui_pid "${listener_pid}" KILL
+      rm -f "${PID_FILE}" "${STATE_FILE}"
+      return 0
+    fi
     echo "[ctl] Hermes WebUI is stopped"
     rm -f "${PID_FILE}" "${STATE_FILE}"
     return 0
@@ -483,6 +922,20 @@ stop_cmd() {
 
   if ! _is_alive "${pid}" || ! _is_owned_webui_pid "${pid}"; then
     _clear_stale_pid
+    if listener_pid="$(_webui_listener_pid_for_port "${stop_port}" 2>/dev/null)"; then
+      echo "[ctl] Stopping Hermes WebUI orphan on ${stop_port} (PID ${listener_pid})"
+      _stop_webui_pid "${listener_pid}" TERM
+      local k
+      for k in {1..50}; do
+        if ! _is_alive "${listener_pid}"; then
+          echo "[ctl] Stopped"
+          return 0
+        fi
+        sleep 0.1
+      done
+      echo "[ctl] Orphan process did not exit after SIGTERM; sending SIGKILL" >&2
+      _stop_webui_pid "${listener_pid}" KILL
+    fi
     return 0
   fi
 
@@ -549,6 +1002,15 @@ status_cmd() {
     echo "  Bound:   ${host}:${port}"
     echo "  Log:     ${log_path}"
     echo "  Health:  ${health}"
+  elif pid="$(_webui_listener_pid_for_port "${port}" 2>/dev/null)"; then
+    uptime="$(ps -p "${pid}" -o etime= 2>/dev/null | sed 's/^ *//' || true)"
+    health="$(_health_line "${host}" "${port}")"
+    echo "● hermes-webui — running (untracked by ctl; restart will recover it)"
+    echo "  PID:     ${pid}"
+    echo "  Uptime:  ${uptime:-unknown}"
+    echo "  Bound:   ${host}:${port}"
+    echo "  Log:     ${log_path}"
+    echo "  Health:  ${health}"
   else
     [[ -f "${PID_FILE}" ]] && _clear_stale_pid >/dev/null 2>&1 || true
     echo "● hermes-webui — stopped"
@@ -594,6 +1056,31 @@ logs_cmd() {
   fi
 }
 
+restart_cmd() {
+  ensure_home
+  _load_repo_dotenv_preserving_env
+  _load_hermes_dotenv
+  _parse_launch_binding "$@"
+
+  # A launchd KeepAlive job must be stopped before any standalone ctl daemon.
+  # Otherwise launchd immediately respawns while ctl.sh is starting its own
+  # process, leaving the two instances racing for the same port and repeatedly
+  # relaunching Electron.
+  if _launchd_job_manages_port "${CTL_PORT}"; then
+    _stop_launchd_webui_job
+    stop_cmd
+    reset_electron_cmd "$@"
+    rm -f "${PID_FILE}" "${STATE_FILE}"
+    _start_launchd_webui_job
+    return 0
+  fi
+
+  stop_cmd
+  reset_electron_cmd "$@"
+  export HERMES_WEBUI_DESKTOP_RESET=1
+  start_cmd "$@"
+}
+
 cmd="${1:-}"
 if [[ $# -gt 0 ]]; then
   shift
@@ -601,8 +1088,10 @@ fi
 
 case "${cmd}" in
   start) start_cmd "$@" ;;
+  start-electron) start_electron_cmd "$@" ;;
   stop) stop_cmd ;;
-  restart) stop_cmd; start_cmd "$@" ;;
+  restart) restart_cmd "$@" ;;
+  reset-electron) reset_electron_cmd "$@" ;;
   status) status_cmd ;;
   logs) logs_cmd "$@" ;;
   -h|--help|help|"") usage ;;

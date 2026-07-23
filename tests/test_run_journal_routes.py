@@ -367,6 +367,150 @@ def test_live_journal_snapshot_reconstructs_visible_progress_and_tool_aliases(mo
     assert tool["args"]["extra"] == "x" * 200
 
 
+def test_live_journal_snapshot_restores_in_progress_tool_output(monkeypatch):
+    import api.routes as routes
+
+    monkeypatch.setattr(
+        routes,
+        "find_run_summary",
+        lambda stream_id: {
+            "session_id": "session_1",
+            "run_id": stream_id,
+            "last_seq": 3,
+            "last_event_id": f"{stream_id}:3",
+        },
+    )
+    monkeypatch.setattr(
+        routes,
+        "read_run_events",
+        lambda session_id, run_id: {
+            "events": [
+                {
+                    "seq": 1,
+                    "event": "tool",
+                    "payload": {
+                        "name": "terminal",
+                        "tid": "tool_live_1",
+                        "args": {"command": "pnpm build"},
+                    },
+                },
+                {
+                    "seq": 2,
+                    "event": "tool_output",
+                    "payload": {
+                        "name": "terminal",
+                        "tid": "tool_live_1",
+                        "stream": "stdout",
+                        "text": "Building...\n",
+                        "sequence": 1,
+                    },
+                },
+                {
+                    "seq": 3,
+                    "event": "tool_output",
+                    "payload": {
+                        "name": "terminal",
+                        "tid": "tool_live_1",
+                        "stream": "stderr",
+                        "text": "warning\n",
+                        "sequence": 1,
+                    },
+                },
+            ]
+        },
+    )
+
+    snapshot = routes._run_journal_live_snapshot("run_live")
+
+    tool = snapshot["tool_calls"][0]
+    assert tool["done"] is False
+    assert tool["result_metadata"] == {
+        "stdout": "Building...\n",
+        "stderr": "warning\n",
+    }
+
+
+def test_live_journal_snapshot_bounds_large_running_worklog_payload(monkeypatch):
+    """Selecting a noisy active thread must not ship every historic tool card.
+
+    A real run with ~200 tools produced a 3.5 MB metadata response and blocked
+    Electron while it parsed/rendered the recovery snapshot. Keep the durable
+    cursor and newest running work visible while bounding recovery-only history.
+    """
+    import api.routes as routes
+
+    stream_id = "run-large-live"
+    events = []
+    seq = 0
+    for index in range(120):
+        tool_id = f"tool-{index}"
+        seq += 1
+        events.append({
+            "seq": seq,
+            "event": "token",
+            "event_id": f"{stream_id}:{seq}",
+            "payload": {"text": f"progress-{index}\n"},
+        })
+        seq += 1
+        events.append({
+            "seq": seq,
+            "event": "tool",
+            "event_id": f"{stream_id}:{seq}",
+            "payload": {
+                "name": "terminal",
+                "tid": tool_id,
+                "args": {"command": f"command-{index}"},
+            },
+        })
+        seq += 1
+        events.append({
+            "seq": seq,
+            "event": "tool_output",
+            "event_id": f"{stream_id}:{seq}",
+            "payload": {
+                "name": "terminal",
+                "tid": tool_id,
+                "stream": "stdout",
+                "text": f"output-{index}\n" + ("x" * 20_000),
+            },
+        })
+        if index < 119:
+            seq += 1
+            events.append({
+                "seq": seq,
+                "event": "tool_complete",
+                "event_id": f"{stream_id}:{seq}",
+                "payload": {"name": "terminal", "tid": tool_id, "preview": "done"},
+            })
+
+    monkeypatch.setattr(
+        routes,
+        "find_run_summary",
+        lambda _: {
+            "session_id": "session-large-live",
+            "last_seq": seq,
+            "last_event_id": f"{stream_id}:{seq}",
+        },
+    )
+    monkeypatch.setattr(
+        routes,
+        "read_run_events",
+        lambda session_id, run_id: {"events": events},
+    )
+
+    snapshot = routes._run_journal_live_snapshot(stream_id)
+    encoded = json.dumps(snapshot)
+
+    assert snapshot["last_seq"] == seq
+    assert snapshot["last_event_id"] == f"{stream_id}:{seq}"
+    assert len(snapshot["tool_calls"]) <= 32
+    assert len(snapshot["anchor_activity_scene"]["activity_rows"]) <= 48
+    assert snapshot["omitted_tool_call_count"] > 0
+    assert snapshot["omitted_activity_row_count"] > 0
+    assert any(tool.get("tid") == "tool-119" and not tool.get("done") for tool in snapshot["tool_calls"])
+    assert len(encoded) < 1_000_000
+
+
 def test_live_journal_snapshot_bounds_pathological_tool_args(monkeypatch):
     import api.routes as routes
 

@@ -81,6 +81,33 @@ def test_render_messages_treats_status_card_as_visible_assistant_content():
     assert "statusHtml" in render_body
 
 
+def test_status_card_does_not_replace_a_settled_assistant_summary():
+    """Terminal status is supplemental UI, never a replacement for answer text."""
+    render_body = _function_body(UI_JS, "renderMessages")
+    status_branch_end = render_body.index(
+        "}else if(!(thinkingText&&window._showThinking!==false&&!isSimplifiedToolCalling())){"
+    )
+    status_branch_start = render_body.rfind("if(statusHtml){", 0, status_branch_end)
+    assert status_branch_start >= 0
+    brace_start = render_body.index("{", status_branch_start)
+    depth = 0
+    branch_close = None
+    for idx in range(brace_start, len(render_body)):
+        if render_body[idx] == "{":
+            depth += 1
+        elif render_body[idx] == "}":
+            depth -= 1
+            if depth == 0:
+                branch_close = idx + 1
+                break
+    assert branch_close is not None
+    status_branch = render_body[status_branch_start:branch_close]
+
+    assert "bodyPart" in status_branch
+    assert '<div class="msg-body">${bodyHtml}</div>' in status_branch
+    assert "statusHtml" in status_branch
+
+
 def test_status_card_styles_exist():
     assert ".status-card" in STYLE_CSS
     assert ".status-card-grid" in STYLE_CSS

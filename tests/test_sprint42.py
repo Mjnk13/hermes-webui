@@ -754,7 +754,7 @@ def test_streaming_persists_reasoning_in_session():
 
     # Persistence block must come BEFORE the settled raw_session payload is built
     persist_idx = src.index("Persist reasoning trace in the session")
-    raw_session_idx = src.index("raw_session = _session_payload_with_full_messages")
+    raw_session_idx = src.index("raw_session = _session_payload_with_terminal_window")
     assert persist_idx < raw_session_idx, \
         "Reasoning persistence block must appear before raw_session assignment"
 

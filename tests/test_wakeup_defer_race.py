@@ -125,6 +125,7 @@ def _reset_cfg_state():
         _cfg.DEFERRED_PROCESS_WAKEUPS.clear()
     with _cfg.STREAMS_LOCK:
         _cfg.STREAMS.clear()
+        _cfg.AGENT_INSTANCES.clear()
     if hasattr(_cfg, "ACTIVE_RUNS"):
         with _cfg.ACTIVE_RUNS_LOCK:
             _cfg.ACTIVE_RUNS.clear()
@@ -202,6 +203,59 @@ def test_completion_during_turn_teardown_still_wakes(monkeypatch):
     finally:
         with cfg.ACTIVE_RUNS_LOCK:
             cfg.ACTIVE_RUNS.pop(stream_id, None)
+        bp.unregister_process_session(sid)
+        _reset_cfg_state()
+
+
+def test_async_delegation_completion_nudges_active_main_at_safe_boundary(monkeypatch):
+    """An async subagent result must not sit deferred until tool limit.
+
+    The durable wakeup remains queued, but the live main agent receives an
+    internal handoff request so it performs one text-only closing call at the
+    next tool boundary. Ordinary background process completions retain their
+    existing non-preempting behavior.
+    """
+    from api import background_process as bp, config as cfg
+
+    fake = _FakeProcessRegistry()
+    sid = "sess-async-handoff"
+    process_id = "deleg-async-handoff"
+    stream_id = "stream-async-handoff"
+    calls: list[str] = []
+
+    class _Agent:
+        def request_turn_handoff(self, reason: str) -> bool:
+            calls.append(reason)
+            return True
+
+    fake.register(process_id, sid)
+    _install_fake_registry(monkeypatch, fake)
+    _reset_cfg_state()
+    bp.register_process_session(sid, sid)
+    monkeypatch.setattr(
+        bp,
+        "format_wakeup_prompt",
+        lambda _evt: "[IMPORTANT: delegated result is ready]",
+    )
+    with cfg.ACTIVE_RUNS_LOCK:
+        cfg.ACTIVE_RUNS[stream_id] = {"session_id": sid, "backend": "local"}
+    with cfg.STREAMS_LOCK:
+        cfg.AGENT_INSTANCES[stream_id] = _Agent()
+
+    try:
+        bp._process_one(
+            {
+                "type": "async_delegation",
+                "session_id": process_id,
+                "session_key": sid,
+                "output": "delegated result",
+            }
+        )
+
+        assert len(calls) == 1
+        assert "delegation" in calls[0].lower()
+        assert cfg.DEFERRED_PROCESS_WAKEUPS[sid][0]["process_id"] == process_id
+    finally:
         bp.unregister_process_session(sid)
         _reset_cfg_state()
 

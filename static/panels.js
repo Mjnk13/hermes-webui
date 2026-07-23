@@ -44,7 +44,7 @@ const APP_TITLEBAR_KEYS = {
   memory: 'tab_memory', workspaces: 'tab_workspaces',
   profiles: 'tab_profiles', todos: 'tab_todos', insights: 'tab_insights', logs: 'tab_logs', settings: 'tab_settings',
 };
-const MAIN_VIEW_PANELS = ['settings','skills','memory','tasks','kanban','workspaces','profiles','insights','logs','plugin'];
+const MAIN_VIEW_PANELS = ['settings','skills','memory','tasks','kanban','workspaces','profiles','insights','logs','plugin','browser'];
 const MAIN_VIEW_SIDEBAR_PANEL_FALLBACKS = { plugin: 'settings' };
 
 /**
@@ -367,6 +367,10 @@ function _syncMobileSidebarPanelFromMainView(){
 async function switchPanel(name, opts = {}) {
   const nextPanel = name || 'chat';
   const prevPanel = _currentPanel;
+  if(typeof _streamUiDiagnostic==='function') _streamUiDiagnostic('lifecycle','app-panel-change-requested',{
+    previous_panel:prevPanel,
+    next_panel:nextPanel,
+  });
   // ── Desktop sidebar collapse toggle (rail-click only) ──
   // If the click came from a rail icon AND we're on desktop, the rail icon
   // does double duty: clicking the already-active panel collapses the sidebar;
@@ -395,13 +399,14 @@ async function switchPanel(name, opts = {}) {
     if (typeof _kanbanStopPolling === 'function') _kanbanStopPolling();
   }
   _currentPanel = nextPanel;
+  const sidebarPanel = nextPanel === 'browser' ? 'chat' : nextPanel;
   // Update nav tabs (rail + mobile sidebar-nav share data-panel)
-  document.querySelectorAll('[data-panel]').forEach(t => t.classList.toggle('active', t.dataset.panel === nextPanel));
+  document.querySelectorAll('[data-panel]').forEach(t => t.classList.toggle('active', t.dataset.panel === sidebarPanel));
   // Refresh aria-expanded on the newly-active rail button to mirror sidebar state.
   if (typeof _syncSidebarAria === 'function') _syncSidebarAria();
   // Update panel views
   document.querySelectorAll('.panel-view').forEach(p => p.classList.remove('active'));
-  const panelEl = $('panel' + nextPanel.charAt(0).toUpperCase() + nextPanel.slice(1));
+  const panelEl = $('panel' + sidebarPanel.charAt(0).toUpperCase() + sidebarPanel.slice(1));
   if (panelEl) panelEl.classList.add('active');
   // Update main content view. Each entry in MAIN_VIEW_PANELS gets a matching
   // showing-<name> class on <main>; no class means chat (the default).
@@ -410,6 +415,17 @@ async function switchPanel(name, opts = {}) {
     MAIN_VIEW_PANELS.forEach(p => {
       mainEl.classList.toggle('showing-' + p, nextPanel === p);
     });
+  }
+  if (typeof syncBrowserWorkbenchTabActive === 'function') syncBrowserWorkbenchTabActive(nextPanel);
+  // #4644: close the mobile sidebar drawer after a rail-click panel switch — but
+  // ONLY for panels that have a main-content view (or chat). Sidebar-only panels
+  // like Todos render INSIDE the drawer, so closing it would hide the very panel
+  // the user just opened. Keep the drawer open for those.
+  const _panelHasMainView = nextPanel === 'chat' || MAIN_VIEW_PANELS.indexOf(nextPanel) !== -1;
+  if (_panelHasMainView && opts.fromRailClick && typeof _isDesktopWidth === 'function' && !_isDesktopWidth()) {
+    if (typeof closeMobileSidebar === 'function') {
+      closeMobileSidebar();
+    }
   }
   // Lazy-load panel data
   if (nextPanel === 'tasks') await loadCrons();
@@ -421,6 +437,9 @@ async function switchPanel(name, opts = {}) {
   if (nextPanel === 'todos') loadTodos();
   if (nextPanel === 'insights') await loadInsights();
   if (nextPanel === 'logs') await loadLogs();
+  if (nextPanel === 'browser' && typeof ensureBrowserWorkbenchSessionOnOpen === 'function') {
+    await ensureBrowserWorkbenchSessionOnOpen();
+  }
   _syncLogsAutoRefresh();
   if (typeof _syncSystemHealthMonitorVisibility === 'function') _syncSystemHealthMonitorVisibility();
   if (nextPanel === 'settings') {
@@ -435,8 +454,14 @@ async function switchPanel(name, opts = {}) {
     }
   }
   _resyncChatSidebarAfterPanelSwitch();
-  if (nextPanel === 'chat' && typeof syncTopbar === 'function') syncTopbar();
-  else syncAppTitlebar();
+  if (nextPanel === 'chat') {
+    if(typeof syncTopbar === 'function') syncTopbar();
+    if(typeof _reconcileActiveSessionQueueUi==='function') _reconcileActiveSessionQueueUi('chat-panel-entered');
+  } else syncAppTitlebar();
+  if(typeof _streamUiDiagnostic==='function') _streamUiDiagnostic('lifecycle','app-panel-changed',{
+    previous_panel:prevPanel,
+    next_panel:nextPanel,
+  });
   return true;
 }
 
@@ -5733,6 +5758,7 @@ function _positionComposerWsDropdown(){
   // While the mobile config panel is open, anchor to #composerMobileWorkspaceAction instead of only the desktop workspace chip.
   const anchor=(panel&&panel.classList.contains('open')&&mobileAction)?mobileAction:chip;
   if(!dd||!anchor||!footer)return;
+  if(typeof _positionGlobalOverlayFromAnchor==='function'&&_positionGlobalOverlayFromAnchor(dd,anchor,4))return;
   const chipRect=anchor.getBoundingClientRect();
   const footerRect=footer.getBoundingClientRect();
   let left=chipRect.left-footerRect.left;
@@ -5750,6 +5776,9 @@ function _positionProfileDropdown(){
   const ddW=dd.offsetWidth||260;
   // Decide direction: below for titlebar, above for composer
   const openBelow=trigger===document.getElementById('titlebarProfileBtn');
+  if(typeof _positionGlobalOverlayFromAnchor==='function'&&_positionGlobalOverlayFromAnchor(dd,trigger,4,{
+    placement:openBelow?'bottom':'top',align:'center',widthMode:'natural',margin:8,
+  }))return;
   // Horizontal: center on trigger, clamp to viewport
   let left=rect.left+(rect.width/2)-(ddW/2);
   left=Math.max(8, Math.min(left, window.innerWidth-ddW-8));
@@ -13166,14 +13195,72 @@ async function _viewCheckpointDiff(workspace,checkpoint){
   }
 }
 
+function _chooseCheckpointRestoreMode(label){
+  const activeSid=S&&S.session&&S.session.session_id?S.session.session_id:'';
+  if(!activeSid){
+    return showConfirmDialog({title:t('checkpoint_restore_confirm_title'),message:t('checkpoint_restore_confirm_message',label),confirmLabel:t('checkpoint_restore_files_only'),danger:true,focusCancel:true})
+      .then(ok=>ok?'files_only':null);
+  }
+  return new Promise(resolve=>{
+    const modal=document.createElement('div');
+    modal.className='checkpoint-restore-options-modal';
+    modal.innerHTML=`
+      <div class="checkpoint-restore-options-dialog" role="dialog" aria-modal="true" aria-labelledby="checkpointRestoreOptionsTitle">
+        <div class="checkpoint-restore-options-head">
+          <div>
+            <div id="checkpointRestoreOptionsTitle" class="checkpoint-restore-options-title">${esc(t('checkpoint_restore_options_title'))}</div>
+            <div class="checkpoint-restore-options-subtitle">${esc(label||'')}</div>
+          </div>
+          <button class="checkpoint-restore-options-close" type="button" data-mode="">&times;</button>
+        </div>
+        <div class="checkpoint-restore-options-body">
+          <button type="button" class="checkpoint-restore-option" data-mode="files_only">
+            <span class="checkpoint-restore-option-title">${esc(t('checkpoint_restore_files_only'))}</span>
+            <span class="checkpoint-restore-option-desc">${esc(t('checkpoint_restore_files_only_desc'))}</span>
+          </button>
+          <button type="button" class="checkpoint-restore-option danger" data-mode="chat_files">
+            <span class="checkpoint-restore-option-title">${esc(t('checkpoint_restore_chat_files'))}</span>
+            <span class="checkpoint-restore-option-desc">${esc(t('checkpoint_restore_chat_files_desc'))}</span>
+          </button>
+          <button type="button" class="checkpoint-restore-option" data-mode="chat_only">
+            <span class="checkpoint-restore-option-title">${esc(t('checkpoint_restore_chat_only'))}</span>
+            <span class="checkpoint-restore-option-desc">${esc(t('checkpoint_restore_chat_only_desc'))}</span>
+          </button>
+        </div>
+      </div>`;
+    const onKey=(e)=>{if(e.key==='Escape') finish(null);};
+    const finish=(mode)=>{
+      document.removeEventListener('keydown',onKey);
+      if(modal.parentNode) modal.parentNode.removeChild(modal);
+      resolve(mode||null);
+    };
+    modal.addEventListener('click',e=>{
+      if(e.target===modal) return finish(null);
+      const btn=e.target&&e.target.closest?e.target.closest('[data-mode]'):null;
+      if(btn) finish(btn.dataset.mode||null);
+    });
+    document.addEventListener('keydown',onKey);
+    document.body.appendChild(modal);
+    const first=modal.querySelector('[data-mode="files_only"]');
+    if(first) first.focus();
+  });
+}
+
 async function _restoreCheckpoint(workspace,checkpoint,message){
   const label=message||checkpoint;
-  const ok=await showConfirmDialog({title:t('checkpoint_restore_confirm_title'),message:t('checkpoint_restore_confirm_message',label),confirmLabel:t('checkpoint_restore'),danger:true,focusCancel:true});
-  if(!ok) return;
+  const mode=await _chooseCheckpointRestoreMode(label);
+  if(!mode) return;
   try{
-    const data=await api('/api/rollback/restore',{method:'POST',body:JSON.stringify({workspace,checkpoint})});
+    const sid=S&&S.session&&S.session.session_id?S.session.session_id:'';
+    const data=await api('/api/rollback/restore',{method:'POST',body:JSON.stringify({workspace,checkpoint,mode,session_id:sid})});
     if(data&&data.ok){
-      showToast(t('checkpoint_restored')+(data.files_restored_count?` (${data.files_restored_count} ${t('checkpoint_files').toLowerCase()})`:''));
+      const restoredFiles=data.files_restored_count?` (${data.files_restored_count} ${t('checkpoint_files').toLowerCase()})`:'';
+      showToast(t('checkpoint_restored')+restoredFiles);
+      if(data.chat_restored&&sid&&S.session&&S.session.session_id===sid&&typeof loadSession==='function'){
+        await loadSession(sid,{force:true});
+      }else if(data.file_restored&&typeof loadDir==='function'){
+        try{await loadDir('.',{preservePreview:true});}catch(_e){}
+      }
     }else{
       showToast((data&&data.error)||'Restore failed','error');
     }

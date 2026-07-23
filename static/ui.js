@@ -1,3 +1,65 @@
+// Opt-in, bounded diagnostics for long-lived streaming UI investigations.
+// Enable for the current app tab with `setStreamUiDiagnostics(true)` in DevTools,
+// reproduce the issue, then inspect `getStreamUiDiagnostics()`. Keeping this
+// disabled by default makes the hot streaming path a single cheap boolean check;
+// the ring buffer prevents a long run from accumulating unbounded memory.
+const _STREAM_UI_DIAGNOSTICS_STORAGE_KEY='hermes-stream-ui-diagnostics';
+const _STREAM_UI_DIAGNOSTICS_MAX_ENTRIES=2000;
+const _streamUiDiagnosticEntries=[];
+let _streamUiDiagnosticSequence=0;
+function _streamUiDiagnosticsEnabled(){
+  if(typeof window==='undefined') return false;
+  if(window.__HERMES_STREAM_UI_DIAGNOSTICS__===true) return true;
+  try{return sessionStorage.getItem(_STREAM_UI_DIAGNOSTICS_STORAGE_KEY)==='1';}
+  catch(_){return false;}
+}
+function _streamUiDiagnostic(layer,event,details){
+  if(!_streamUiDiagnosticsEnabled()) return null;
+  const entry={
+    sequence:++_streamUiDiagnosticSequence,
+    timestamp:new Date().toISOString(),
+    monotonic_ms:(typeof performance!=='undefined'&&performance.now)?Math.round(performance.now()*10)/10:null,
+    layer:String(layer||'unknown'),
+    event:String(event||'unknown'),
+    active_session_id:(typeof S!=='undefined'&&S.session)?S.session.session_id:null,
+    ...(details&&typeof details==='object'?details:{}),
+  };
+  _streamUiDiagnosticEntries.push(entry);
+  if(_streamUiDiagnosticEntries.length>_STREAM_UI_DIAGNOSTICS_MAX_ENTRIES){
+    _streamUiDiagnosticEntries.splice(0,_streamUiDiagnosticEntries.length-_STREAM_UI_DIAGNOSTICS_MAX_ENTRIES);
+  }
+  try{console.debug('[Hermes stream UI]',entry);}catch(_){}
+  return entry;
+}
+if(typeof window!=='undefined'){
+  window.setStreamUiDiagnostics=enabled=>{
+    window.__HERMES_STREAM_UI_DIAGNOSTICS__=!!enabled;
+    try{
+      if(enabled) sessionStorage.setItem(_STREAM_UI_DIAGNOSTICS_STORAGE_KEY,'1');
+      else sessionStorage.removeItem(_STREAM_UI_DIAGNOSTICS_STORAGE_KEY);
+    }catch(_){}
+    return !!enabled;
+  };
+  window.getStreamUiDiagnostics=()=>_streamUiDiagnosticEntries.slice();
+  window.clearStreamUiDiagnostics=()=>{_streamUiDiagnosticEntries.length=0;};
+  if(!window.__HERMES_STREAM_UI_LIFECYCLE_DIAGNOSTICS_BOUND__){
+    window.__HERMES_STREAM_UI_LIFECYCLE_DIAGNOSTICS_BOUND__=true;
+    const lifecycle=(event,extra)=>_streamUiDiagnostic('lifecycle',event,{
+      visibility:typeof document!=='undefined'?document.visibilityState:null,
+      focused:typeof document!=='undefined'&&document.hasFocus?document.hasFocus():null,
+      route:typeof location!=='undefined'?`${location.pathname}${location.search}${location.hash}`:null,
+      ...(extra||{}),
+    });
+    window.addEventListener('focus',()=>lifecycle('window-focus'));
+    window.addEventListener('blur',()=>lifecycle('window-blur'));
+    window.addEventListener('popstate',()=>lifecycle('route-popstate'));
+    window.addEventListener('hashchange',()=>lifecycle('route-hashchange'));
+    window.addEventListener('pageshow',e=>lifecycle('page-show',{persisted:!!e.persisted}));
+    window.addEventListener('pagehide',e=>lifecycle('page-hide',{persisted:!!e.persisted}));
+    document.addEventListener('visibilitychange',()=>lifecycle('visibility-change'));
+  }
+}
+
 // `todos` is the single source of truth for the Todos panel.  Any update
 // goes through the `todo_state` SSE event (live) or session.todo_state
 // (cold-load).  `todoStateMeta` doubles as a sentinel: while it is null
@@ -5,7 +67,7 @@
 // legacy reverse-scan over S.messages — that keeps new clients working
 // against old servers (Phase 1 may not yet be deployed everywhere).
 // See api/todo_state.py for the wire contract.
-const S={session:null,messages:[],entries:[],busy:false,pendingFiles:[],toolCalls:[],activeStreamId:null,currentDir:'.',activeProfile:'default',activeProfileIsDefault:true,showHiddenWorkspaceFiles:false,todos:[],todoStateMeta:null,_pendingSessionToolsets:null};
+const S={session:null,messages:[],entries:[],busy:false,pendingFiles:[],pendingContextItems:[],toolCalls:[],activeStreamId:null,currentDir:'.',activeProfile:'default',activeProfileIsDefault:true,showHiddenWorkspaceFiles:false,todos:[],todoStateMeta:null,_pendingSessionToolsets:null};
 
 function assistantDisplayName(){
   if(S.activeProfile&&S.activeProfile!=='default') return S.activeProfile.charAt(0).toUpperCase()+S.activeProfile.slice(1);
@@ -247,19 +309,81 @@ function _readPersistedSessionQueue(sid){
   }
   return [];
 }
+function _hydrateSessionQueueFromStorage(sid){
+  if(!sid) return [];
+  // A normal SPA thread switch keeps the authoritative in-memory queue. Do
+  // not append the mirrored storage copy or the same items would appear twice.
+  const existing=_getSessionQueue(sid,false);
+  if(existing.length) return existing;
+  const persisted=_readPersistedSessionQueue(sid);
+  if(!persisted.length) return existing;
+  // Storage keys and the in-memory map are both session-scoped. Rebuild only
+  // this thread's queue so navigating between chats can never mix their items.
+  const stored=persisted.filter(entry=>entry&&typeof entry==='object').map(entry=>{
+    const restored=typeof _ensureQueuedMessageIdentity==='function'
+      ? _ensureQueuedMessageIdentity(sid,entry)
+      : {...entry};
+    if(Array.isArray(restored.browser_context_parts)&&restored.browser_context_parts.length&&!Array.isArray(restored.parts)){
+      restored.parts=restored.browser_context_parts;
+    }
+    return restored;
+  });
+  if(!stored.length) return existing;
+  SESSION_QUEUES[sid]=stored;
+  return stored;
+}
+let _clientMessageIdentityCounter=0;
+function _newClientMessageId(sid,kind='message'){
+  let random='';
+  try{
+    if(globalThis.crypto&&typeof globalThis.crypto.randomUUID==='function') random=globalThis.crypto.randomUUID();
+  }catch(_){ }
+  if(!random){
+    _clientMessageIdentityCounter+=1;
+    random=`${Date.now().toString(36)}-${_clientMessageIdentityCounter.toString(36)}-${Math.random().toString(36).slice(2,10)}`;
+  }
+  return `${kind}:${String(sid||'session')}:${random}`;
+}
+function _ensureQueuedMessageIdentity(sid,payload){
+  const entry=payload&&typeof payload==='object'?{...payload}:{};
+  const existing=String(entry.client_message_id||'').trim();
+  entry.client_message_id=existing||_newClientMessageId(sid,'queue');
+  return entry;
+}
 function queueSessionMessage(sid, payload){
   if(!sid||!payload) return 0;
   const q=_getSessionQueue(sid,true);
-  // Stamp created_at so the restore path can detect stale entries (agent already responded)
-  const entry={...payload, _queued_at: Date.now()};
+  // The identity survives persistence, requeue, Combine promotion, and the
+  // server-confirmed transcript. Never use message text as queue identity: two
+  // intentional turns are allowed to have identical text.
+  const entry={..._ensureQueuedMessageIdentity(sid,payload), _queued_at: payload._queued_at||Date.now()};
+  if(Array.isArray(entry.browser_context_parts)&&entry.browser_context_parts.length&&!Array.isArray(entry.parts)){
+    entry.parts=entry.browser_context_parts;
+  }
+  const existingIdx=q.findIndex(item=>item&&item.client_message_id===entry.client_message_id);
+  if(existingIdx!==-1){
+    q[existingIdx]={...q[existingIdx],...entry,_queued_at:q[existingIdx]._queued_at||entry._queued_at};
+    _persistSessionQueueStorage(sid,q);
+    return q.length;
+  }
   q.push(entry);
+  _persistSessionQueueStorage(sid,q);
+  return q.length;
+}
+function restoreShiftedQueuedSessionMessage(sid,payload){
+  if(!sid||!payload) return 0;
+  const q=_getSessionQueue(sid,true);
+  const entry={..._ensureQueuedMessageIdentity(sid,payload),_queued_at:payload._queued_at||Date.now()};
+  const existingIdx=q.findIndex(item=>item&&item.client_message_id===entry.client_message_id);
+  if(existingIdx!==-1) q.splice(existingIdx,1);
+  q.unshift(entry);
   _persistSessionQueueStorage(sid,q);
   return q.length;
 }
 function shiftQueuedSessionMessage(sid){
   const q=_getSessionQueue(sid,false);
   if(!q.length) return null;
-  const next=q.shift();
+  const next=_ensureQueuedMessageIdentity(sid,q.shift());
   if(!q.length){
     delete SESSION_QUEUES[sid];
     _clearPersistedSessionQueue(sid);
@@ -278,6 +402,428 @@ function _setCompressionSessionLock(sid){
   window._compressionLockSid=sid||null;
 }
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+// ── Shared chat overlay portal ─────────────────────────────────────────────
+// Electron WebContentsView surfaces are native child views: no DOM z-index can
+// draw above them. Every floating chat surface therefore keeps its original
+// live node/handlers, but is temporarily moved into this one document-level
+// portal. A consolidated, generation-ordered stack event lets Browser Workbench
+// stage the intersecting native surface's current pixels before temporarily
+// hiding that same surface. Its bounds and DOM viewport never change, so opening
+// an overlay cannot reflow either pane or expose the viewport fallback.
+const _globalOverlayHomes=new WeakMap();
+const _globalOverlayStyles=new WeakMap();
+const _globalOverlayMounted=new Set();
+const _globalOverlayAnchors=new WeakMap();
+const _globalOverlayLayouts=new WeakMap();
+let _globalOverlayObserver=null;
+let _globalOverlayResizeObserver=null;
+let _globalOverlayPublishFrame=0;
+let _globalOverlayPositionFrame=0;
+let _globalOverlayGeneration=Date.now();
+let _globalOverlayLastSignature='';
+let _globalOverlayNextId=1;
+const _globalOverlayIds=new WeakMap();
+
+function _ensureGlobalOverlayLayer(){
+  let layer=document.getElementById('globalOverlayLayer');
+  if(!layer){
+    layer=document.createElement('div');
+    layer.id='globalOverlayLayer';
+    layer.className='global-overlay-layer';
+    (document.body||document.documentElement).appendChild(layer);
+  }
+  return layer;
+}
+
+function _globalOverlayIsOpen(el){
+  if(!el||!el.isConnected)return false;
+  const mode=String(el.dataset.globalOverlay||'');
+  if(mode==='always')return true;
+  if(mode==='open')return el.classList.contains('open')&&!el.hidden;
+  if(mode==='visible')return el.classList.contains('visible')&&!el.hidden;
+  if(mode==='hover')return el.classList.contains('ctx-tooltip-active')&&!el.hidden;
+  if(mode==='shown')return !el.hidden&&el.style.display!=='none'&&getComputedStyle(el).display!=='none';
+  if(mode==='modal')return !el.hidden&&el.style.display!=='none'&&getComputedStyle(el).display!=='none';
+  return false;
+}
+
+function _globalOverlayNativeSurfaceActive(){
+  const main=document.querySelector('main.main.showing-browser');
+  const desktop=window.hermesDesktop&&window.hermesDesktop.browser;
+  return !!(main&&desktop&&(desktop.renderer==='electron-native'||desktop.isDesktop===true));
+}
+
+function _globalOverlayHomeFor(el){
+  if(el.id==='composerModelDropdown'&&typeof _modelDropdownHome!=='undefined'&&_modelDropdownHome&&_modelDropdownHome.parent){
+    return {parent:_modelDropdownHome.parent,nextSibling:_modelDropdownHome.nextSibling};
+  }
+  return {parent:el.parentNode,nextSibling:el.nextSibling};
+}
+
+function _globalOverlayViewport(){
+  const vv=window.visualViewport;
+  const left=Math.max(0,Number(vv&&vv.offsetLeft)||0);
+  const top=Math.max(0,Number(vv&&vv.offsetTop)||0);
+  const width=Math.max(1,Number(vv&&vv.width)||window.innerWidth||1);
+  const height=Math.max(1,Number(vv&&vv.height)||window.innerHeight||1);
+  return {left,top,width,height,right:left+width,bottom:top+height};
+}
+
+function _globalOverlayStyle(el,key,value){
+  if(!el||el.style[key]===value)return false;
+  el.style[key]=value;
+  return true;
+}
+
+function _globalOverlayDefaultAnchor(el){
+  if(!el)return null;
+  const byId=id=>document.getElementById(id);
+  const explicit=String(el.dataset.globalOverlayTrigger||'');
+  if(explicit){
+    const anchor=byId(explicit);
+    if(anchor)return {anchor,gap:6,placement:'top',align:'end',widthMode:'natural'};
+  }
+  const mobilePanel=byId('composerMobileConfigPanel');
+  const mobileOpen=!!(mobilePanel&&mobilePanel.classList.contains('open'));
+  const definitions={
+    composerModelDropdown:{anchor:mobileOpen?byId('composerMobileModelAction'):byId('composerModelChip'),gap:6,placement:'top',align:'start',widthMode:mobileOpen?'viewport':'natural'},
+    composerWsDropdown:{anchor:mobileOpen?byId('composerMobileWorkspaceAction'):(byId('composerWorkspaceGroup')||byId('composerWorkspaceChip')),gap:4,placement:'top',align:'start',widthMode:'natural'},
+    composerReasoningDropdown:{anchor:mobileOpen?byId('composerMobileReasoningAction'):byId('composerReasoningChip'),gap:4,placement:'top',align:'start',widthMode:'natural'},
+    composerFastDropdown:{anchor:mobileOpen?byId('composerMobileFastAction'):byId('composerFastChip'),gap:4,placement:'top',align:'start',widthMode:'natural'},
+    composerToolsetsDropdown:{anchor:byId('composerToolsetsChip'),gap:4,placement:'top',align:'start',widthMode:'natural'},
+    composerMobileConfigPanel:{anchor:byId('composerMobileConfigBtn'),gap:6,placement:'top',align:'end',widthMode:'natural'},
+    savedPromptsPopup:{anchor:byId('btnSavedPrompts'),gap:8,placement:'top',align:'start',widthMode:'natural'},
+    cmdDropdown:{anchor:byId('composerBox'),gap:4,placement:'top',align:'start',widthMode:'anchor'},
+  };
+  return definitions[el.id]&&definitions[el.id].anchor?definitions[el.id]:null;
+}
+
+function _globalOverlayAnchorFor(el){
+  const stored=_globalOverlayAnchors.get(el);
+  if(stored&&stored.anchor&&stored.anchor.isConnected)return stored;
+  return _globalOverlayDefaultAnchor(el);
+}
+
+function _observeGlobalOverlay(el,record){
+  if(typeof ResizeObserver!=='function')return;
+  if(!_globalOverlayResizeObserver)_globalOverlayResizeObserver=new ResizeObserver(()=>_scheduleGlobalOverlayPositions());
+  try{_globalOverlayResizeObserver.observe(el);}catch(_){}
+  if(record&&record.anchor)try{_globalOverlayResizeObserver.observe(record.anchor);}catch(_){}
+  if(record&&record.parent)try{_globalOverlayResizeObserver.observe(record.parent);}catch(_){}
+}
+
+function _unobserveGlobalOverlay(el){
+  if(!_globalOverlayResizeObserver||!el)return;
+  const anchor=_globalOverlayAnchors.get(el);
+  const layout=_globalOverlayLayouts.get(el);
+  try{_globalOverlayResizeObserver.unobserve(el);}catch(_){}
+  if(anchor&&anchor.anchor)try{_globalOverlayResizeObserver.unobserve(anchor.anchor);}catch(_){}
+  if(layout&&layout.parent)try{_globalOverlayResizeObserver.unobserve(layout.parent);}catch(_){}
+}
+
+function _positionAnchoredGlobalOverlay(el,record){
+  if(!el||!record||!record.anchor||!record.anchor.isConnected)return false;
+  const anchorRect=record.anchor.getBoundingClientRect();
+  if(!anchorRect||(!anchorRect.width&&!anchorRect.height))return false;
+  const viewport=_globalOverlayViewport();
+  const margin=Math.max(4,Number(record.margin)||8);
+  const gap=Math.max(0,Number(record.gap)||0);
+  const maxWidth=Math.max(1,viewport.width-margin*2);
+  _globalOverlayStyle(el,'position','fixed');
+  _globalOverlayStyle(el,'right','auto');
+  _globalOverlayStyle(el,'bottom','auto');
+
+  let width;
+  if(record.widthMode==='viewport')width=maxWidth;
+  else if(record.widthMode==='anchor')width=Math.max(1,anchorRect.width);
+  else width=Math.max(1,record.naturalWidth||el.scrollWidth||el.getBoundingClientRect().width||1);
+  width=Math.min(width,maxWidth);
+  _globalOverlayStyle(el,'width',Math.round(width)+'px');
+  _globalOverlayStyle(el,'maxWidth',Math.round(maxWidth)+'px');
+
+  let rect=el.getBoundingClientRect();
+  const contentHeight=Math.max(1,el.scrollHeight||0,rect.height||el.offsetHeight||1);
+  const cssHeightCap=Number(record.cssMaxHeight);
+  const desiredHeight=Number.isFinite(cssHeightCap)&&cssHeightCap>0?Math.min(contentHeight,cssHeightCap):contentHeight;
+  const topRoom=Math.max(0,anchorRect.top-viewport.top-gap-margin);
+  const bottomRoom=Math.max(0,viewport.bottom-anchorRect.bottom-gap-margin);
+  const preferred=record.placement==='bottom'?'bottom':'top';
+  let placement=preferred;
+  if(preferred==='top'&&desiredHeight>topRoom&&bottomRoom>topRoom)placement='bottom';
+  else if(preferred==='bottom'&&desiredHeight>bottomRoom&&topRoom>bottomRoom)placement='top';
+  const room=placement==='top'?topRoom:bottomRoom;
+  const constrained=desiredHeight>room&&room>0;
+  _globalOverlayStyle(el,'maxHeight',constrained?Math.max(48,Math.floor(room))+'px':(record.baseMaxHeight||''));
+  rect=el.getBoundingClientRect();
+  const height=Math.max(1,rect.height||el.offsetHeight||1);
+
+  let left=anchorRect.left;
+  if(record.align==='end')left=anchorRect.right-width;
+  else if(record.align==='center')left=anchorRect.left+(anchorRect.width-width)/2;
+  left=Math.max(viewport.left+margin,Math.min(left,viewport.right-margin-width));
+  let top=placement==='top'?anchorRect.top-gap-height:anchorRect.bottom+gap;
+  top=Math.max(viewport.top+margin,Math.min(top,viewport.bottom-margin-height));
+  _globalOverlayStyle(el,'left',Math.round(left)+'px');
+  _globalOverlayStyle(el,'top',Math.round(top)+'px');
+  if(el.dataset.globalOverlayPlacement!==placement)el.dataset.globalOverlayPlacement=placement;
+  return true;
+}
+
+function _positionLayoutGlobalOverlay(el,layout){
+  if(!el||!layout||!layout.parent||!layout.parent.isConnected)return false;
+  const parentRect=layout.parent.getBoundingClientRect();
+  const viewport=_globalOverlayViewport();
+  const margin=4;
+  let rect=el.getBoundingClientRect();
+  let width=Math.max(1,rect.width||layout.width||1);
+  if(layout.horizontal==='stretch')width=Math.max(1,parentRect.width-layout.leftInset-layout.rightInset);
+  width=Math.min(width,Math.max(1,viewport.width-margin*2));
+  _globalOverlayStyle(el,'width',Math.round(width)+'px');
+  rect=el.getBoundingClientRect();
+  const height=Math.max(1,rect.height||layout.height||1);
+  let left=layout.horizontal==='right'?parentRect.right-layout.rightInset-width:parentRect.left+layout.leftInset;
+  let top=layout.vertical==='bottom'?parentRect.bottom-layout.bottomInset-height:parentRect.top+layout.topInset;
+  left=Math.max(viewport.left+margin,Math.min(left,viewport.right-margin-width));
+  top=Math.max(viewport.top+margin,Math.min(top,viewport.bottom-margin-height));
+  _globalOverlayStyle(el,'position','fixed');
+  _globalOverlayStyle(el,'right','auto');
+  _globalOverlayStyle(el,'bottom','auto');
+  _globalOverlayStyle(el,'left',Math.round(left)+'px');
+  _globalOverlayStyle(el,'top',Math.round(top)+'px');
+  return true;
+}
+
+function _positionGlobalOverlay(el){
+  if(!el||!_globalOverlayMounted.has(el)||!_globalOverlayIsOpen(el))return false;
+  const mode=String(el.dataset.globalOverlay||'');
+  if(mode==='modal'||mode==='always')return false;
+  const anchor=_globalOverlayAnchorFor(el);
+  if(anchor){
+    if(!_globalOverlayAnchors.has(el))_globalOverlayAnchors.set(el,anchor);
+    return _positionAnchoredGlobalOverlay(el,anchor);
+  }
+  return _positionLayoutGlobalOverlay(el,_globalOverlayLayouts.get(el));
+}
+
+function _scheduleGlobalOverlayPositions(){
+  if(_globalOverlayPositionFrame||!_globalOverlayMounted.size)return;
+  _globalOverlayPositionFrame=requestAnimationFrame(()=>{
+    _globalOverlayPositionFrame=0;
+    _globalOverlayMounted.forEach(el=>_positionGlobalOverlay(el));
+    _publishGlobalOverlayRects();
+  });
+}
+
+function _positionGlobalOverlayFromAnchor(el,anchor,gap=4,options={}){
+  if(!el||!anchor)return false;
+  const previous=_globalOverlayAnchors.get(el)||{};
+  const record={
+    ...previous,
+    anchor,
+    gap,
+    placement:options.placement||previous.placement||'top',
+    align:options.align||previous.align||'start',
+    widthMode:options.widthMode||previous.widthMode||'natural',
+    margin:options.margin||previous.margin||8,
+  };
+  _globalOverlayAnchors.set(el,record);
+  if(!_globalOverlayMounted.has(el)&&_globalOverlayNativeSurfaceActive()&&_globalOverlayIsOpen(el))_mountGlobalOverlay(el);
+  if(!_globalOverlayMounted.has(el))return false;
+  _observeGlobalOverlay(el,record);
+  const positioned=_positionAnchoredGlobalOverlay(el,record);
+  _emitGlobalOverlayState();
+  return positioned;
+}
+
+function _mountGlobalOverlay(el){
+  if(!el||_globalOverlayMounted.has(el))return;
+  const layer=_ensureGlobalOverlayLayer();
+  if(!layer||el===layer)return;
+  const mode=String(el.dataset.globalOverlay||'');
+  const rect=el.getBoundingClientRect();
+  const home=_globalOverlayHomeFor(el);
+  const parentRect=home&&home.parent&&typeof home.parent.getBoundingClientRect==='function'?home.parent.getBoundingClientRect():null;
+  const computed=typeof getComputedStyle==='function'?getComputedStyle(el):null;
+  _globalOverlayHomes.set(el,home);
+  _globalOverlayStyles.set(el,{
+    position:el.style.position,left:el.style.left,right:el.style.right,
+    top:el.style.top,bottom:el.style.bottom,width:el.style.width,
+    maxWidth:el.style.maxWidth,maxHeight:el.style.maxHeight,
+    margin:el.style.margin,
+  });
+  const anchor=_globalOverlayAnchorFor(el);
+  if(anchor){
+    anchor.naturalWidth=Math.max(1,rect.width||el.offsetWidth||anchor.naturalWidth||1);
+    anchor.baseMaxHeight=el.style.maxHeight||'';
+    const cssMaxHeight=Number.parseFloat(computed&&computed.maxHeight||'');
+    anchor.cssMaxHeight=Number.isFinite(cssMaxHeight)?cssMaxHeight:null;
+    _globalOverlayAnchors.set(el,anchor);
+  }else if(mode!=='modal'&&mode!=='always'&&parentRect){
+    const horizontal=computed&&computed.left!=='auto'&&computed.right!=='auto'?'stretch':(computed&&computed.right!=='auto'&&computed.left==='auto'?'right':'left');
+    const vertical=computed&&computed.bottom!=='auto'&&computed.top==='auto'?'bottom':'top';
+    _globalOverlayLayouts.set(el,{
+      parent:home.parent,horizontal,vertical,
+      leftInset:rect.left-parentRect.left,rightInset:parentRect.right-rect.right,
+      topInset:rect.top-parentRect.top,bottomInset:parentRect.bottom-rect.bottom,
+      width:rect.width,height:rect.height,
+    });
+  }
+  // `always` is the existing conversation-actions portal and `modal` surfaces
+  // already own viewport coordinates. Everything else is converted to fixed
+  // viewport coordinates, then anchored again after the live node is moved.
+  if(mode!=='modal'&&mode!=='always'){
+    el.style.position='fixed';
+    el.style.left=Math.max(0,Math.round(rect.left))+'px';
+    el.style.right='auto';
+    el.style.top=Math.max(0,Math.round(rect.top))+'px';
+    el.style.bottom='auto';
+    el.style.width=Math.max(1,Math.round(rect.width))+'px';
+    el.style.margin='0';
+  }
+  el.classList.add('global-overlay-item');
+  layer.appendChild(el);
+  _globalOverlayMounted.add(el);
+  _observeGlobalOverlay(el,anchor||_globalOverlayLayouts.get(el));
+  _positionGlobalOverlay(el);
+  _emitGlobalOverlayState();
+}
+
+function _restoreGlobalOverlay(el){
+  if(!el||!_globalOverlayMounted.has(el))return;
+  _unobserveGlobalOverlay(el);
+  _globalOverlayMounted.delete(el);
+  el.classList.remove('global-overlay-item');
+  delete el.dataset.globalOverlayPlacement;
+  const home=_globalOverlayHomes.get(el);
+  if(el.isConnected&&home&&home.parent&&home.parent.isConnected){
+    if(home.nextSibling&&home.nextSibling.parentNode===home.parent) home.parent.insertBefore(el,home.nextSibling);
+    else home.parent.appendChild(el);
+  }
+  const style=_globalOverlayStyles.get(el);
+  if(style){
+    Object.keys(style).forEach(key=>{el.style[key]=style[key];});
+  }
+  _globalOverlayAnchors.delete(el);
+  _globalOverlayLayouts.delete(el);
+  _emitGlobalOverlayState();
+}
+
+function _globalOverlayId(el){
+  if(!el)return '';
+  if(_globalOverlayIds.has(el))return _globalOverlayIds.get(el);
+  const id=el.id||'global-overlay-'+(_globalOverlayNextId++);
+  _globalOverlayIds.set(el,id);
+  return id;
+}
+
+function _collectGlobalOverlayState(){
+  const overlays=[];
+  _globalOverlayMounted.forEach(el=>{
+    if(!el.isConnected||!_globalOverlayIsOpen(el))return;
+    const rect=el.getBoundingClientRect();
+    if(rect.width<=0||rect.height<=0)return;
+    overlays.push({
+      id:_globalOverlayId(el),
+      rect:{
+        x:Math.round(rect.left),y:Math.round(rect.top),
+        width:Math.round(rect.width),height:Math.round(rect.height),
+      },
+    });
+  });
+  return overlays;
+}
+
+function _emitGlobalOverlayState(options){
+  options=options||{};
+  const overlays=options.clear===true?[]:_collectGlobalOverlayState();
+  const signature=JSON.stringify(overlays);
+  if(options.force!==true&&signature===_globalOverlayLastSignature)return window.__hermesGlobalOverlayState||null;
+  _globalOverlayLastSignature=signature;
+  _globalOverlayGeneration=Math.max(_globalOverlayGeneration+1,Date.now());
+  const detail={
+    generation:_globalOverlayGeneration,
+    overlayCount:overlays.length,
+    overlays,
+    rects:overlays.map(item=>item.rect),
+  };
+  window.__hermesGlobalOverlayState=detail;
+  try{window.dispatchEvent(new CustomEvent('hermes-global-overlay-change',{detail}));}catch(_){}
+  return detail;
+}
+
+function _publishGlobalOverlayRects(){
+  if(_globalOverlayPublishFrame)cancelAnimationFrame(_globalOverlayPublishFrame);
+  _globalOverlayPublishFrame=requestAnimationFrame(()=>{
+    _globalOverlayPublishFrame=0;
+    _emitGlobalOverlayState();
+  });
+}
+
+function _reconcileGlobalOverlays(){
+  const shouldPortal=_globalOverlayNativeSurfaceActive();
+  document.querySelectorAll('[data-global-overlay]').forEach(el=>{
+    if(shouldPortal&&_globalOverlayIsOpen(el))_mountGlobalOverlay(el);
+    else _restoreGlobalOverlay(el);
+  });
+  Array.from(_globalOverlayMounted).forEach(el=>{
+    if(!el.isConnected){_restoreGlobalOverlay(el);return;}
+    if(!_globalOverlayIsOpen(el))_restoreGlobalOverlay(el);
+  });
+  _scheduleGlobalOverlayPositions();
+  _publishGlobalOverlayRects();
+}
+
+function _bindHoverGlobalOverlay(el){
+  if(!el||el.dataset.globalOverlayHoverBound==='1')return;
+  const trigger=document.getElementById(el.dataset.globalOverlayTrigger||'');
+  if(!trigger)return;
+  el.dataset.globalOverlayHoverBound='1';
+  const open=()=>{el.classList.add('ctx-tooltip-active');el.setAttribute('aria-hidden','false');_reconcileGlobalOverlays();};
+  const closeSoon=(event)=>{
+    const next=event&&event.relatedTarget;
+    if(next&&(trigger.contains(next)||el.contains(next)))return;
+    setTimeout(()=>{
+      if(trigger.matches(':hover')||trigger.contains(document.activeElement)||el.matches(':hover')||el.contains(document.activeElement))return;
+      el.classList.remove('ctx-tooltip-active');el.setAttribute('aria-hidden','true');_reconcileGlobalOverlays();
+    },0);
+  };
+  trigger.addEventListener('pointerenter',open);
+  trigger.addEventListener('pointerleave',closeSoon);
+  trigger.addEventListener('focusin',open);
+  trigger.addEventListener('focusout',closeSoon);
+  el.addEventListener('pointerleave',closeSoon);
+  el.addEventListener('focusout',closeSoon);
+}
+
+function initGlobalOverlayLayer(){
+  _ensureGlobalOverlayLayer();
+  document.querySelectorAll('[data-global-overlay="hover"]').forEach(_bindHoverGlobalOverlay);
+  if(typeof MutationObserver==='function'&&!_globalOverlayObserver){
+    _globalOverlayObserver=new MutationObserver(()=>_reconcileGlobalOverlays());
+    _globalOverlayObserver.observe(document.body,{subtree:true,childList:true,attributes:true,attributeFilter:['class','style','hidden','aria-hidden','data-global-overlay']});
+  }
+  window.addEventListener('resize',_scheduleGlobalOverlayPositions,{passive:true});
+  window.addEventListener('orientationchange',_scheduleGlobalOverlayPositions,{passive:true});
+  document.addEventListener('scroll',_scheduleGlobalOverlayPositions,{capture:true,passive:true});
+  if(window.visualViewport){
+    window.visualViewport.addEventListener('resize',_scheduleGlobalOverlayPositions,{passive:true});
+    window.visualViewport.addEventListener('scroll',_scheduleGlobalOverlayPositions,{passive:true});
+  }
+  window.addEventListener('hermes-native-surface-interaction',(event)=>{
+    if(!_globalOverlayMounted.size)return;
+    const detail=event&&event.detail&&typeof event.detail==='object'?event.detail:{};
+    if(detail.type==='escape'){
+      document.dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',code:'Escape',bubbles:true,cancelable:true}));
+    }else{
+      document.documentElement.dispatchEvent(new MouseEvent('click',{bubbles:true,cancelable:true,view:window}));
+    }
+  });
+  window.addEventListener('pagehide',()=>_emitGlobalOverlayState({clear:true,force:true}));
+  _reconcileGlobalOverlays();
+}
+if(document.readyState==='loading')document.addEventListener('DOMContentLoaded',initGlobalOverlayLayer,{once:true});
+else initGlobalOverlayLayer();
 function _matchBacktickFenceLine(line){
   const m=String(line||'').match(/^[ ]{0,3}(`{3,})([^`]*)$/);
   if(!m) return null;
@@ -699,6 +1245,936 @@ function _messageVirtualSpacer(height, where){
   spacer.style.flex='0 0 auto';
   return spacer;
 }
+function _assistantModifiedItemStatsObject(item){
+  if(!item) return null;
+  const source=item.stats && typeof item.stats==='object' ? item.stats : item;
+  const added=Number(source.added);
+  const removed=Number(source.removed);
+  if(Number.isFinite(added)||Number.isFinite(removed)) return {added:Number.isFinite(added)?added:0,removed:Number.isFinite(removed)?removed:0};
+  const text=(typeof assistantModifiedDiffStatsText==='function')?assistantModifiedDiffStatsText(item):'';
+  const addedMatch=String(text||'').match(/\+(\d+)/);
+  const removedMatch=String(text||'').match(/-(\d+)/);
+  if(addedMatch||removedMatch) return {added:addedMatch?Number(addedMatch[1]):0,removed:removedMatch?Number(removedMatch[1]):0};
+  return null;
+}
+function _assistantModifiedItemsSameDiff(a,b){
+  const left=String(a||'').trim();
+  const right=String(b||'').trim();
+  return !!left && !!right && left===right;
+}
+function _assistantAppendFinalModifiedFileItem(existing, rawItem, path){
+  const item=rawItem||{};
+  if(!existing){
+    const first={...item,path,_recapEventCount:1};
+    const diff=String(item.diff||'');
+    first._recapDiffParts=diff?[diff]:[];
+    const stats=_assistantModifiedItemStatsObject(item);
+    if(stats) first.stats=stats;
+    return first;
+  }
+  const diff=String(item.diff||'');
+  const parts=Array.isArray(existing._recapDiffParts)?existing._recapDiffParts.slice():(existing.diff?[String(existing.diff)]:[]);
+  if(diff && !parts.some(part=>_assistantModifiedItemsSameDiff(part,diff))) parts.push(diff);
+  const oldStats=_assistantModifiedItemStatsObject(existing);
+  const newStats=_assistantModifiedItemStatsObject(item);
+  const hasOutcome=item.failed===true||item.succeeded===true;
+  const failed=hasOutcome?item.failed===true:!!existing.failed;
+  const combined={
+    ...existing,
+    path,
+    source:existing.source||item.source||'tool',
+    failed,
+    succeeded:hasOutcome?item.succeeded===true:!!existing.succeeded,
+    failure_details:failed?String(item.failure_details||existing.failure_details||'The patch tool reported a failure.'):'',
+    pending:failed?false:!!(existing.pending&&item.pending),
+    status:failed?'Patch could not be applied':(item.status||existing.status||''),
+    _recapEventCount:Number(existing._recapEventCount||1)+1,
+    _recapDiffParts:parts,
+  };
+  if(failed){
+    combined.diff='';
+    combined.stats=null;
+  }else if(parts.length) combined.diff=parts.join('\n');
+  if(!failed&&(oldStats||newStats)) combined.stats={
+    added:(oldStats?oldStats.added:0)+(newStats?newStats.added:0),
+    removed:(oldStats?oldStats.removed:0)+(newStats?newStats.removed:0),
+  };
+  const rawOutput=String(item.raw_output||item.rawOutput||'');
+  const existingRaw=String(existing.raw_output||existing.rawOutput||'');
+  if(!failed&&rawOutput && !existingRaw.includes(rawOutput)) combined.raw_output=existingRaw?`${existingRaw}\n\n${rawOutput}`:rawOutput;
+  return combined;
+}
+function _assistantMergeFinalModifiedFileItems(fileGroups){
+  const byPath=new Map();
+  const items=[];
+  for(const item of (fileGroups||[])){
+    const path=typeof _normalizeArtifactPath==='function'?_normalizeArtifactPath(item&&item.path):String(item&&item.path||'');
+    if(!path) continue;
+    const merged=_assistantAppendFinalModifiedFileItem(byPath.get(path),item,path);
+    if(byPath.has(path)){
+      const existingIdx=items.findIndex(existing=>existing&&existing.path===path);
+      if(existingIdx>=0) items[existingIdx]=merged;
+    }else{
+      items.push(merged);
+    }
+    byPath.set(path,merged);
+  }
+  return items.slice(0,24).map(item=>{
+    const out={...item};
+    delete out._recapDiffParts;
+    return out;
+  });
+}
+function _assistantTurnModifiedFilesByFinalRawIdx(entries){
+  const byFinal=new Map();
+  let run=[];
+  const flush=()=>{
+    if(!run.length) return;
+    const allFiles=[];
+    for(const entry of run){
+      const files=(typeof assistantMessageModifiedFiles==='function')
+        ? assistantMessageModifiedFiles(entry.m, entry.rawIdx)
+        : [];
+      for(const item of files) allFiles.push(item);
+    }
+    const items=_assistantMergeFinalModifiedFileItems(allFiles);
+    if(items.length) byFinal.set(run[run.length-1].rawIdx, items);
+    run=[];
+  };
+  for(const entry of (entries||[])){
+    const role=entry&&entry.m&&entry.m.role;
+    if(role==='assistant') run.push(entry);
+    else flush();
+  }
+  flush();
+  return byFinal;
+}
+function _assistantModifiedFilesRawOutputHtml(item){
+  const raw=String(item&&item.raw_output||item&&item.rawOutput||'');
+  if(!raw.trim()) return '';
+  const clipped=raw.length>50000?raw.slice(0,50000)+'\n… raw output clipped …':raw;
+  return `<details class="assistant-modified-raw-output"><summary>View raw output</summary><pre><code>${esc(clipped)}</code></pre></details>`;
+}
+function _assistantModifiedPatchFailureHtml(item){
+  const raw=String(item&&item.failure_details||item&&item.failureDetails||item&&item.error||'The patch tool reported a failure.').trim();
+  const clipped=raw.length>20000?raw.slice(0,20000)+'\n… failure details clipped …':raw;
+  const warning='<svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10.3 2.9 1.8 17a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 2.9a2 2 0 0 0-3.4 0Z"/><path d="M12 9v4"/><path d="M12 17h.01"/></svg>';
+  return `<div class="assistant-modified-patch-failure" role="status">`+
+    `<div class="assistant-modified-patch-failure-message">${warning}<span>Patch could not be applied</span></div>`+
+    `<details class="assistant-modified-patch-failure-details"><summary>Failure details</summary><pre><code>${esc(clipped)}</code></pre></details>`+
+    `</div>`;
+}
+function _assistantModifiedFileIconHtml(kind, item){
+  const label=String(kind||'').trim().toLowerCase();
+  const pending=!!(item&&item.pending);
+  const failed=!!(item&&item.failed);
+  const icon= failed ? 'failed'
+    : pending ? 'pending'
+    : label.includes('creat') ? 'created'
+    : label.includes('delet') ? 'deleted'
+    : label.includes('remov') ? 'deleted'
+    : label.includes('writ') ? 'written'
+    : 'edited';
+  const svgByIcon={
+    failed:'<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.3 2.9 1.8 17a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 2.9a2 2 0 0 0-3.4 0Z"/><path d="M12 9v4"/><path d="M12 17h.01"/></svg>',
+    pending:'<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-6.22-8.56"/></svg>',
+    created:'<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/><path d="M12 18v-6"/><path d="M9 15h6"/></svg>',
+    deleted:'<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/><path d="M9 15h6"/></svg>',
+    written:'<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/><path d="m9 18 6-6"/><path d="m14 11 2 2"/></svg>',
+    edited:'<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/><path d="M9 15h6"/><path d="M9 11h3"/></svg>',
+  };
+  const classByIcon={
+    failed:'assistant-modified-file-icon-failed',
+    pending:'assistant-modified-file-icon-pending',
+    created:'assistant-modified-file-icon-created',
+    deleted:'assistant-modified-file-icon-deleted',
+    written:'assistant-modified-file-icon-written',
+    edited:'assistant-modified-file-icon-edited',
+  };
+  return `<span class="assistant-modified-file-icon ${classByIcon[icon]||classByIcon.edited}" aria-hidden="true">${svgByIcon[icon]||svgByIcon.edited}</span>`;
+}
+function _assistantModifiedFileStatsHtml(item, statsText){
+  const text=String(statsText||'').trim();
+  if(item&&item.failed){
+    return '<span class="assistant-modified-file-stats is-failed">Patch failed</span>';
+  }
+  const pendingLabel=item&&item.pending?(item.status||'Writing file…'):'';
+  if(!text){
+    return pendingLabel
+      ? `<span class="assistant-modified-file-stats is-pending">${esc(pendingLabel)}</span>`
+      : `<span class="assistant-modified-file-stats is-empty">Diff on open</span>`;
+  }
+  const addedMatch=text.match(/\+(\d+)/);
+  const removedMatch=text.match(/-(\d+)/);
+  const added=addedMatch?`+${addedMatch[1]}`:'';
+  const removed=removedMatch?`-${removedMatch[1]}`:'';
+  if(added||removed){
+    return `<span class="assistant-modified-file-stats"><span class="assistant-modified-file-stat-added">${esc(added||'+0')}</span>${added&&removed?' ':''}<span class="assistant-modified-file-stat-removed">${esc(removed||'-0')}</span></span>`;
+  }
+  return `<span class="assistant-modified-file-stats">${esc(text)}</span>`;
+}
+function _assistantModifiedChangeOverview(items){
+  const uniqueRaw=[];
+  const seenRaw=new Set();
+  for(const item of (items||[])){
+    const raw=String(item&&item.raw_output||item&&item.rawOutput||'').trim();
+    if(!raw||seenRaw.has(raw))continue;
+    seenRaw.add(raw);
+    uniqueRaw.push(raw);
+  }
+  if(!uniqueRaw.length||typeof _toolChangeSummaryData!=='function')return null;
+  const filesByPath=new Map();
+  let fileCount=0;
+  let added=0;
+  let removed=0;
+  let hasAdded=false;
+  let hasRemoved=false;
+  let detected=false;
+  for(const raw of uniqueRaw){
+    const data=_toolChangeSummaryData(raw,'git diff --stat',[]);
+    if(!data||(data.file_count<=0&&data.added===null&&data.removed===null))continue;
+    detected=true;
+    fileCount+=Number(data.file_count||0);
+    if(Number.isFinite(data.added)){added+=data.added;hasAdded=true;}
+    if(Number.isFinite(data.removed)){removed+=data.removed;hasRemoved=true;}
+    for(const file of (data.files||[]))if(file&&file.path&&!filesByPath.has(file.path))filesByPath.set(file.path,file);
+  }
+  if(!detected)return null;
+  const files=Array.from(filesByPath.values());
+  return {
+    title:'Change Overview',
+    file_count:files.length||fileCount,
+    added:hasAdded?added:null,
+    removed:hasRemoved?removed:null,
+    files,
+    raw:uniqueRaw.join('\n\n'),
+  };
+}
+function _assistantModifiedFilesSummaryHtml(items, opts){
+  if(!Array.isArray(items)||!items.length) return '';
+  opts=opts||{};
+  const shown=items.slice(0,8);
+  const count=items.length;
+  const finalRecap=!!opts.finalRecap;
+  const label=finalRecap?`Changed files in this prompt (${count})`:`Modified Files (${count})`;
+  const overview=typeof _assistantModifiedChangeOverview==='function'&&items.some(item=>String(item&&item.diff||'').trim())
+    ? _assistantModifiedChangeOverview(items)
+    : null;
+  const overviewRaw=String(overview&&overview.raw||'');
+  const rows=shown.map(item=>{
+    const path=String(item&&item.path||'');
+    const display=(typeof _workspaceDisplayPath==='function')?_workspaceDisplayPath(path):path;
+    const kind=item&&item.failed?'Failed':((typeof _changedTurnKindForSource==='function')?_changedTurnKindForSource(item&&item.source):'Changed');
+    const diff=String(item&&item.diff||'');
+    const stats=(typeof assistantModifiedDiffStatsText==='function')?assistantModifiedDiffStatsText(item):'';
+    const pendingLabel=item&&item.pending?(item.status||'Writing file…'):'';
+    const statsHtml=_assistantModifiedFileStatsHtml(item,stats);
+    const itemRaw=String(item&&item.raw_output||item&&item.rawOutput||'').trim();
+    const rawOutputHtml=(item&&item.failed)||(overviewRaw&&itemRaw&&overviewRaw.includes(itemRaw))?'':_assistantModifiedFilesRawOutputHtml(item);
+    const diffHtml=item&&item.failed
+      ? _assistantModifiedPatchFailureHtml(item)
+      : diff&&typeof assistantModifiedDiffHtml==='function'
+      ? `${assistantModifiedDiffHtml(diff,{maxLines:120,allowExpand:true,simulateStream:!!opts.simulateDiffStream})}${rawOutputHtml}`
+      : (pendingLabel?`<div class="assistant-modified-diff-empty">${esc(pendingLabel)}</div>${rawOutputHtml}`:`<div class="assistant-modified-diff-empty">Open this card to load the current Git diff for the file.</div>${rawOutputHtml}`);
+    const fileOpen=opts.openFiles?' open':'';
+    const settledState=(diff||(item&&item.failed))?'data-diff-loaded="1"':'';
+    const failedState=item&&item.failed?' data-patch-failed="1"':'';
+    return `<details class="assistant-modified-file-card" data-modified-file-path="${esc(path)}" ${settledState}${failedState}${fileOpen} ontoggle="if(this.open&&typeof loadAssistantModifiedDiff==='function')loadAssistantModifiedDiff(this)">`+
+      `<summary class="assistant-modified-file-summary">`+
+      _assistantModifiedFileIconHtml(kind,item)+
+      `<span class="assistant-modified-file-main"><span class="assistant-modified-file-path" title="${esc(display)}">${esc(display)}</span><span class="assistant-modified-file-meta"><span class="assistant-modified-file-kind">${esc(kind)}</span>${statsHtml}</span></span>`+
+      `<span class="assistant-modified-file-chevron" aria-hidden="true">›</span>`+
+      `</summary>`+
+      `<div class="assistant-modified-file-actions"><button type="button" class="assistant-modified-open" onclick="if(typeof openChangedTurnPath==='function')openChangedTurnPath(this.closest('.assistant-modified-file-card').dataset.modifiedFilePath)">Open file</button></div>`+
+      `<div class="assistant-modified-diff-panel">${diffHtml}</div>`+
+      `</details>`;
+  }).join('');
+  const more=count>shown.length?`<div class="assistant-modified-more">+${count-shown.length} more</div>`:'';
+  const overviewHtml=overview
+    ? `<section class="assistant-change-overview"><div class="assistant-change-overview-title">${esc(overview.title)}</div>${_toolChangeSummaryBodyHtml(overview,{rawAction:false,showFiles:false})}${_assistantModifiedFilesRawOutputHtml({raw_output:overview.raw})}</section>`
+    : '';
+  const groupOpen=opts.open?' open':'';
+  const recapClass=finalRecap?' assistant-modified-files-final-recap':'';
+  return `<details class="assistant-modified-files${recapClass}"${groupOpen}><summary>${esc(label)}</summary><div class="assistant-modified-list">${overviewHtml}${rows}${more}</div></details>`;
+}
+
+// Complete mutation payloads arrive as one string, unlike assistant prose
+// tokens. Live DiffCards progressively mount whole rows and then type the code
+// cell. Pending rows stay detached, so their gutters cannot reserve height or
+// expose the final layout before generation reaches them. State is keyed by
+// mutation owner + file and survives live DOM replacement; settled history
+// never receives data-diff-stream and renders immediately.
+const _assistantDiffStreamAnimations=new Map();
+// Renderer-only lifetime state. A completed result must not type itself again
+// after session navigation, tab hiding, or DOM remount. Keying by session,
+// mutation/message owner, file, and content signature lets a genuinely new
+// result for the same file animate once while keeping this cache bounded.
+const _assistantDiffStreamCompletedResults=new Map();
+const ASSISTANT_DIFF_STREAM_COMPLETED_LIMIT=512;
+const ASSISTANT_DIFF_STREAM_MAX_LINE_UNITS=72;
+const ASSISTANT_DIFF_STREAM_HUNK_UNITS=24;
+function _assistantDiffStreamRequestFrame(callback){
+  if(typeof requestAnimationFrame==='function') return requestAnimationFrame(callback);
+  return setTimeout(()=>callback(typeof performance!=='undefined'&&performance.now?performance.now():Date.now()),16);
+}
+function _assistantDiffStreamCancelFrame(frameId){
+  if(!frameId) return;
+  if(typeof cancelAnimationFrame==='function') cancelAnimationFrame(frameId);
+  else clearTimeout(frameId);
+}
+function _assistantDiffStreamNow(){
+  return typeof performance!=='undefined'&&performance.now?performance.now():Date.now();
+}
+function _assistantDiffStreamReducedMotion(){
+  try{
+    if(typeof document!=='undefined'&&document.hidden) return true;
+    return !!(typeof window!=='undefined'&&window.matchMedia&&window.matchMedia('(prefers-reduced-motion: reduce)').matches);
+  }catch(_){ return false; }
+}
+function _assistantDiffStreamRows(pre){
+  return pre&&pre.querySelectorAll?Array.from(pre.querySelectorAll('.assistant-code-diff-line')):[];
+}
+function _assistantDiffStreamAnimateNumber(element, duration){
+  if(!element||typeof element.animate!=='function') return;
+  try{
+    if(element._assistantDiffStreamNumberAnimation) element._assistantDiffStreamNumberAnimation.cancel();
+    element._assistantDiffStreamNumberAnimation=element.animate([
+      {opacity:.52,transform:'translateY(3px) scale(.96)'},
+      {opacity:1,transform:'translateY(0) scale(1)'},
+    ],{duration:Math.max(70,Number(duration)||110),easing:'cubic-bezier(.2,.8,.2,1)'});
+  }catch(_){/* Web Animations may be unavailable in embedded shells. */}
+}
+function _assistantDiffStreamStats(card){
+  if(!card||!card.querySelectorAll) return [];
+  return Array.from(card.querySelectorAll('.assistant-modified-file-stat-added,.assistant-modified-file-stat-removed')).map(element=>{
+    const added=!!(element.classList&&element.classList.contains('assistant-modified-file-stat-added'));
+    const prefix=added?'+':'-';
+    if(!Number.isFinite(Number(element._assistantDiffStreamTarget))){
+      const match=String(element.textContent||'').match(/\d+/);
+      element._assistantDiffStreamTarget=match?Number(match[0]):0;
+    }
+    return {element,prefix,target:Math.max(0,Number(element._assistantDiffStreamTarget)||0)};
+  });
+}
+function _assistantDiffStreamHunkParts(text){
+  const match=String(text||'').match(/^@@\s+-(\d+)(?:,(\d+))?\s+\+(\d+)(?:,(\d+))?\s+@@$/);
+  if(!match) return null;
+  return {
+    oldStart:Number(match[1]),
+    oldCount:match[2]===undefined?null:Number(match[2]),
+    newStart:Number(match[3]),
+    newCount:match[4]===undefined?null:Number(match[4]),
+  };
+}
+function _assistantDiffStreamProgressNumber(target, progress){
+  const value=Math.max(0,Number(target)||0);
+  const ratio=Math.max(0,Math.min(1,Number(progress)||0));
+  if(ratio>=1||value===0) return value;
+  return Math.max(1,Math.min(value,Math.round(value*ratio)));
+}
+function _assistantDiffStreamHunkText(hunk, progress){
+  if(!hunk) return '';
+  const oldStart=_assistantDiffStreamProgressNumber(hunk.oldStart,progress);
+  const newStart=_assistantDiffStreamProgressNumber(hunk.newStart,progress);
+  const oldCount=hunk.oldCount===null?'':`,${_assistantDiffStreamProgressNumber(hunk.oldCount,progress)}`;
+  const newCount=hunk.newCount===null?'':`,${_assistantDiffStreamProgressNumber(hunk.newCount,progress)}`;
+  return `@@ -${oldStart}${oldCount} +${newStart}${newCount} @@`;
+}
+function _assistantDiffStreamLineSet(pre){
+  const lines=_assistantDiffStreamRows(pre).map(row=>{
+    const container=row&&row.parentElement;
+    const code=row&&row.querySelector&&row.querySelector('.assistant-code-diff-code');
+    let text='';
+    if(code){
+      if(typeof code._assistantDiffStreamFullText!=='string'){
+        code._assistantDiffStreamFullText=String(code.textContent||'');
+      }
+      text=code._assistantDiffStreamFullText;
+    }else{
+      text=String(row&&row.textContent||'');
+    }
+    const chars=Array.from(text);
+    const isMeta=!!(row&&row.classList&&row.classList.contains('assistant-code-diff-meta'));
+    const isHunk=!!(row&&row.classList&&row.classList.contains('assistant-code-diff-hunk'));
+    const streamable=!isMeta;
+    const hunk=isHunk?_assistantDiffStreamHunkParts(text):null;
+    const gapMatch=row&&row.classList&&row.classList.contains('assistant-code-diff-gap')
+      ? text.match(/^(\d+)\s+unmodified\s+lines?$/i)
+      : null;
+    const gapTarget=gapMatch?Math.max(1,Number(gapMatch[1])||1):0;
+    const units=hunk
+      ? ASSISTANT_DIFF_STREAM_HUNK_UNITS
+      : Math.max(1,Math.min(ASSISTANT_DIFF_STREAM_MAX_LINE_UNITS,chars.length));
+    return {row,container,code,text,chars,gapTarget,streamable,isHunk,hunk,units,mounted:true};
+  });
+  return {pre,lines,total:lines.reduce((sum,line)=>sum+(line.streamable?line.units:0),0)};
+}
+function _assistantDiffStreamSetMounted(line, mounted){
+  if(!line||!line.row||!line.container) return;
+  const isMounted=line.row.parentElement===line.container;
+  if(mounted&&!isMounted){
+    line.container.appendChild(line.row);
+  }else if(!mounted&&isMounted){
+    line.row.remove();
+  }
+  line.mounted=!!mounted;
+}
+function _assistantDiffStreamSyncGutters(lineSet){
+  if(!lineSet||!lineSet.pre) return;
+  let oldDigits=3;
+  let newDigits=3;
+  for(const line of (lineSet.lines||[])){
+    if(!line.mounted||!line.row||!line.row.querySelector) continue;
+    const oldGutter=line.row.querySelector('.assistant-code-diff-old');
+    const newGutter=line.row.querySelector('.assistant-code-diff-new');
+    oldDigits=Math.max(oldDigits,String(oldGutter&&oldGutter.textContent||'').trim().length);
+    newDigits=Math.max(newDigits,String(newGutter&&newGutter.textContent||'').trim().length);
+  }
+  const pre=lineSet.pre;
+  pre.setAttribute('data-diff-old-digits',String(oldDigits));
+  pre.setAttribute('data-diff-new-digits',String(newDigits));
+  if(pre.style&&typeof pre.style.setProperty==='function'){
+    pre.style.setProperty('--diff-old-gutter-width',`calc(${oldDigits}ch + 15px)`);
+    pre.style.setProperty('--diff-new-gutter-width',`calc(${newDigits}ch + 15px)`);
+  }
+}
+function _assistantDiffStreamSignature(lines){
+  let hash=2166136261;
+  for(const line of (lines||[])){
+    const text=String(line&&line.text||'');
+    for(let idx=0;idx<text.length;idx++) hash=Math.imul(hash^text.charCodeAt(idx),16777619);
+    hash=Math.imul(hash^10,16777619);
+  }
+  return `${(lines||[]).length}:${hash>>>0}`;
+}
+function _assistantDiffStreamAnimationKey(card, cardIndex){
+  const owner=card&&card.closest&&card.closest('[data-mutation-event-key],[data-anchor-row-id],[data-msg-idx]');
+  const ownerKey=owner&&(
+    owner.getAttribute('data-mutation-event-key')||
+    owner.getAttribute('data-anchor-row-id')||
+    owner.getAttribute('data-msg-idx')||''
+  );
+  const path=card&&card.getAttribute&&card.getAttribute('data-modified-file-path')||'file';
+  const sessionId=(typeof S!=='undefined'&&S&&S.session&&S.session.session_id)||
+    (owner&&owner.getAttribute&&owner.getAttribute('data-session-id'))||'session';
+  return `${sessionId}:${ownerKey||'live'}:${path}:${cardIndex||0}`;
+}
+function _assistantDiffStreamResultKey(key, signature){
+  return `${String(key||'')}:${String(signature||'')}`;
+}
+function _assistantDiffStreamRememberCompleted(resultKey){
+  const key=String(resultKey||'');
+  if(!key) return;
+  if(_assistantDiffStreamCompletedResults.has(key)) _assistantDiffStreamCompletedResults.delete(key);
+  _assistantDiffStreamCompletedResults.set(key,Date.now());
+  while(_assistantDiffStreamCompletedResults.size>ASSISTANT_DIFF_STREAM_COMPLETED_LIMIT){
+    const oldest=_assistantDiffStreamCompletedResults.keys().next().value;
+    if(oldest===undefined) break;
+    _assistantDiffStreamCompletedResults.delete(oldest);
+  }
+}
+function _assistantDiffStreamCancelState(state){
+  if(!state) return;
+  _assistantDiffStreamCancelFrame(state.frameId);
+  state.frameId=0;
+  for(const binding of (state.bindings||[])){
+    try{ binding.pre.removeEventListener('scroll',binding.onScroll); }catch(_){/* detached DOM */}
+  }
+  for(const stat of (state.stats||[])){
+    try{ if(stat.element._assistantDiffStreamNumberAnimation) stat.element._assistantDiffStreamNumberAnimation.cancel(); }catch(_){ }
+  }
+  for(const lineSet of (state.lineSets||[])){
+    for(const line of (lineSet.lines||[])){
+      try{ if(line.code&&line.code._assistantDiffStreamNumberAnimation) line.code._assistantDiffStreamNumberAnimation.cancel(); }catch(_){ }
+    }
+  }
+  state.bindings=[];
+}
+function _assistantDiffStreamFollowScroll(state){
+  if(!state||!state.followTail) return;
+  for(const pre of (state.pres||[])){
+    if(!pre||pre.hidden) continue;
+    pre.scrollTop=Math.max(0,(Number(pre.scrollHeight)||0)-(Number(pre.clientHeight)||0));
+  }
+}
+function _assistantDiffStreamApply(state, count, animate){
+  if(!state) return;
+  const target=Math.max(0,Math.min(state.total,Math.floor(Number(count)||0)));
+  state.revealed=target;
+  for(const lineSet of state.lineSets){
+    const pre=lineSet.pre;
+    let remaining=target;
+    pre.setAttribute('data-diff-stream-ready','1');
+    pre.setAttribute('data-diff-stream-revealed',String(Math.min(target,lineSet.total)));
+    pre.setAttribute('aria-busy',target<state.total?'true':'false');
+    for(const line of lineSet.lines){
+      if(!line.streamable){
+        _assistantDiffStreamSetMounted(line,true);
+        if(line.code) line.code.textContent=line.text;
+        continue;
+      }
+      const consumed=Math.min(line.units,Math.max(0,remaining));
+      const show=consumed>0;
+      // Mount the gutter, marker and code as one atomic row only when the
+      // first unit of that line is revealed. A pending line is not hidden in
+      // place: it is absent from the layout entirely.
+      _assistantDiffStreamSetMounted(line,show);
+      if(line.code){
+        const ratio=line.units>0?consumed/line.units:1;
+        if(show&&line.hunk){
+          const nextText=_assistantDiffStreamHunkText(line.hunk,ratio);
+          if(line.code.textContent!==nextText){
+            line.code.textContent=nextText;
+            if(animate) _assistantDiffStreamAnimateNumber(line.code,90);
+          }
+        }else if(show&&line.gapTarget){
+          const gapCount=consumed>=line.units
+            ? line.gapTarget
+            : Math.max(1,Math.min(line.gapTarget,Math.round(line.gapTarget*ratio)));
+          const nextText=`${gapCount} unmodified line${gapCount===1?'':'s'}`;
+          if(line.code.textContent!==nextText){
+            line.code.textContent=nextText;
+            if(animate) _assistantDiffStreamAnimateNumber(line.code,85);
+          }
+        }else{
+          const charCount=consumed>=line.units
+            ? line.chars.length
+            : Math.min(line.chars.length,Math.max(1,Math.ceil(line.chars.length*ratio)));
+          line.code.textContent=show?line.chars.slice(0,charCount).join(''):'';
+        }
+      }
+      remaining=Math.max(0,remaining-line.units);
+    }
+    _assistantDiffStreamSyncGutters(lineSet);
+  }
+  const progress=state.total?target/state.total:1;
+  for(const stat of (state.stats||[])){
+    const value=target>=state.total?stat.target:Math.max(0,Math.min(stat.target,Math.round(stat.target*progress)));
+    const nextText=`${stat.prefix}${value}`;
+    if(stat.element.textContent!==nextText){
+      stat.element.textContent=nextText;
+      if(animate) _assistantDiffStreamAnimateNumber(stat.element,125);
+    }
+  }
+  _assistantDiffStreamFollowScroll(state);
+  if(typeof scrollIfPinned==='function') scrollIfPinned();
+}
+function _assistantDiffStreamFinish(state){
+  if(!state) return;
+  _assistantDiffStreamCancelFrame(state.frameId);
+  state.frameId=0;
+  _assistantDiffStreamApply(state,state.total,false);
+  state.complete=true;
+  _assistantDiffStreamRememberCompleted(state.resultKey);
+  for(const pre of state.pres){
+    pre.removeAttribute('aria-busy');
+    pre.setAttribute('data-diff-stream-complete','1');
+  }
+}
+function _assistantDiffStreamTick(state, timestamp){
+  if(!state||state.complete||_assistantDiffStreamAnimations.get(state.key)!==state) return;
+  const elapsed=Math.max(0,Number(timestamp)-state.startedAt);
+  const progress=Math.min(1,elapsed/state.duration);
+  const target=Math.max(1,Math.ceil(state.total*progress));
+  _assistantDiffStreamApply(state,target,true);
+  if(target>=state.total){
+    _assistantDiffStreamFinish(state);
+    return;
+  }
+  state.frameId=_assistantDiffStreamRequestFrame(next=>_assistantDiffStreamTick(state,next));
+}
+function _activateAssistantDiffStreaming(root){
+  if(!root||!root.querySelectorAll) return 0;
+  const cards=[];
+  const activeKeys=new Set();
+  if(root.matches&&root.matches('.assistant-modified-file-card')) cards.push(root);
+  root.querySelectorAll('.assistant-modified-file-card').forEach(card=>cards.push(card));
+  let activated=0;
+  cards.forEach((card,cardIndex)=>{
+    const pres=Array.from(card.querySelectorAll('.assistant-code-diff[data-diff-stream="1"]')).filter(pre=>!pre.hidden);
+    if(!pres.length) return;
+    const lineSets=pres.map(pre=>_assistantDiffStreamLineSet(pre));
+    const longest=lineSets.reduce((best,lineSet)=>(
+      lineSet.total>best.total||(!best.lines.length&&lineSet.lines.length)
+    )?lineSet:best,{lines:[],total:0});
+    if(!longest.lines.length) return;
+    const key=_assistantDiffStreamAnimationKey(card,cardIndex);
+    activeKeys.add(key);
+    const signature=_assistantDiffStreamSignature(longest.lines);
+    const resultKey=_assistantDiffStreamResultKey(key,signature);
+    const previous=_assistantDiffStreamAnimations.get(key);
+    const same=!!(previous&&previous.signature===signature);
+    const previousComplete=!!(same&&previous.complete);
+    const ownerElement=card&&card.closest&&card.closest('[data-mutation-event-key],[data-anchor-row-id],[data-msg-idx]');
+    const remounted=!!(same&&previous&&previous.ownerElement&&previous.ownerElement!==ownerElement);
+    const rememberedComplete=_assistantDiffStreamCompletedResults.has(resultKey);
+    const previousRevealed=same?Math.min(previous.revealed,longest.total):0;
+    const previousFollowTail=same?previous.followTail:true;
+    _assistantDiffStreamCancelState(previous);
+
+    const state={
+      key,
+      resultKey,
+      signature,
+      ownerElement,
+      pres,
+      lineSets,
+      stats:_assistantDiffStreamStats(card),
+      bindings:[],
+      total:longest.total,
+      revealed:0,
+      followTail:previousFollowTail,
+      complete:false,
+      frameId:0,
+      duration:Math.min(4200,Math.max(620,longest.total*5)),
+      startedAt:_assistantDiffStreamNow(),
+    };
+    _assistantDiffStreamAnimations.set(key,state);
+    for(const lineSet of lineSets){
+      const pre=lineSet.pre;
+      // Capture the complete row data first, then remove it from the live code
+      // container before marking the pre ready. This prevents placeholder rows
+      // and their final gutters from reserving vertical space during typing.
+      for(const line of lineSet.lines){
+        _assistantDiffStreamSetMounted(line,false);
+        if(line.code) line.code.textContent='';
+      }
+      _assistantDiffStreamSyncGutters(lineSet);
+      const onScroll=()=>{
+        const max=Math.max(0,(Number(pre.scrollHeight)||0)-(Number(pre.clientHeight)||0));
+        state.followTail=max<=2||(Number(pre.scrollTop)||0)>=max-18;
+      };
+      pre.addEventListener('scroll',onScroll,{passive:true});
+      state.bindings.push({pre,onScroll});
+    }
+
+    if(!state.total||previousComplete||rememberedComplete||remounted||_assistantDiffStreamReducedMotion()){
+      _assistantDiffStreamFinish(state);
+      activated+=1;
+      return;
+    }
+    const initial=Math.max(1,previousRevealed);
+    state.startedAt-=state.duration*(initial/state.total);
+    _assistantDiffStreamApply(state,initial,false);
+    state.frameId=_assistantDiffStreamRequestFrame(timestamp=>_assistantDiffStreamTick(state,timestamp));
+    activated+=1;
+  });
+  // A live replacement may shrink or remove a file/diff. Release controllers
+  // owned by that replaced subtree instead of retaining detached rows until
+  // the whole turn ends.
+  for(const [key,state] of _assistantDiffStreamAnimations.entries()){
+    const ownedByRoot=state&&state.ownerElement&&(
+      state.ownerElement===root||
+      (root.contains&&root.contains(state.ownerElement))
+    );
+    if(ownedByRoot&&!activeKeys.has(key)){
+      _assistantDiffStreamCancelState(state);
+      _assistantDiffStreamAnimations.delete(key);
+    }
+  }
+  return activated;
+}
+function _resetAssistantDiffStreaming(){
+  for(const state of _assistantDiffStreamAnimations.values()){
+    // A teardown means this result left its current rendering lifecycle. If it
+    // is shown again, render the complete result instead of replaying typing.
+    _assistantDiffStreamFinish(state);
+    _assistantDiffStreamCancelState(state);
+  }
+  _assistantDiffStreamAnimations.clear();
+}
+function _finishAssistantDiffStreamingForVisibilityExit(){
+  for(const state of _assistantDiffStreamAnimations.values()){
+    if(state&&!state.complete) _assistantDiffStreamFinish(state);
+  }
+}
+if(typeof document!=='undefined'&&document.addEventListener){
+  document.addEventListener('visibilitychange',()=>{
+    if(document.hidden) _finishAssistantDiffStreamingForVisibilityExit();
+  });
+}
+if(typeof window!=='undefined'&&window.addEventListener){
+  window.addEventListener('pagehide',_finishAssistantDiffStreamingForVisibilityExit);
+}
+
+function _assistantMutationSemanticKeyFromToolCall(tc){
+  if(!tc||typeof tc!=='object') return '';
+  const name=String(tc.name||'').replace(/^functions\./,'').toLowerCase();
+  if(!/^(write_file|patch|edit_file|create_file|mcp_filesystem_write_file|mcp_filesystem_edit_file)$/.test(name)) return '';
+  const args=tc.args&&typeof tc.args==='object'?tc.args:{};
+  const path=String(args.path||args.file_path||args.file||args.target||args.destination||'');
+  if(!path) return '';
+  const discriminator=[args.mode||'',args.old_string||'',args.new_string||'',args.content||''].join('\x1f');
+  let hash=2166136261;
+  const identity=`${name}\x1f${path}\x1f${discriminator}`;
+  for(let idx=0;idx<identity.length;idx++) hash=Math.imul(hash^identity.charCodeAt(idx),16777619);
+  return `mutation:${name}:${hash>>>0}`;
+}
+function _assistantMutationEventKeyFromToolCall(tc, fallback){
+  const mutationKey=_assistantMutationSemanticKeyFromToolCall(tc);
+  if(mutationKey) return mutationKey;
+  const identity=typeof _toolIdentity==='function'?_toolIdentity(tc):'';
+  if(identity) return identity;
+  const tid=tc&&(tc.tid||tc.id||tc.tool_call_id||tc.tool_use_id||tc.call_id||'');
+  if(tid) return `id:${tid}`;
+  return fallback?String(fallback):'';
+}
+function _assistantMutationItemsWithEventKey(items, eventKey){
+  return (items||[]).map((item,idx)=>({
+    ...(item||{}),
+    mutationEventKey:String((item&&item.mutationEventKey)||eventKey||`event:${idx}`),
+  }));
+}
+function _assistantLiveMutationItemsFromToolCall(tc){
+  if(!tc || typeof tc!=='object') return [];
+  const eventKey=_assistantMutationEventKeyFromToolCall(tc, `derived:${Date.now()}`);
+  const msg={tool_calls:[tc]};
+  if(typeof assistantMessageModifiedFiles==='function') return _assistantMutationItemsWithEventKey(assistantMessageModifiedFiles(msg).slice(0,24), eventKey);
+  const out=[];
+  const preview=tc.mutation_preview || tc.mutationPreview || {};
+  const name=String(tc.name||'').replace(/^functions\./,'').toLowerCase();
+  const confirmedMutation=typeof _artifactToolCallHasConfirmedMutation==='function'
+    ? _artifactToolCallHasConfirmedMutation(tc,preview)
+    : /^(?:write_file|patch|edit_file|create_file|mcp_filesystem_write_file|mcp_filesystem_edit_file)$/.test(name);
+  if(confirmedMutation&&preview&&Array.isArray(preview.files)){
+    preview.files.forEach((file,idx)=>{
+      const path=typeof _normalizeArtifactPath==='function'?_normalizeArtifactPath(file&&file.path):String(file&&file.path||'');
+      if(!path) return;
+      const item={path, source:(file&&file.source)||preview.source||tc.name||'tool', mutationEventKey:eventKey};
+      if(file&&file.failed){
+        item.failed=true;
+        item.succeeded=false;
+        item.status='Patch could not be applied';
+        item.failure_details=String(file.failure_details||file.failureDetails||file.error||file.message||file.status||'The patch tool reported a failure.');
+      }else if(file&&file.diff){item.diff=String(file.diff);item.stats=file.stats||null;item.failed=false;item.succeeded=tc.done===true;}
+      else if(file&&file.pending){item.pending=true;item.status=file.status||'Writing file…';}
+      out.push(item);
+    });
+  }
+  return out;
+}
+
+const _liveAssistantMutationEventsByKey=new Map();
+let _liveAssistantModifiedFilesDeferredTimer=null;
+const _LIVE_MUTATION_PENDING_MIN_MS=180;
+function _resetLiveAssistantModifiedFiles(){
+  _liveAssistantMutationEventsByKey.clear();
+  _resetAssistantDiffStreaming();
+  if(_liveAssistantModifiedFilesDeferredTimer){
+    clearTimeout(_liveAssistantModifiedFilesDeferredTimer);
+    _liveAssistantModifiedFilesDeferredTimer=null;
+  }
+}
+function _assistantMutationEventKeyFromItems(items){
+  const first=(items||[]).find(item=>item&&item.mutationEventKey);
+  if(first&&first.mutationEventKey) return String(first.mutationEventKey);
+  const pathItem=(items||[]).find(item=>item&&item.path);
+  return pathItem?`derived:${pathItem.path}:${Date.now()}`:`derived:${Date.now()}`;
+}
+function _flushDeferredLiveAssistantModifiedDiffs(){
+  _liveAssistantModifiedFilesDeferredTimer=null;
+  let changed=false;
+  for(const [eventKey,event] of _liveAssistantMutationEventsByKey.entries()){
+    if(!event||!Array.isArray(event.items)) continue;
+    let eventChanged=false;
+    const items=event.items.map(item=>{
+      if(!item||!item._deferredDiff) return item;
+      eventChanged=true;
+      return {
+        ...item,
+        diff:item._deferredDiff,
+        stats:item._deferredStats||null,
+        source:item._deferredSource||item.source||'tool',
+        pending:false,
+        status:'',
+        _deferredDiff:'',
+        _deferredStats:null,
+        _deferredSource:'',
+      };
+    });
+    if(!eventChanged) continue;
+    _liveAssistantMutationEventsByKey.set(eventKey,{...event,items});
+    const row=document.querySelector(`.assistant-live-modified-files-row[data-mutation-event-key="${CSS.escape(eventKey)}"]`);
+    if(row){
+      _replaceAssistantModifiedFilesHtmlPreservingState(
+        row,
+        _assistantModifiedFilesSummaryHtml(items.slice(0,24),{open:true,openFiles:true,simulateDiffStream:true})
+      );
+    }
+    changed=true;
+  }
+  if(!changed) return;
+}
+function _scheduleLiveAssistantModifiedFilesDeferredDiff(delayMs){
+  if(_liveAssistantModifiedFilesDeferredTimer) return;
+  _liveAssistantModifiedFilesDeferredTimer=setTimeout(_flushDeferredLiveAssistantModifiedDiffs, Math.max(0,delayMs||_LIVE_MUTATION_PENDING_MIN_MS));
+}
+function _mergeLiveAssistantModifiedItems(items){
+  const now=Date.now();
+  const eventKey=_assistantMutationEventKeyFromItems(items);
+  const event=_liveAssistantMutationEventsByKey.get(eventKey)||{items:[],createdAt:now};
+  const byPath=new Map();
+  for(const existing of event.items||[]){
+    const path=typeof _normalizeArtifactPath==='function'?_normalizeArtifactPath(existing&&existing.path):String(existing&&existing.path||'');
+    if(path) byPath.set(path,existing);
+  }
+  for(const rawItem of items||[]){
+    const raw={...(rawItem||{}),mutationEventKey:eventKey};
+    const path=typeof _normalizeArtifactPath==='function'?_normalizeArtifactPath(raw&&raw.path):String(raw&&raw.path||'');
+    if(!path) continue;
+    const existing=byPath.get(path) || {};
+    const rawFailed=raw.failed===true;
+    const rawSucceeded=raw.succeeded===true;
+    const pendingStartedAt=existing._pendingStartedAt || (raw.pending && !raw.diff && !rawFailed ? now : 0);
+    const rawSource=String(raw.source||existing.source||'').toLowerCase();
+    const shouldInitialDeferDiff=!!(!rawFailed&&raw.diff && !existing.diff && !existing.pending && (rawSource.includes('write')||rawSource.includes('create')));
+    const shouldDeferDiff=!!(!rawFailed&&raw.diff && existing.pending && pendingStartedAt && now-pendingStartedAt<_LIVE_MUTATION_PENDING_MIN_MS);
+    if(shouldInitialDeferDiff){
+      byPath.set(path,{
+        ...existing,
+        path,
+        mutationEventKey:eventKey,
+        source:raw.source || existing.source || 'tool',
+        pending:true,
+        status:'Writing file…',
+        _pendingStartedAt:now,
+        _deferredDiff:raw.diff,
+        _deferredStats:raw.stats || null,
+        _deferredSource:raw.source || existing.source || 'tool',
+      });
+      _scheduleLiveAssistantModifiedFilesDeferredDiff(_LIVE_MUTATION_PENDING_MIN_MS);
+      continue;
+    }
+    if(shouldDeferDiff){
+      byPath.set(path,{
+        ...existing,
+        path,
+        mutationEventKey:eventKey,
+        source:raw.source || existing.source || 'tool',
+        pending:true,
+        status:existing.status || raw.status || 'Writing file…',
+        _pendingStartedAt:pendingStartedAt,
+        _deferredDiff:raw.diff,
+        _deferredStats:raw.stats || null,
+        _deferredSource:raw.source || existing.source || 'tool',
+      });
+      _scheduleLiveAssistantModifiedFilesDeferredDiff(_LIVE_MUTATION_PENDING_MIN_MS-(now-pendingStartedAt));
+      continue;
+    }
+    byPath.set(path,{
+      ...existing,
+      ...raw,
+      path,
+      mutationEventKey:eventKey,
+      failed:rawFailed?true:(rawSucceeded?false:!!existing.failed),
+      succeeded:rawFailed?false:(rawSucceeded||!!existing.succeeded),
+      failure_details:rawFailed?String(raw.failure_details||'The patch tool reported a failure.'):(rawSucceeded?'':String(existing.failure_details||'')),
+      diff:rawFailed?'':(raw.diff || existing.diff || ''),
+      stats:rawFailed?null:(raw.stats || existing.stats || null),
+      source:raw.source || existing.source || 'tool',
+      pending:rawFailed?false:!!(raw.pending && !raw.diff && !existing.diff),
+      status:rawFailed?'Patch could not be applied':(rawSucceeded?'':(raw.status || existing.status || '')),
+      _pendingStartedAt:rawFailed?0:(raw.pending && !raw.diff && !existing.diff ? pendingStartedAt : 0),
+      _deferredDiff:rawFailed?'':(raw.diff ? '' : (existing._deferredDiff || '')),
+      _deferredStats:rawFailed?null:(raw.diff ? null : (existing._deferredStats || null)),
+      _deferredSource:rawFailed?'':(raw.diff ? '' : (existing._deferredSource || '')),
+    });
+  }
+  const merged=Array.from(byPath.values()).slice(0,24);
+  _liveAssistantMutationEventsByKey.set(eventKey,{...event,eventKey,items:merged});
+  return merged;
+}
+function _mergeAssistantModifiedItemsForDisplay(existingItems, nextItems){
+  const byPath=new Map();
+  const add=(raw)=>{
+    const path=typeof _normalizeArtifactPath==='function'?_normalizeArtifactPath(raw&&raw.path):String(raw&&raw.path||'');
+    if(!path) return;
+    const existing=byPath.get(path) || {};
+    byPath.set(path,{
+      ...existing,
+      ...raw,
+      path,
+      failed:raw.failed===true?true:(raw.succeeded===true?false:!!existing.failed),
+      succeeded:raw.failed===true?false:(raw.succeeded===true||!!existing.succeeded),
+      failure_details:raw.failed===true?String(raw.failure_details||'The patch tool reported a failure.'):(raw.succeeded===true?'':String(existing.failure_details||'')),
+      diff:raw.failed===true?'':(raw.diff || existing.diff || ''),
+      stats:raw.failed===true?null:(raw.stats || existing.stats || null),
+      source:raw.source || existing.source || 'tool',
+      pending:raw.failed===true?false:!!(raw.pending && !raw.diff && !existing.diff),
+      status:raw.failed===true?'Patch could not be applied':(raw.succeeded===true?'':(raw.status || existing.status || '')),
+    });
+  };
+  (existingItems||[]).forEach(add);
+  (nextItems||[]).forEach(add);
+  return Array.from(byPath.values()).slice(0,24);
+}
+function _assistantModifiedFilesNode(items, extraClass, opts){
+  const node=document.createElement('div');
+  node.className=`assistant-segment assistant-live-modified-files-row ${extraClass||''}`.trim();
+  node.setAttribute('data-live-mutations','1');
+  const eventKey=_assistantMutationEventKeyFromItems(items||[]);
+  if(eventKey) node.setAttribute('data-mutation-event-key',eventKey);
+  const collapsed=!!(opts&&opts.collapsed);
+  const simulateDiffStream=opts&&opts.simulateDiffStream!==undefined
+    ? !!opts.simulateDiffStream
+    : false;
+  node.innerHTML=_assistantModifiedFilesSummaryHtml(
+    items,
+    collapsed?{}:{open:true,openFiles:true,simulateDiffStream}
+  );
+  if(simulateDiffStream) _activateAssistantDiffStreaming(node);
+  return node;
+}
+function _replaceAssistantModifiedFilesHtmlPreservingState(row, html){
+  if(!row) return;
+  const state=typeof _captureWorklogDetailDisclosureState==='function'
+    ? _captureWorklogDetailDisclosureState(row)
+    : null;
+  row.innerHTML=html;
+  if(state&&state.size&&typeof _restoreWorklogDetailDisclosureState==='function'){
+    _restoreWorklogDetailDisclosureState(row,state);
+  }
+  _activateAssistantDiffStreaming(row);
+}
+function _appendLiveModifiedFilesCard(tc, opts){
+  const items=_assistantLiveMutationItemsFromToolCall(tc);
+  if(!items.length) return false;
+  opts=opts||{};
+  const inner=opts.inner || _assistantTurnBlocks($('liveAssistantTurn'));
+  if(!inner) return false;
+  const tid=tc&&(tc.tid||tc.id||tc.tool_call_id||tc.tool_use_id||tc.call_id||'');
+  const merged=_mergeLiveAssistantModifiedItems(items);
+  const eventKey=_assistantMutationEventKeyFromItems(merged);
+  let row=eventKey?inner.querySelector(`.assistant-live-modified-files-row[data-mutation-event-key="${CSS.escape(eventKey)}"]`):null;
+  if(!row){
+    row=_assistantModifiedFilesNode(merged,'assistant-timeline-mutation-event',{simulateDiffStream:true});
+    const anchor=opts.anchor;
+    const footer=inner.querySelector('#liveRunStatus');
+    if(anchor && anchor.parentElement===inner) anchor.after(row);
+    else if(footer && footer.parentElement===inner) inner.insertBefore(row,footer);
+    else inner.appendChild(row);
+  }else{
+    _replaceAssistantModifiedFilesHtmlPreservingState(
+      row,
+      _assistantModifiedFilesSummaryHtml(merged,{open:true,openFiles:true,simulateDiffStream:true})
+    );
+  }
+  if(typeof _moveLiveRunStatusToTurnEnd==='function') _moveLiveRunStatusToTurnEnd();
+  if(tid&&inner.querySelectorAll){
+    inner.querySelectorAll(`.tool-card-row[data-live-tid="${CSS.escape(tid)}"],.transparent-event-row[data-live-tid="${CSS.escape(tid)}"]`).forEach(existing=>{
+      if(existing!==row && !existing.matches('.assistant-live-modified-files-row,[data-live-mutations="1"]')) existing.remove();
+    });
+  }
+  if(typeof scrollIfPinned==='function') scrollIfPinned();
+  return true;
+}
+function _assistantMessageHasAnchorMutationFiles(message){
+  if(!message||!message._anchor_activity_scene) return false;
+  const rows=typeof _anchorSceneRowsForRendering==='function'
+    ? _anchorSceneRowsForRendering(message._anchor_activity_scene,{settled:true})
+    : (Array.isArray(message._anchor_activity_scene.activity_rows)?message._anchor_activity_scene.activity_rows:[]);
+  return rows.some(row=>_assistantAnchorSceneMutationItemsFromRow(row,{settled:true}).length>0);
+}
 function _messageVirtualWindowKeyFor(windowMetrics){
   if(!windowMetrics) return '';
   return [
@@ -801,9 +2277,17 @@ function _syncMessageVirtualHeightCache(visWithIdx){
   if(nextHeights===null){
     _clearMessageVirtualHeightCache();
     _messageVirtualHeightCache=new Array(nextEntries.length);
+    if(typeof _streamUiDiagnostic==='function') _streamUiDiagnostic('virtualization','virtual-row-invalidated',{
+      reason:'message-reference-mismatch',
+      row_count:nextEntries.length,
+    });
   }else{
     _messageVirtualHeightCache=nextHeights;
     _messageVirtualWindowKey='';
+    if(typeof _streamUiDiagnostic==='function') _streamUiDiagnostic('virtualization','virtual-row-invalidated',{
+      reason:'message-window-shift',
+      row_count:nextEntries.length,
+    });
   }
   _messageVirtualHeightCacheEntries=nextEntries;
   _messageVirtualHeightCacheLen=S.messages.length;
@@ -1381,6 +2865,11 @@ function _updateMessageVirtualMeasurements(renderVisWithIdx, renderVisibleIdxs, 
     _messageVirtualEstimatedRowHeight=Math.max(60, Math.round(measuredTotal/measuredCount));
   }
   if(changed){
+    if(typeof _streamUiDiagnostic==='function') _streamUiDiagnostic('virtualization','virtual-row-invalidated',{
+      reason:'measured-height-change',
+      measured_count:measuredCount,
+      window_key:_messageVirtualWindowKeyFor(virtualWindow),
+    });
     _scheduleMessageVirtualMeasurementRefresh(virtualWindow);
   }else{
     _markMessageVirtualMeasurementsSettled(virtualWindow);
@@ -2306,6 +3795,7 @@ function _openMermaidLightbox(svgEl) {
   if(!svgEl) return;
   const lb = document.createElement('div');
   lb.className = 'img-lightbox';
+  lb.dataset.globalOverlay='modal';
   lb.setAttribute('role', 'dialog');
   lb.setAttribute('aria-modal', 'true');
   lb.setAttribute('aria-label', 'Mermaid diagram');
@@ -2370,12 +3860,16 @@ function _openMermaidLightbox(svgEl) {
     if(e.key==='Escape') _closeImgLightbox(lb);
   };
   document.body.appendChild(lb);
+  // Dynamic modals do not have a component render pass. Reconcile in the same
+  // task so the native Browser surface cannot cover their first painted frame.
+  _reconcileGlobalOverlays();
   document.addEventListener('keydown', lb._keyHandler);
   return lb;
 }
 function _openImgLightboxWithNav(src, alt, images, index) {
   const lb = document.createElement('div');
   lb.className = 'img-lightbox';
+  lb.dataset.globalOverlay='modal';
   lb.setAttribute('role', 'dialog');
   lb.setAttribute('aria-modal', 'true');
   lb.setAttribute('aria-label', alt || 'Image');
@@ -2414,6 +3908,7 @@ function _openImgLightboxWithNav(src, alt, images, index) {
   }
   lb.onclick = () => _closeImgLightbox(lb);
   document.body.appendChild(lb);
+  _reconcileGlobalOverlays();
   // Single keyboard handler — reads lb._navX live, no remove/add churn.
   lb._keyHandler = e => {
     if(e.key==='Escape'){ _closeImgLightbox(lb); return; }
@@ -3867,6 +5362,9 @@ function _positionModelDropdown(){
   const anchor=(panel&&panel.classList.contains('open')&&mobileAction)?mobileAction:(chip&&chip.offsetParent?chip:mobileAction);
   if(!anchor) return;
   const isPhone=typeof window.matchMedia==='function'&&window.matchMedia('(max-width:640px)').matches;
+  if(typeof _positionGlobalOverlayFromAnchor==='function'&&_positionGlobalOverlayFromAnchor(dd,anchor,6,{
+    placement:'top',align:'start',widthMode:isPhone?'viewport':'natural',margin:8,
+  }))return;
   if(isPhone){
     // #6080: .composer-footer sets container-type:inline-size (and a
     // backdrop-filter under the Geist Contrast skin) — both establish a fixed
@@ -4703,6 +6201,7 @@ async function toggleModelDropdown(){
   if(typeof closeProfileDropdown==='function') closeProfileDropdown();
   if(typeof closeWsDropdown==='function') closeWsDropdown();
   if(typeof closeReasoningDropdown==='function') closeReasoningDropdown();
+  if(typeof closeFastDropdown==='function') closeFastDropdown();
   if(typeof closeToolsetsDropdown==='function') closeToolsetsDropdown();
   if(typeof window._ensureModelDropdownReady==='function'){
     const ready=window._ensureModelDropdownReady();
@@ -4723,7 +6222,10 @@ function closeModelDropdown(){
   const dd=$('composerModelDropdown');
   const chip=$('composerModelChip');
   const mobileAction=$('composerMobileModelAction');
-  if(dd) dd.classList.remove('open');
+  if(dd){
+    dd.classList.remove('open');
+    if(typeof _restoreGlobalOverlay==='function')_restoreGlobalOverlay(dd);
+  }
   if(chip) chip.classList.remove('active');
   if(mobileAction) mobileAction.classList.remove('active');
   // If the phone path reparented the menu onto <body>, put it back in the
@@ -4849,6 +6351,10 @@ window.addEventListener('resize',()=>{
   if(rdd&&rdd.classList.contains('open')&&typeof _positionReasoningDropdown==='function'){
     _positionReasoningDropdown();
   }
+  const fdd=$('composerFastDropdown');
+  if(fdd&&fdd.classList.contains('open')&&typeof _positionFastDropdown==='function'){
+    _positionFastDropdown();
+  }
 });
 
 // visualViewport resize/scroll fire on mobile when the on-screen keyboard opens
@@ -4956,6 +6462,7 @@ let _currentReasoningEffortsSupported=null;
 // is empty (GLM-4.5–5.1 on native zai). Undefined = unknown, treated as true
 // so the chip stays visible by default (prior behavior).
 let _currentReasoningToggleSupported=undefined;
+let _currentReasoningOptions=null;
 let _profileTransitionReasoningContext=null;
 
 function _normalizeReasoningEffort(eff){
@@ -4969,8 +6476,9 @@ function _formatReasoningEffortLabel(effort){
   if(effort==='low') return 'Low';
   if(effort==='medium') return 'Medium';
   if(effort==='high') return 'High';
-  if(effort==='xhigh') return 'XHigh';
+  if(effort==='xhigh') return 'Extra High';
   if(effort==='max') return 'Max';
+  if(effort==='ultra') return 'Ultra';
   return effort.charAt(0).toUpperCase()+effort.slice(1);
 }
 
@@ -5001,28 +6509,47 @@ function _reasoningEffortQuery(){
   return qs?('?'+qs):'';
 }
 
-function _applyReasoningOptions(supportedEfforts){
+function _applyReasoningOptions(supportedEfforts,options){
   const dd=$('composerReasoningDropdown');
   if(!dd) return;
   const supported=new Set(Array.isArray(supportedEfforts)?supportedEfforts:[]);
-  dd.querySelectorAll('.reasoning-option').forEach(function(opt){
-    const effort=opt.dataset.effort;
-    // 'none' (turn thinking off) and '' (Default = clear override, provider
-    // default = thinking on) are meta-options outside the effort ladder. They
-    // are always shown so a thinking-toggle-only model (GLM-4.5–5.1 on native
-    // zai, where the ladder is empty) still has an operable two-state control:
-    // Default (on) + None (off). Without the Default option the toggle is
-    // one-way off-only — the user can disable thinking but cannot re-enable it.
-    // (#6219 round-3)
-    if(effort==='none'||effort===''){
-      opt.style.display='';
-      return;
-    }
-    if(!supported.size){
-      opt.style.display='none';
-      return;
-    }
-    opt.style.display=supported.has(effort)?'':'none';
+  const backendOptions=Array.isArray(options)?options.filter(function(opt){
+    return opt&&typeof opt.value==='string'&&typeof opt.label==='string';
+  }):[];
+  // The backend owns both capability filtering and label -> payload mapping.
+  // A tiny fallback keeps older standalone backends usable without reviving a
+  // permanently hard-coded final dropdown.
+  const rendered=backendOptions.length?backendOptions:[
+    {value:'',label:'Default'},
+    {value:'none',label:'None'},
+    ...Array.from(supported).map(function(value){
+      return {value:value,label:_formatReasoningEffortLabel(value)};
+    }),
+  ];
+  const renderKey=JSON.stringify(rendered.map(function(item){
+    return [item.value,item.label,item.backend_value||item.value,item.provider_value||item.value];
+  }));
+  if(!dd.dataset) dd.dataset={};
+  if(dd.dataset.reasoningOptionsKey===renderKey) return;
+  dd.dataset.reasoningOptionsKey=renderKey;
+  if(typeof dd.replaceChildren==='function'&&typeof dd.appendChild==='function'){
+    dd.replaceChildren();
+    rendered.forEach(function(item){
+      const opt=document.createElement('div');
+      opt.className='reasoning-option';
+      opt.dataset.effort=item.value;
+      opt.dataset.backendValue=item.backend_value||item.value;
+      opt.dataset.providerValue=item.provider_value||item.backend_value||item.value;
+      opt.textContent=item.label;
+      dd.appendChild(opt);
+    });
+    return;
+  }
+  // Keep pre-rendered dropdowns usable for older cached pages while newer
+  // pages use the backend-owned dynamic option list above.
+  const visibleValues=new Set(rendered.map(function(item){return item.value;}));
+  Array.from(dd.querySelectorAll?dd.querySelectorAll('.reasoning-option'):[]).forEach(function(opt){
+    opt.style.display=visibleValues.has(opt.dataset.effort)?'':'none';
   });
 }
 
@@ -5042,6 +6569,13 @@ function _applyReasoningChip(eff){
   if(meta&&typeof meta.supports_thinking_toggle==='boolean'){
     _currentReasoningToggleSupported=meta.supports_thinking_toggle;
   }
+  if(meta&&Array.isArray(meta.options)){
+    _currentReasoningOptions=meta.options;
+  }
+  const currentSupported=(typeof _currentReasoningEffortsSupported==='undefined')
+    ?null:_currentReasoningEffortsSupported;
+  window.__HERMES_REASONING_SUPPORTED_EFFORTS__=Array.isArray(currentSupported)
+    ?currentSupported.slice():[];
   const wrap=$('composerReasoningWrap');
   const label=$('composerReasoningLabel');
   const chip=$('composerReasoningChip');
@@ -5067,7 +6601,11 @@ function _applyReasoningChip(eff){
   }
   wrap.style.display='';
   if(mobileAction) mobileAction.style.display='';
-  if(typeof _applyReasoningOptions==='function') _applyReasoningOptions(supportedEfforts);
+  if(typeof _applyReasoningOptions==='function'){
+    const options=(typeof _currentReasoningOptions==='undefined')
+      ?null:_currentReasoningOptions;
+    _applyReasoningOptions(supportedEfforts,options);
+  }
   const text=_formatReasoningEffortLabel(effort);
   label.textContent=text;
   if(mobileLabel) mobileLabel.textContent=text;
@@ -5121,6 +6659,7 @@ function refreshProfileTransitionReasoningChip(model, provider){
   _currentReasoningEffort=null;
   _currentReasoningEffortsSupported=null;
   _currentReasoningToggleSupported=undefined;
+  _currentReasoningOptions=null;
   _lastReasoningFetchKey=null;
   ++_reasoningFetchSeq;
   _applyReasoningChip('', {supported_efforts:[], supports_thinking_toggle:false});
@@ -5175,6 +6714,7 @@ function toggleReasoningDropdown(){
   if(typeof closeProfileDropdown==='function') closeProfileDropdown();
   if(typeof closeWsDropdown==='function') closeWsDropdown();
   closeModelDropdown();
+  if(typeof closeFastDropdown==='function') closeFastDropdown();
   if(typeof closeToolsetsDropdown==='function') closeToolsetsDropdown();
   _highlightReasoningOption(_currentReasoningEffort);
   dd.classList.add('open');
@@ -5192,6 +6732,7 @@ function _positionReasoningDropdown(){
   if(!dd||!chip||!footer) return;
   const panel=$('composerMobileConfigPanel');
   const anchor=(panel&&panel.classList.contains('open')&&mobileAction)?mobileAction:chip;
+  if(typeof _positionGlobalOverlayFromAnchor==='function'&&_positionGlobalOverlayFromAnchor(dd,anchor,4))return;
   const chipRect=anchor.getBoundingClientRect();
   const footerRect=footer.getBoundingClientRect();
   let left=chipRect.left-footerRect.left;
@@ -5217,7 +6758,7 @@ document.addEventListener('click',function(e){
   ) closeReasoningDropdown();
   if(e.target.closest('.reasoning-option')){
     const opt=e.target.closest('.reasoning-option');
-    const effort=opt&&opt.dataset.effort;
+    const effort=opt&&(opt.dataset.backendValue||opt.dataset.effort);
     // NOTE: effort may be the empty string for the "Default" option (clears
     // the override). Check option presence, not truthiness — `if(effort)` would
     // silently ignore the Default click and leave the toggle one-way off-only.
@@ -5230,10 +6771,202 @@ document.addEventListener('click',function(e){
           // — display 'Default' rather than an empty toast.
           const display=(st&&st.reasoning_effort)||effort||'Default';
           _applyReasoningChip((st&&st.reasoning_effort)||effort, st||{});
-          showToast('🧠 Reasoning effort set to '+display);
+          const selected=(st&&st.reasoning_effort)||effort;
+          const diagnosticLabel=st&&st.diagnostics&&st.diagnostics.ui_label;
+          showToast('🧠 Reasoning effort set to '+(diagnosticLabel||display||_formatReasoningEffortLabel(selected)));
         })
         .catch(function(){showToast('🧠 Failed to set effort');});
       closeReasoningDropdown();
+    }
+  }
+});
+
+// ── Fast mode chip ───────────────────────────────────────────────────────────
+let _currentFastMode=null;
+let _currentFastSupported=null;
+let _currentFastUnsupportedReason='';
+let _lastFastFetchKey=null;
+let _fastFetchSeq=0;
+
+function _normalizeFastMode(mode){
+  const value=String(mode||'').trim().toLowerCase();
+  if(value==='fast'||value==='on'||value==='priority') return 'fast';
+  return 'normal';
+}
+
+function _formatFastLabel(mode){
+  return _normalizeFastMode(mode)==='fast'?'Fast':'Normal';
+}
+
+function _fastModeContext(){
+  const sel=$('modelSelect');
+  const model=(S&&S.session&&S.session.model)||(sel&&sel.value)||'';
+  let provider=(S&&S.session&&S.session.model_provider)||'';
+  if(!provider&&sel&&model&&typeof _modelStateForSelect==='function'){
+    provider=_modelStateForSelect(sel, model).model_provider||'';
+  }
+  const ctx={};
+  if(model) ctx.model=model;
+  if(provider) ctx.provider=provider;
+  return ctx;
+}
+
+function _fastModeQuery(){
+  const params=new URLSearchParams(_fastModeContext());
+  const qs=params.toString();
+  return qs?('?'+qs):'';
+}
+
+function _applyFastOptions(supported){
+  const dd=$('composerFastDropdown');
+  if(!dd) return;
+  dd.querySelectorAll('.fast-option').forEach(function(opt){
+    const mode=opt.dataset.fastMode;
+    const disabled=mode==='fast'&&!supported;
+    opt.classList.toggle('disabled',disabled);
+    opt.setAttribute('aria-disabled',disabled?'true':'false');
+  });
+}
+
+function _applyFastChip(mode){
+  const meta=arguments[1]||null;
+  const normalized=_normalizeFastMode(mode);
+  _currentFastMode=normalized;
+  if(meta&&typeof meta.supports_fast_mode==='boolean') _currentFastSupported=meta.supports_fast_mode;
+  if(meta&&typeof meta.unsupported_reason==='string'){
+    _currentFastUnsupportedReason=meta.unsupported_reason;
+  }
+  const wrap=$('composerFastWrap');
+  const label=$('composerFastLabel');
+  const chip=$('composerFastChip');
+  const mobileLabel=$('composerMobileFastLabel');
+  const mobileAction=$('composerMobileFastAction');
+  if(!wrap||!label) return;
+  const supported=_currentFastSupported!==false;
+  wrap.style.display='';
+  if(mobileAction) mobileAction.style.display='';
+  _applyFastOptions(supported);
+  const text=supported?_formatFastLabel(normalized):'Fast unavailable';
+  label.textContent=text;
+  if(mobileLabel) mobileLabel.textContent=text;
+  if(chip){
+    chip.classList.toggle('inactive',normalized!=='fast');
+    chip.classList.toggle('disabled',!supported);
+    chip.setAttribute('aria-disabled',supported?'false':'true');
+    chip.title=supported
+      ?'Fast mode: '+text
+      :(_currentFastUnsupportedReason||'Fast Mode is not supported by this provider');
+  }
+  if(mobileAction){
+    mobileAction.classList.toggle('inactive',normalized!=='fast');
+    mobileAction.classList.toggle('disabled',!supported);
+    mobileAction.setAttribute('aria-disabled',supported?'false':'true');
+  }
+  _highlightFastOption(normalized);
+}
+
+function fetchFastChip(){
+  const key=_fastModeQuery();
+  const seq=++_fastFetchSeq;
+  _lastFastFetchKey=key;
+  api('/api/fast'+key).then(function(st){
+    if(seq!==_fastFetchSeq) return;
+    _applyFastChip((st&&st.fast_mode)||'normal', st||{});
+  }).catch(function(){
+    if(seq!==_fastFetchSeq) return;
+    _lastFastFetchKey=null;
+    _applyFastChip('normal',{supports_fast_mode:false});
+  });
+}
+
+function syncFastChip(){
+  const key=_fastModeQuery();
+  if(_lastFastFetchKey===key){
+    if(_currentFastMode!==null) _applyFastChip(_currentFastMode);
+    return;
+  }
+  fetchFastChip();
+}
+
+function _highlightFastOption(mode){
+  const dd=$('composerFastDropdown');
+  if(!dd) return;
+  const normalized=_normalizeFastMode(mode);
+  dd.querySelectorAll('.fast-option').forEach(function(opt){
+    opt.classList.toggle('selected',opt.dataset.fastMode===normalized);
+  });
+}
+
+function toggleFastDropdown(){
+  const dd=$('composerFastDropdown');
+  const chip=$('composerFastChip');
+  if(!dd||!chip) return;
+  if(_currentFastSupported===false){
+    showToast('⚡ '+(_currentFastUnsupportedReason||'Fast Mode is not supported by this provider'));
+    closeFastDropdown();
+    return;
+  }
+  const open=dd.classList.contains('open');
+  if(open){closeFastDropdown();return;}
+  if(typeof closeProfileDropdown==='function') closeProfileDropdown();
+  if(typeof closeWsDropdown==='function') closeWsDropdown();
+  closeModelDropdown();
+  if(typeof closeReasoningDropdown==='function') closeReasoningDropdown();
+  if(typeof closeFastDropdown==='function') closeFastDropdown();
+  if(typeof closeToolsetsDropdown==='function') closeToolsetsDropdown();
+  _highlightFastOption(_currentFastMode);
+  dd.classList.add('open');
+  _positionFastDropdown();
+  chip.classList.add('active');
+  const mobileAction=$('composerMobileFastAction');
+  if(mobileAction) mobileAction.classList.add('active');
+}
+
+function _positionFastDropdown(){
+  const dd=$('composerFastDropdown');
+  const chip=$('composerFastChip');
+  const mobileAction=$('composerMobileFastAction');
+  const footer=document.querySelector('.composer-footer');
+  if(!dd||!chip||!footer) return;
+  const panel=$('composerMobileConfigPanel');
+  const anchor=(panel&&panel.classList.contains('open')&&mobileAction)?mobileAction:chip;
+  if(typeof _positionGlobalOverlayFromAnchor==='function'&&_positionGlobalOverlayFromAnchor(dd,anchor,4))return;
+  const chipRect=anchor.getBoundingClientRect();
+  const footerRect=footer.getBoundingClientRect();
+  let left=chipRect.left-footerRect.left;
+  const maxLeft=Math.max(0,footer.clientWidth-dd.offsetWidth);
+  left=Math.max(0,Math.min(left,maxLeft));
+  dd.style.left=`${left}px`;
+}
+
+function closeFastDropdown(){
+  const dd=$('composerFastDropdown');
+  const chip=$('composerFastChip');
+  const mobileAction=$('composerMobileFastAction');
+  if(dd) dd.classList.remove('open');
+  if(chip) chip.classList.remove('active');
+  if(mobileAction) mobileAction.classList.remove('active');
+}
+
+document.addEventListener('click',function(e){
+  if(
+    !e.target.closest('#composerFastChip') &&
+    !e.target.closest('#composerMobileFastAction') &&
+    !e.target.closest('#composerFastDropdown')
+  ) closeFastDropdown();
+  if(e.target.closest('.fast-option')){
+    const opt=e.target.closest('.fast-option');
+    if(opt.classList.contains('disabled')) return;
+    const mode=opt&&opt.dataset.fastMode;
+    if(mode){
+      const payload=Object.assign({mode:mode},_fastModeContext());
+      api('/api/fast',{method:'POST',body:JSON.stringify(payload)})
+        .then(function(st){
+          _applyFastChip((st&&st.fast_mode)||mode, st||{});
+          showToast('⚡ Fast mode: '+_formatFastLabel((st&&st.fast_mode)||mode));
+        })
+        .catch(function(e){showToast('⚡ Failed to set fast mode: '+(e&&e.message?e.message:'unavailable'));});
+      closeFastDropdown();
     }
   }
 });
@@ -5430,6 +7163,7 @@ function _positionToolsetsDropdown() {
   // 1100px container threshold while dropdown was open), don't try to anchor
   // to a zero-rect element — close the dropdown instead. (#1431)
   if (chip.offsetParent === null) { closeToolsetsDropdown(); return; }
+  if (typeof _positionGlobalOverlayFromAnchor === 'function' && _positionGlobalOverlayFromAnchor(dd, chip, 4)) return;
   const chipRect = chip.getBoundingClientRect();
   const footerRect = footer.getBoundingClientRect();
   let left = chipRect.left - footerRect.left;
@@ -6475,6 +8209,7 @@ function _syncMobileCtxDisplay(state){
   const usageLine=$('composerMobileContextUsage');
   const tokensLine=$('composerMobileContextTokens');
   const thresholdLine=$('composerMobileContextThreshold');
+  const compressionLine=$('composerMobileContextCompressions');
   const costLine=$('composerMobileContextCost');
   const compressBtn=$('composerMobileCtxCompressBtn');
   if(!state||!state.visible){
@@ -6527,6 +8262,15 @@ function _syncMobileCtxDisplay(state){
       thresholdLine.textContent='';
     }
   }
+  if(compressionLine){
+    if(state.compressionText){
+      compressionLine.style.display='';
+      compressionLine.textContent=state.compressionText;
+    }else{
+      compressionLine.style.display='none';
+      compressionLine.textContent='';
+    }
+  }
   if(costLine){
     if(state.costText){
       costLine.style.display='';
@@ -6563,6 +8307,15 @@ function _mergeUsageForCtxIndicator(latest, fallback){
   if(!Object.hasOwn(latestObj,'post_compression_context_tokens_estimate')&&fallbackObj.post_compression_context_tokens_estimate!=null){
     merged.post_compression_context_tokens_estimate=fallbackObj.post_compression_context_tokens_estimate;
   }
+  const latestCompressionCount=latestObj.compression_count!=null?latestObj.compression_count:latestObj.compressions;
+  const fallbackCompressionCount=fallbackObj.compression_count!=null?fallbackObj.compression_count:fallbackObj.compressions;
+  if(latestCompressionCount!=null||fallbackCompressionCount!=null){
+    merged.compression_count=Math.max(
+      0,
+      Math.floor(Number(latestCompressionCount)||0),
+      Math.floor(Number(fallbackCompressionCount)||0),
+    );
+  }
   return merged;
 }
 
@@ -6590,12 +8343,26 @@ function _syncCtxIndicator(usage){
   const totalTok=(usage.input_tokens||0)+(usage.output_tokens||0);
   const cacheReadTok=usage.cache_read_tokens||0;
   const cacheWriteTok=usage.cache_write_tokens||0;
+  const storedCompressionCount=(typeof S!=='undefined'&&S.session)?Number(S.session.compression_count)||0:0;
+  const rawCompressionCount=usage.compression_count!=null
+    ? usage.compression_count
+    : (usage.compressions!=null?usage.compressions:storedCompressionCount);
+  // A metering snapshot from before compaction may still carry an explicit 0.
+  // Never let that stale value hide the newer session-level monotonic count.
+  const compressionCount=Math.max(
+    0,
+    storedCompressionCount,
+    Math.floor(Number(rawCompressionCount)||0),
+  );
+  if(typeof S!=='undefined'&&S.session&&compressionCount>storedCompressionCount){
+    S.session.compression_count=compressionCount;
+  }
   // Default context window to 128K when not provided by backend
   const DEFAULT_CTX=128*1024;
   const ctxWindow=usage.context_length||DEFAULT_CTX;
   const cost=usage.estimated_cost;
   // Show indicator whenever we have any usage data (tokens or cost)
-  if(!promptTok&&!totalTok&&!cost&&!cacheReadTok&&!cacheWriteTok){
+  if(!promptTok&&!totalTok&&!cost&&!cacheReadTok&&!cacheWriteTok&&!compressionCount){
     if(wrap) wrap.style.display='none';
     _syncMobileCtxDisplay({visible:false});
     return;
@@ -6616,6 +8383,8 @@ function _syncCtxIndicator(usage){
   const usageLine=$('ctxTooltipUsage');
   const tokensLine=$('ctxTooltipTokens');
   const thresholdLine=$('ctxTooltipThreshold');
+  const compressionBadge=$('ctxCompressionCount');
+  const compressionLine=$('ctxTooltipCompressions');
   const costLine=$('ctxTooltipCost');
   if(ring){
     const circumference=61.261056745;
@@ -6626,6 +8395,17 @@ function _syncCtxIndicator(usage){
   const hasExplicitCtx=!!usage.context_length;
   el.classList.toggle('ctx-mid',pct>50&&pct<=75);
   el.classList.toggle('ctx-high',pct>75);
+  el.classList.toggle('ctx-compression-warn',compressionCount>=5&&compressionCount<10);
+  el.classList.toggle('ctx-compression-bad',compressionCount>=10);
+  const compressionText=compressionCount?`Compressions: ${compressionCount}`:'';
+  if(compressionBadge){
+    compressionBadge.style.display=compressionCount?'':'none';
+    compressionBadge.textContent=compressionCount?`🗜️ ${compressionCount}`:'';
+  }
+  if(compressionLine){
+    compressionLine.style.display=compressionCount?'':'none';
+    compressionLine.textContent=compressionText;
+  }
   // ── Compress affordance (#524) ──
   // Show a hint in the tooltip when context usage is high so users
   // discover /compress without having to know the slash command.
@@ -6639,6 +8419,7 @@ function _syncCtxIndicator(usage){
   const contextLabel=hasPostCompressionEstimate?'Estimated next model context':'Context window';
   let label=hasPromptTok?`${contextLabel} ${pct}% used`:`${_fmtTokens(totalTok)} tokens used`;
   if(!hasExplicitCtx&&hasPromptTok) label+=' (est. 128K)';
+  if(compressionCount) label+=` \u00b7 🗜️ ${compressionCount}`;
   if(cost) label+=` \u00b7 $${cost<0.01?cost.toFixed(4):cost.toFixed(2)}`;
   if(cacheText) label+=` \u00b7 ${cacheText}`;
   el.setAttribute('aria-label',label);
@@ -6682,6 +8463,7 @@ function _syncCtxIndicator(usage){
     usageText,
     tokensText,
     thresholdText,
+    compressionText,
     costText,
     compressText
   });
@@ -7731,7 +9513,7 @@ function lockComposerForClarify(placeholderText){
   // card is active (and survives page refresh / syncs across clients).
   const sid = S && S.session && S.session.session_id;
   if (sid && typeof _saveComposerDraftNow === 'function') {
-    _saveComposerDraftNow(sid, input.value || '', S.pendingFiles ? [...S.pendingFiles] : []);
+    _saveComposerDraftNow(sid, input.value || '', S.pendingFiles ? [...S.pendingFiles] : [], S.pendingContextItems ? [...S.pendingContextItems] : []);
   }
   if(!_composerLockState){
     _composerLockState={
@@ -7761,7 +9543,7 @@ function unlockComposerForClarify(){
 
 function _composerHasContent(){
   const msg=$('msg');
-  return !!((msg&&msg.value.trim().length>0)||S.pendingFiles.length>0||(typeof window._hasPendingSelections==='function'&&window._hasPendingSelections()));
+  return !!((msg&&msg.value.trim().length>0)||S.pendingFiles.length>0||(S.pendingContextItems&&S.pendingContextItems.length>0)||(typeof window._hasPendingSelections==='function'&&window._hasPendingSelections()));
 }
 
 function _getExplicitBusyCommandAction(text){
@@ -7910,17 +9692,22 @@ async function handleComposerPrimaryAction(){
 function setBusy(v){
   S.busy=v;
   updateSendBtn();
+  if(typeof renderChangedThisTurn==='function') renderChangedThisTurn();
   if(!v){
     if(typeof _clearActivityElapsedTimer==='function') _clearActivityElapsedTimer();
     setStatus('');
     setComposerStatus('');
     const sid=_queueDrainSid||(S.session&&S.session.session_id);
+    if(typeof hideThreadElapsedTimer==='function') hideThreadElapsedTimer(sid);
     _queueDrainSid=null;
     updateQueueBadge(sid);
     // Drain one queued message for the finished session after UI settles
     const _isViewedSid=!S.session||sid===S.session.session_id;
-    const next=sid&&_isViewedSid?shiftQueuedSessionMessage(sid):null;
+    const promotionSet=window._queueDrainPromotionPending||(window._queueDrainPromotionPending=new Set());
+    const promotionAlreadyPending=!!(sid&&promotionSet.has(sid));
+    const next=sid&&_isViewedSid&&!promotionAlreadyPending?shiftQueuedSessionMessage(sid):null;
     if(next){
+      promotionSet.add(sid);
       updateQueueBadge(sid);
       setTimeout(()=>{
         // Guard: if the user switched away from the drain session during
@@ -7929,12 +9716,12 @@ function setBusy(v){
         // skip sending — it will drain when the user returns to that session
         // or when its next stream completes while it is the active view.
         if(S.session&&S.session.session_id!==sid){
-          queueSessionMessage(sid,next);
+          promotionSet.delete(sid);
+          if(typeof restoreShiftedQueuedSessionMessage==='function') restoreShiftedQueuedSessionMessage(sid,next);
+          else queueSessionMessage(sid,next);
           updateQueueBadge(sid);
           return;
         }
-        $('msg').value=next.text||'';
-        S.pendingFiles=Array.isArray(next.files)?[...next.files]:[];
         // Restore model from queued item (sent in /api/chat/start payload)
         // Note: profile is NOT restored — full profile switch requires server interaction
         if(next.model&&S.session&&next.model!==S.session.model){
@@ -7945,9 +9732,12 @@ function setBusy(v){
           if(typeof _applyModelToDropdown==='function'&&$('modelSelect')) _applyModelToDropdown(next.model,$('modelSelect'),S.session.model_provider||null);
           if(typeof syncModelChip==='function') syncModelChip();
         }
-        autoResize();
-        renderTray();
-        send();
+        // Queue entries include user-queued prompts, goal continuations, and
+        // leftover steer messages. Feed them directly to send(): #msg and the
+        // pending attachment/context state belong to the draft the user may be
+        // typing while the agent continues automatically.
+        promotionSet.delete(sid);
+        send({queueDrain:true,queueSessionId:sid,queuedMessage:next});
       },120);
     }
   }
@@ -7971,6 +9761,12 @@ function _clearQueueCardDisplay(sid){
     const _sid=String(sid||'');
     const _epoch=_chips.getAttribute('data-queue-render-epoch')||'';
     setTimeout(()=>{
+      // A navigation can return to the same still-running thread before this
+      // exit animation settles. Its queue remains authoritative; an old clear
+      // callback must not erase the newly-current list just because the shared
+      // card is temporarily hidden or explicitly collapsed.
+      const _activeSid=String((S.session&&S.session.session_id)||'');
+      if(_sid&&_activeSid===_sid&&getQueuedSessionCount(_sid)>0) return;
       if((_card&&!_card.classList.contains('visible'))||!_card){
         if((_chips.getAttribute('data-queue-render-sid')||'')===_sid&&(_chips.getAttribute('data-queue-render-epoch')||'')===_epoch){
           _chips.innerHTML='';
@@ -7988,10 +9784,31 @@ function _renderQueueChips(sid){
   const inner=document.getElementById('queueChips');
   if(!card||!inner) return;
   const q=_getSessionQueue(sid,false);
-  const key=q.map(e=>{const t=e&&(e.text||e.message||e.content||'');return(e&&e._queued_at||0)+':'+t.length+':'+t.slice(0,20);}).join('|');
-  if(key===(_queueRenderKeys[sid]||'')&&key!='') return;
-  // Skip re-render if user is actively editing inside the queue panel
-  if(inner.contains(document.activeElement)&&document.activeElement!==inner) return;
+  const key=q.map(e=>{
+    const text=e&&(e.text||e.message||e.content||'');
+    const contexts=e&&Array.isArray(e.context_items)?e.context_items:[];
+    const parts=e&&Array.isArray(e.parts)?e.parts:(e&&Array.isArray(e.browser_context_parts)?e.browser_context_parts:[]);
+    return `${e&&e._queued_at||0}:${text.length}:${text.slice(0,20)}:${contexts.length}:${parts.length}`;
+  }).join('|');
+  const cachedDomMatches=(inner.getAttribute('data-queue-render-sid')||'')===String(sid)
+    && inner.childElementCount>0;
+  if(key===(_queueRenderKeys[sid]||'')&&key!=''&&cachedDomMatches){
+    // The fingerprint only proves the rows are current; it does not prove the
+    // shared card is still visible after a panel/thread DOM transition.
+    if(!_queueCollapsed[sid]&&!card.classList.contains('visible')){
+      card.classList.add('visible');
+      const _msgs=document.getElementById('messages');
+      if(_msgs) _msgs.classList.add('queue-open');
+    }
+    return;
+  }
+  // Preserve an in-progress inline text edit, but never let focused action
+  // buttons (Combine/Delete/Hide) suppress their own UI update. The old broad
+  // `inner.contains(activeElement)` guard meant Combine persisted correctly yet
+  // left the pre-combine rows visible until another queued message arrived.
+  const activeQueueEditor=document.activeElement&&inner.contains(document.activeElement)
+    &&document.activeElement.matches&&document.activeElement.matches('.queue-card-text[contenteditable="true"]');
+  if(activeQueueEditor) return;
   _queueRenderKeys[sid]=key;
   inner.setAttribute('data-queue-render-sid',sid);
   inner.setAttribute('data-queue-render-epoch',String(++_queueRenderEpoch));
@@ -8031,6 +9848,27 @@ function _renderQueueChips(sid){
     updateQueueBadge(sid);
   }
 
+  function _entryBrowserContextParts(entry){
+    const entryText=String(entry&&(entry.text||entry.message||entry.content||'')||'');
+    const candidates=[entry&&entry.parts,entry&&entry.browser_context_parts];
+    for(const candidate of candidates){
+      if(!Array.isArray(candidate))continue;
+      let normalized=_trimBrowserContextTextPartEdges(candidate);
+      if(!_browserWorkbenchContextPartsHaveElement(normalized))continue;
+      const hasText=normalized.some(part=>part&&part.type==='text'&&String(part.content??part.text??'').trim());
+      if(entryText&&!hasText)normalized=[{type:'text',content:entryText+' '},...normalized];
+      return normalized;
+    }
+    const contextItems=entry&&Array.isArray(entry.context_items)?entry.context_items.filter(Boolean):[];
+    if(!contextItems.length)return[];
+    const parts=entryText?[{type:'text',content:entryText+' '}]:[];
+    contextItems.forEach(item=>{
+      const part=_browserWorkbenchContextPartFromItem(item,'');
+      if(part)parts.push(part);
+    });
+    return _trimBrowserContextTextPartEdges(parts);
+  }
+
   // Header (2+ items)
   if(q.length>1){
     const header=document.createElement('div');
@@ -8051,7 +9889,10 @@ function _renderQueueChips(sid){
         const liveQ=_getSessionQueue(sid,false);
         const first=snapshot.find(e=>e)||{};
         const firstFiles=(snapshot.find(e=>e&&Array.isArray(e.files)&&e.files.length)||{files:[]}).files;
-        liveQ.length=0;liveQ.push({text:combined,files:firstFiles,model:first.model||'',model_provider:first.model_provider||null,_queued_at:Date.now()});
+        const combinedContext=snapshot.flatMap(e=>e&&Array.isArray(e.context_items)?e.context_items:[]);
+        const combinedBrowserContextParts=snapshot.flatMap(e=>_entryBrowserContextParts(e));
+        const combinedMessageIds=snapshot.map(e=>String(e&&e.client_message_id||'').trim()).filter(Boolean);
+        liveQ.length=0;liveQ.push({text:combined,files:firstFiles,context_items:combinedContext,browser_context_parts:combinedBrowserContextParts,parts:combinedBrowserContextParts,client_message_id:_newClientMessageId(sid,'queue-combined'),combined_queue_message_ids:combinedMessageIds,model:first.model||'',model_provider:first.model_provider||null,_queued_at:Date.now()});
         SESSION_QUEUES[sid]=liveQ;
         _persistSessionQueueStorage(sid,liveQ);
         delete _queueRenderKeys[sid];
@@ -8094,6 +9935,8 @@ function _renderQueueChips(sid){
     const _entryTs=entry&&entry._queued_at;
     const entryText=entry&&(entry.text||entry.message||entry.content||'');
     const _files=entry&&Array.isArray(entry.files)?entry.files.filter(Boolean):[];
+    const _contextItems=entry&&Array.isArray(entry.context_items)?entry.context_items.filter(Boolean):[];
+    const _browserContextParts=_entryBrowserContextParts(entry);
     const row=document.createElement('div');
     row.className='queue-card-row';
     row.setAttribute('role','listitem');
@@ -8117,29 +9960,43 @@ function _renderQueueChips(sid){
     drag.innerHTML=typeof li==='function'?li('list-todo',13):'≡';
     // Inline-editable text
     const msgSpan=document.createElement('span');
-    msgSpan.className='queue-card-text';
+    msgSpan.className='queue-card-text composer-editor queue-message-editor';
     msgSpan.setAttribute('contenteditable','true');
     msgSpan.setAttribute('role','textbox');
     msgSpan.setAttribute('aria-label','Queued message — edit in place');
-    msgSpan.textContent=entryText||(_files.length?'':'—');
+    const _renderOriginalQueueMessage=()=>{
+      if(!_browserContextParts.length||!_composerSetBrowserContextParts(msgSpan,_browserContextParts)){
+        msgSpan.textContent=entryText||((_files.length||_contextItems.length)?'':'—');
+      }
+    };
+    _renderOriginalQueueMessage();
+    _installRichMessagePartsClipboard(msgSpan);
     msgSpan.setAttribute('draggable','false');
+    let _cancelQueueEdit=false;
     msgSpan.onfocus=()=>{msgSpan.style.overflow='auto';msgSpan.style.whiteSpace='pre-wrap';msgSpan.style.textOverflow='clip';};
     msgSpan.onblur=()=>{
       msgSpan.style.overflow='';msgSpan.style.whiteSpace='';msgSpan.style.textOverflow='';
-      const newText=msgSpan.textContent.trim();
-      if(newText===''&&!_files.length){ msgSpan.textContent=entryText||'—'; return; }
-      if(newText!==entryText){
-        const liveQ=_getSessionQueue(sid,false);
-        const idx=_entryTs!=null?liveQ.findIndex(e=>e&&e._queued_at===_entryTs):i;
-        if(idx!==-1){
-          liveQ[idx]={...liveQ[idx],text:newText};
-          _persistSessionQueueStorage(sid,liveQ);
-          delete _queueRenderKeys[sid];
-          updateQueueBadge(sid);
-        }
+      if(_cancelQueueEdit){_cancelQueueEdit=false;_renderOriginalQueueMessage();return;}
+      const newText=_composerEditorPlainText(msgSpan).trim();
+      const newParts=_messagePartsFromEditor(msgSpan);
+      const newContextItems=Array.from(msgSpan.querySelectorAll('.composer-browser-context-pill')).map(_composerContextFromPill).filter(Boolean).slice(0,8);
+      if(newText===''&&!_files.length&&!newContextItems.length){_renderOriginalQueueMessage();return;}
+      const liveQ=_getSessionQueue(sid,false);
+      const idx=_entryTs!=null?liveQ.findIndex(e=>e&&e._queued_at===_entryTs):i;
+      if(idx!==-1){
+        liveQ[idx]={
+          ...liveQ[idx],
+          text:newText,
+          context_items:newContextItems,
+          browser_context_parts:newParts,
+          parts:newParts,
+        };
+        _persistSessionQueueStorage(sid,liveQ);
+        delete _queueRenderKeys[sid];
+        updateQueueBadge(sid);
       }
     };
-    msgSpan.onkeydown=(e)=>{if(e.key==='Enter'){e.preventDefault();msgSpan.blur();}if(e.key==='Escape'){msgSpan.textContent=entryText||'—';msgSpan.blur();}};
+    msgSpan.onkeydown=(e)=>{if(e.key==='Enter'){e.preventDefault();msgSpan.blur();}if(e.key==='Escape'){e.preventDefault();_cancelQueueEdit=true;_renderOriginalQueueMessage();msgSpan.blur();}};
     // Compact badges (files, model, profile)
     const badges=document.createElement('span');
     badges.className='queue-card-badges';
@@ -8235,6 +10092,38 @@ function updateQueueBadge(sessionId){
     }
   }
 }
+function _reconcileActiveSessionQueueUi(reason){
+  const sid=String((S.session&&S.session.session_id)||'');
+  if(!sid) return 0;
+  if(typeof _hydrateSessionQueueFromStorage==='function'){
+    try{_hydrateSessionQueueFromStorage(sid);}catch(_){}
+  }
+  const count=getQueuedSessionCount(sid);
+  updateQueueBadge(sid);
+  if(typeof _reconcileGlobalOverlays==='function') _reconcileGlobalOverlays();
+  if(typeof _streamUiDiagnostic==='function') _streamUiDiagnostic('queue-ui','active-session-reconciled',{
+    reason:String(reason||'unknown'),
+    session_id:sid,
+    queue_count:count,
+    rendered_rows:document.querySelectorAll('#queueChips .queue-card-row').length,
+    card_visible:!!(document.getElementById('queueCard')&&document.getElementById('queueCard').classList.contains('visible')),
+  });
+  return count;
+}
+function _bindActiveSessionQueueUiReconciliation(){
+  if(typeof window==='undefined'||window.__HERMES_QUEUE_UI_RECONCILE_BOUND__) return;
+  window.__HERMES_QUEUE_UI_RECONCILE_BOUND__=true;
+  const reconcile=reason=>{
+    if(typeof queueMicrotask==='function') queueMicrotask(()=>_reconcileActiveSessionQueueUi(reason));
+    else setTimeout(()=>_reconcileActiveSessionQueueUi(reason),0);
+  };
+  window.addEventListener('focus',()=>reconcile('window-focus'));
+  window.addEventListener('pageshow',()=>reconcile('page-show'));
+  document.addEventListener('visibilitychange',()=>{
+    if(document.visibilityState==='visible') reconcile('visibility-visible');
+  });
+}
+_bindActiveSessionQueueUiReconciliation();
 const TOAST_DEFAULT_MS=2800;
 const TOAST_ERROR_DEFAULT_MS=20000;
 function clearToastDismissTimer(el){if(!el)return;clearTimeout(el._t);el._t=null;}
@@ -8297,6 +10186,7 @@ function _finishAppDialog(result, restoreFocus=true){
   APP_DIALOG.kind=null;
   APP_DIALOG.lastFocus=null;
   if(overlay){overlay.style.display='none';overlay.setAttribute('aria-hidden','true');}
+  _reconcileGlobalOverlays();
   if(dialog) dialog.setAttribute('role','dialog');
   if(input){input.value='';input.style.display='none';input.placeholder='';}
   if(confirmBtn){confirmBtn.classList.remove('danger');confirmBtn.textContent=t('dialog_confirm_btn');}
@@ -8384,6 +10274,7 @@ function showConfirmDialog(opts={}){
   }
   if(dialog) dialog.setAttribute('role',opts.danger?'alertdialog':'dialog');
   if(overlay){overlay.style.display='flex';overlay.setAttribute('aria-hidden','false');}
+  _reconcileGlobalOverlays();
   return new Promise(resolve=>{
     APP_DIALOG.resolve=resolve;
     setTimeout(()=>((opts.focusCancel?cancelBtn:confirmBtn)||confirmBtn||cancelBtn).focus(),0);
@@ -8420,6 +10311,7 @@ function showPromptDialog(opts={}){
   }
   if(dialog) dialog.setAttribute('role',opts.danger?'alertdialog':'dialog');
   if(overlay){overlay.style.display='flex';overlay.setAttribute('aria-hidden','false');}
+  _reconcileGlobalOverlays();
   return new Promise(resolve=>{
     APP_DIALOG.resolve=resolve;
     setTimeout(()=>{
@@ -8480,8 +10372,12 @@ function copyStatusSessionId(btn){
 function copyMsg(btn){
   const row=btn.closest('[data-raw-text]');
   const text=row?row.dataset.rawText:'';
-  if(!text)return;
-  _copyText(text).then(()=>{
+  if(!row||!text)return;
+  const idx=parseInt(row.dataset.msgIdx||'',10);
+  const m=Number.isFinite(idx)&&Array.isArray(S.messages)?S.messages[idx]:null;
+  const parts=m&&m.role==='user'?_messagePartsForUserMessage(m,text):[];
+  const copyPromise=_browserWorkbenchContextPartsHaveElement(parts)?_copyMessagePartsRich(parts):_copyText(text);
+  copyPromise.then(()=>{
     const orig=btn.innerHTML;btn.innerHTML=li('check',13);btn.style.color='var(--blue)';
     setTimeout(()=>{btn.innerHTML=orig;btn.style.color='';},1500);
   }).catch(()=>showToast(t('copy_failed')));
@@ -10345,6 +12241,9 @@ function getPendingSessionMessage(session, messagesOverride=null){
   const text=String(session?.pending_user_message||'').trim();
   if(!text) return null;
   const attachments=Array.isArray(session?.pending_attachments)?session.pending_attachments.filter(Boolean):[];
+  const contextItems=Array.isArray(session?.pending_context_items)?session.pending_context_items.filter(Boolean):[];
+  const browserContextParts=Array.isArray(session?.pending_browser_context_parts)?session.pending_browser_context_parts.filter(Boolean):[];
+  const clientMessageId=String(session?.pending_client_message_id||'').trim();
   const sourceMessages=Array.isArray(messagesOverride)?messagesOverride:session?.messages;
   const messages=Array.isArray(sourceMessages)?sourceMessages:[];
   const currentTailUser=_pendingCurrentTailUserMessage(messages);
@@ -10355,6 +12254,10 @@ function getPendingSessionMessage(session, messagesOverride=null){
       : String(msgContent(currentTailUser)||'').trim()===text;
     if(sameCurrentTurn){
       if(attachments.length&&!currentTailUser.attachments?.length) currentTailUser.attachments=attachments;
+      if(contextItems.length&&!currentTailUser.context_items?.length) currentTailUser.context_items=contextItems;
+      if(browserContextParts.length&&!currentTailUser.browser_context_parts?.length) currentTailUser.browser_context_parts=browserContextParts;
+      if(browserContextParts.length&&!currentTailUser.parts?.length) currentTailUser.parts=browserContextParts;
+      if(clientMessageId&&!currentTailUser.client_message_id) currentTailUser.client_message_id=clientMessageId;
       return null;
     }
   }
@@ -10362,6 +12265,10 @@ function getPendingSessionMessage(session, messagesOverride=null){
     role:'user',
     content:text,
     attachments:attachments.length?attachments:undefined,
+    context_items:contextItems.length?contextItems:undefined,
+    browser_context_parts:browserContextParts.length?browserContextParts:undefined,
+    parts:browserContextParts.length?browserContextParts:undefined,
+    client_message_id:clientMessageId||undefined,
     _ts:session?.pending_started_at||Date.now()/1000,
     _pending:true,
     _source:session?.pending_user_source||undefined,
@@ -10417,6 +12324,7 @@ function syncTopbar(){
     if(typeof syncWorkspaceDisplays==='function') syncWorkspaceDisplays();
     if(typeof _syncWorkspaceHeadingState==='function') _syncWorkspaceHeadingState();
     if(typeof syncModelChip==='function') syncModelChip();
+    if(typeof syncFastChip==='function') syncFastChip();
     if(typeof syncTerminalButton==='function') syncTerminalButton();
     if(typeof _syncHermesPanelSessionActions==='function') _syncHermesPanelSessionActions();
     else {
@@ -10535,6 +12443,7 @@ function syncTopbar(){
   }
   if(typeof syncModelChip==='function') syncModelChip();
   if(typeof syncReasoningChip==='function') syncReasoningChip();
+  if(typeof syncFastChip==='function') syncFastChip();
   if(typeof syncToolsetsChip==='function') syncToolsetsChip();
   // Show Clear button only when session has messages
   const clearBtn=$('btnClearConv');
@@ -10938,6 +12847,268 @@ function _worklogDetailDisclosureKeyForElement(el, counts){
   counts[base]=idx+1;
   return `${base}#${idx}`;
 }
+function _assistantDiffScrollKeyForElement(pre, counts){
+  if(!pre||!pre.classList||!pre.classList.contains('assistant-code-diff')) return '';
+  const row=pre.closest&&pre.closest('[data-mutation-event-key],[data-anchor-row-id],[data-msg-idx]');
+  const file=pre.closest&&pre.closest('.assistant-modified-file-card');
+  const owner=row&&(
+    row.getAttribute('data-mutation-event-key')||
+    row.getAttribute('data-anchor-row-id')||
+    row.getAttribute('data-msg-idx')||''
+  );
+  const path=file&&file.getAttribute('data-modified-file-path')||'';
+  const variant=pre.classList.contains('is-full')?'full':(pre.classList.contains('is-truncated')?'truncated':'inline');
+  const base=`diff-scroll:${owner||'row'}:${path||'file'}:${variant}`;
+  const idx=counts[base]||0;
+  counts[base]=idx+1;
+  return `${base}#${idx}`;
+}
+const _toolResultScrollableSelector=[
+  '.tool-card-detail',
+  // Outer formatted/raw panes.
+  '.tool-output-formatted',
+  '.tool-output-raw',
+  // Terminal and command panes.
+  '.tool-output-terminal-output',
+  '.tool-output-test-log',
+  '.tool-output-test-failure-log',
+  '.tool-output-content-body',
+  '.tool-output-text',
+  'pre.tool-output-code',
+  'pre.tool-output-command-block',
+  // Nested structured/transcript panes. These can scroll independently of
+  // .tool-output-formatted, so preserving only the outer pane still makes the
+  // user's inspected child jump to its first line on every anchor-scene tick.
+  '.tool-output-record-payload',
+  '.tool-output-numbered-record > pre',
+  // Legacy/fallback tool result paths (Read/Run/Raw before structured
+  // classification succeeds) remain active for older agents and payloads.
+  '.tool-card-result pre',
+  '.tool-arg-val',
+  '.tool-change-summary-raw',
+  '.tool-diagnostic-section > pre',
+  '.tool-diagnostic-raw > pre',
+].join(',');
+const _toolResultDisclosureSelector='.tool-output-card details,.tool-diagnostic-card details';
+function _captureToolResultScrollPosition(el){
+  if(!el)return null;
+  const top=Math.max(0,Number(el.scrollTop)||0);
+  const left=Math.max(0,Number(el.scrollLeft)||0);
+  const maxTop=Math.max(0,(Number(el.scrollHeight)||0)-(Number(el.clientHeight)||0));
+  // A fixed 32px tail zone classifies the middle of short parent cards as
+  // "following" (for example 31px from the bottom of a 62px range). Scale the
+  // threshold down for short viewports while retaining the forgiving 32px
+  // terminal/log threshold for long output.
+  const tailThreshold=Math.min(32,Math.max(4,Math.floor(maxTop*0.1)));
+  // A viewport that does not overflow yet is implicitly pinned. Once output
+  // grows beyond it, continue following the tail until the user scrolls up.
+  return{
+    scrollTop:top,
+    scrollLeft:left,
+    followTail:maxTop<=0||maxTop-top<=tailThreshold,
+  };
+}
+function _restoreToolResultScrollPosition(el,saved){
+  if(!el||!saved)return;
+  const maxTop=Math.max(0,(Number(el.scrollHeight)||0)-(Number(el.clientHeight)||0));
+  const maxLeft=Math.max(0,(Number(el.scrollWidth)||0)-(Number(el.clientWidth)||0));
+  const top=saved.followTail?maxTop:Number(saved.scrollTop);
+  const left=Number(saved.scrollLeft);
+  if(Number.isFinite(top))el.scrollTop=Math.min(Math.max(0,top),maxTop);
+  if(Number.isFinite(left))el.scrollLeft=Math.min(Math.max(0,left),maxLeft);
+}
+function _toolResultOwnerKey(el){
+  const row=el&&el.closest&&el.closest('.tool-card-row,[data-mutation-event-key],[data-anchor-row-id],[data-msg-idx]');
+  if(!row)return'row';
+  return row.getAttribute('data-tool-disclosure-key')||
+    row.getAttribute('data-live-tid')||
+    row.getAttribute('data-tool-call-id')||
+    row.getAttribute('data-tool-id')||
+    row.getAttribute('data-mutation-event-key')||
+    row.getAttribute('data-anchor-row-id')||
+    row.getAttribute('data-msg-idx')||
+    row.dataset&&row.dataset.toolActionLabel||
+    row.dataset&&row.dataset.toolName||
+    'row';
+}
+function _toolResultElementRole(el){
+  if(!el||!el.classList)return'result';
+  if(el.classList.contains('tool-card-detail'))return'card-detail';
+  if(el.classList.contains('tool-output-raw'))return'raw';
+  if(el.classList.contains('tool-output-formatted'))return`formatted:${el.getAttribute('data-content-kind')||'output'}`;
+  if(el.classList.contains('tool-output-terminal-output')){
+    const section=el.closest&&el.closest('[data-tool-output-stream]');
+    return`terminal:${section&&section.getAttribute('data-tool-output-stream')||'output'}`;
+  }
+  if(el.classList.contains('tool-output-content-body'))return'content-body';
+  if(el.classList.contains('tool-output-command-block'))return'command';
+  if(el.classList.contains('tool-output-code'))return`code:${Array.from(el.classList).find(name=>name.startsWith('language-'))||'plain'}`;
+  if(el.classList.contains('tool-output-text'))return`text:${Array.from(el.classList).find(name=>name.startsWith('is-'))||'plain'}`;
+  if(el.classList.contains('tool-output-test-log'))return'test-log';
+  if(el.classList.contains('tool-output-test-failure-log'))return'test-failure-log';
+  if(el.classList.contains('tool-output-record-payload'))return'record-payload';
+  if(el.classList.contains('tool-arg-val'))return'argument';
+  if(el.classList.contains('tool-change-summary-raw'))return'change-summary-raw';
+  if(el.closest&&el.closest('.tool-output-numbered-record'))return'numbered-record';
+  if(el.closest&&el.closest('.tool-card-result'))return'legacy-result';
+  const diagnosticRaw=el.closest&&el.closest('.tool-diagnostic-raw');
+  if(diagnosticRaw)return'diagnostic-raw';
+  const diagnostic=el.closest&&el.closest('.tool-diagnostic-section');
+  if(diagnostic){
+    const label=diagnostic.querySelector&&diagnostic.querySelector('.tool-diagnostic-section-label');
+    return`diagnostic:${_worklogDetailTextKey(label&&label.textContent||'output',60)}`;
+  }
+  return'result';
+}
+function _toolResultScrollKeyForElement(el,counts){
+  if(!el)return'';
+  const base=`tool-result-scroll:${_toolResultOwnerKey(el)}:${_toolResultElementRole(el)}`;
+  const idx=counts[base]||0;
+  counts[base]=idx+1;
+  return`${base}#${idx}`;
+}
+function _toolResultDisclosureKeyForElement(el,counts){
+  if(!el)return'';
+  const classes=Array.from(el.classList||[]).filter(name=>name.startsWith('tool-output-')||name.startsWith('tool-diagnostic-')).sort();
+  const base=`tool-result-disclosure:${_toolResultOwnerKey(el)}:${classes.join('.')||'details'}`;
+  const idx=counts[base]||0;
+  counts[base]=idx+1;
+  return`${base}#${idx}`;
+}
+function _captureToolResultPresentationState(root){
+  const state=new Map();
+  if(!root||!root.querySelectorAll)return state;
+  const disclosureCounts=Object.create(null);
+  root.querySelectorAll(_toolResultDisclosureSelector).forEach(el=>{
+    const key=_toolResultDisclosureKeyForElement(el,disclosureCounts);
+    if(key)state.set(key,{toolResultDisclosure:true,open:!!el.open});
+  });
+  const scrollCounts=Object.create(null);
+  root.querySelectorAll(_toolResultScrollableSelector).forEach(el=>{
+    const key=_toolResultScrollKeyForElement(el,scrollCounts);
+    const scroll=_captureToolResultScrollPosition(el);
+    if(!key||!scroll)return;
+    state.set(key,{
+      toolResultScroll:true,
+      ...scroll,
+      hidden:el.classList&&el.classList.contains('tool-output-raw')?!!el.hidden:undefined,
+    });
+  });
+  return state;
+}
+let _toolResultUserScrollIntentSeq=0;
+let _toolResultUserScrollIntentBound=false;
+function _markToolResultUserScrollIntent(event){
+  const target=event&&event.target;
+  if(!target||!target.closest||!target.matches)return;
+  if(event.type==='keydown'&&!/^(?:ArrowUp|ArrowDown|PageUp|PageDown|Home|End| |Spacebar)$/.test(event.key||''))return;
+  const version=++_toolResultUserScrollIntentSeq;
+  for(let node=target;node&&node!==document;node=node.parentElement){
+    if(
+      node.matches&&node.matches(_toolResultScrollableSelector)&&
+      (
+        (Number(node.scrollHeight)||0)>(Number(node.clientHeight)||0)+1||
+        (Number(node.scrollWidth)||0)>(Number(node.clientWidth)||0)+1
+      )
+    )node._toolResultUserScrollIntentVersion=version;
+  }
+}
+function _bindToolResultUserScrollIntent(){
+  if(_toolResultUserScrollIntentBound||typeof document==='undefined'||!document.addEventListener)return;
+  _toolResultUserScrollIntentBound=true;
+  for(const type of ['wheel','touchstart','touchmove','pointerdown','keydown']){
+    document.addEventListener(type,_markToolResultUserScrollIntent,true);
+  }
+}
+function _captureToolPresentationRestoreGuard(root){
+  const guard=new WeakMap();
+  if(!root||!root.querySelectorAll)return guard;
+  _bindToolResultUserScrollIntent();
+  root.querySelectorAll(_worklogDetailDisclosureSelector).forEach(el=>{
+    guard.set(el,{kind:'worklog-disclosure',open:_worklogDetailDisclosureIsOpen(el)});
+  });
+  root.querySelectorAll(_toolResultDisclosureSelector).forEach(el=>{
+    guard.set(el,{kind:'result-disclosure',open:!!el.open});
+  });
+  root.querySelectorAll(_toolResultScrollableSelector).forEach(el=>{
+    // Presentation capture already owns the geometry snapshot. Reading every
+    // scrollHeight/clientHeight again here would force another full layout on
+    // each stdout/response tick; this guard only needs the input generation.
+    guard.set(el,{
+      kind:'scroll',
+      userIntentVersion:Number(el._toolResultUserScrollIntentVersion)||0,
+    });
+  });
+  return guard;
+}
+function _toolPresentationRestoreGuardAllowsDisclosure(el,guard){
+  if(!guard||typeof guard.get!=='function')return true;
+  const saved=guard.get(el);
+  if(!saved||!String(saved.kind||'').includes('disclosure'))return true;
+  const current=saved.kind==='result-disclosure'?!!el.open:_worklogDetailDisclosureIsOpen(el);
+  return current===!!saved.open;
+}
+function _toolPresentationRestoreGuardAllowsScroll(el,guard){
+  if(!guard||typeof guard.get!=='function')return true;
+  const saved=guard.get(el);
+  if(!saved||saved.kind!=='scroll')return true;
+  // Electron can reset scrollTop asynchronously after a preserved node is
+  // reparented, with unchanged geometry and no JS setter call. That native
+  // compositor reset must be repaired. Only suppress the delayed restore when
+  // a real wheel/touch/pointer/keyboard intent occurred after it was queued.
+  return (Number(el._toolResultUserScrollIntentVersion)||0)===saved.userIntentVersion;
+}
+function _restoreToolResultPresentationState(root,state,restoreGuard){
+  if(!root||!root.querySelectorAll||!state||!state.size)return;
+  const disclosureCounts=Object.create(null);
+  root.querySelectorAll(_toolResultDisclosureSelector).forEach(el=>{
+    const key=_toolResultDisclosureKeyForElement(el,disclosureCounts);
+    if(!key||!state.has(key))return;
+    const saved=state.get(key);
+    if(
+      saved&&saved.toolResultDisclosure===true&&
+      _toolPresentationRestoreGuardAllowsDisclosure(el,restoreGuard)
+    )el.open=!!saved.open;
+  });
+  const scrollCounts=Object.create(null);
+  root.querySelectorAll(_toolResultScrollableSelector).forEach(el=>{
+    const key=_toolResultScrollKeyForElement(el,scrollCounts);
+    if(!key||!state.has(key))return;
+    const saved=state.get(key);
+    if(!saved||saved.toolResultScroll!==true)return;
+    if(!_toolPresentationRestoreGuardAllowsScroll(el,restoreGuard))return;
+    if(el.classList&&el.classList.contains('tool-output-raw')&&typeof saved.hidden==='boolean'){
+      el.hidden=saved.hidden;
+      const row=el.closest&&el.closest('.tool-card-row');
+      const code=el.querySelector&&el.querySelector('code');
+      const toggle=row&&row.querySelector&&row.querySelector('.tool-output-raw-toggle');
+      if(!saved.hidden){
+        if(code&&row&&Object.prototype.hasOwnProperty.call(row,'_toolOutputRaw'))code.textContent=String(row._toolOutputRaw||'');
+        if(el.dataset)el.dataset.loaded='1';
+      }else if(el.removeAttribute){
+        el.removeAttribute('data-loaded');
+      }
+      if(toggle){
+        toggle.setAttribute('aria-expanded',String(!saved.hidden));
+        toggle.textContent=saved.hidden?'View raw output':'Hide raw output';
+      }
+    }
+    _restoreToolResultScrollPosition(el,saved);
+  });
+}
+function _setAssistantDiffExpandedState(pre, expanded){
+  const wrap=pre&&pre.closest&&pre.closest('.assistant-modified-diff-wrap');
+  if(!wrap) return;
+  wrap.setAttribute('data-expanded',expanded?'1':'0');
+  const shortPre=wrap.querySelector('.assistant-code-diff.is-truncated');
+  const fullPre=wrap.querySelector('.assistant-code-diff.is-full');
+  const more=wrap.querySelector('[data-diff-action="more"]');
+  const less=wrap.querySelector('[data-diff-action="less"]');
+  if(shortPre) shortPre.hidden=!!expanded;
+  if(fullPre) fullPre.hidden=!expanded;
+  if(more) more.hidden=!!expanded;
+  if(less) less.hidden=!expanded;
+}
 function _captureWorklogDetailDisclosureState(root){
   const state=new Map();
   if(!root||!root.querySelectorAll) return state;
@@ -10952,14 +13123,35 @@ function _captureWorklogDetailDisclosureState(root){
     const key=_worklogDetailDisclosureKeyForElement(el, counts);
     if(!key) return;
     const body=_worklogDetailScrollableBody(el);
+    const bodyScroll=body&&typeof _captureToolResultScrollPosition==='function'
+      ?_captureToolResultScrollPosition(body)
+      :null;
     state.set(key,{
       open:_worklogDetailDisclosureIsOpen(el),
       scrollTop:body?Math.max(0,Number(body.scrollTop)||0):0,
+      scrollLeft:body?Math.max(0,Number(body.scrollLeft)||0):0,
+      followTail:bodyScroll?!!bodyScroll.followTail:false,
     });
   });
+  const diffCounts=Object.create(null);
+  root.querySelectorAll('.assistant-code-diff').forEach(pre=>{
+    const key=_assistantDiffScrollKeyForElement(pre,diffCounts);
+    if(!key) return;
+    const wrap=pre.closest&&pre.closest('.assistant-modified-diff-wrap');
+    state.set(key,{
+      diffScroll:true,
+      scrollTop:Math.max(0,Number(pre.scrollTop)||0),
+      scrollLeft:Math.max(0,Number(pre.scrollLeft)||0),
+      expanded:!!(wrap&&wrap.getAttribute('data-expanded')==='1'),
+    });
+  });
+  if(typeof _captureToolResultPresentationState==='function'){
+    const toolResultState=_captureToolResultPresentationState(root);
+    for(const [key,value] of toolResultState)state.set(key,value);
+  }
   return state;
 }
-function _restoreWorklogDetailDisclosureState(root, state){
+function _restoreWorklogDetailDisclosureState(root, state, restoreGuard){
   if(!root||!root.querySelectorAll||!state||!state.size) return;
   // Don't restore a snapshot captured under a different session.
   try{ if(state._sid!==undefined && state._sid!==(S.session?S.session.session_id:null)) return; }catch(_){ /* fall through */ }
@@ -10969,13 +13161,34 @@ function _restoreWorklogDetailDisclosureState(root, state){
     if(!key||!state.has(key)) return;
     const saved=state.get(key);
     const open=(saved&&typeof saved==='object'&&'open' in saved)?saved.open:saved;
-    _setWorklogDetailDisclosureOpen(el, open);
-    const scrollTop=(saved&&typeof saved==='object')?Number(saved.scrollTop):0;
-    if(open&&Number.isFinite(scrollTop)&&scrollTop>0){
+    const canRestoreDisclosure=_toolPresentationRestoreGuardAllowsDisclosure(el,restoreGuard);
+    if(canRestoreDisclosure)_setWorklogDetailDisclosureOpen(el, open);
+    if(open&&saved&&typeof saved==='object'){
       const body=_worklogDetailScrollableBody(el);
-      if(body) body.scrollTop=Math.min(scrollTop, Math.max(0, body.scrollHeight-body.clientHeight));
+      const canRestoreBody=!body||_toolPresentationRestoreGuardAllowsScroll(body,restoreGuard);
+      if(body&&canRestoreBody&&typeof _restoreToolResultScrollPosition==='function'){
+        _restoreToolResultScrollPosition(body,saved);
+      }else if(body&&canRestoreBody){
+        const scrollTop=Number(saved.scrollTop);
+        if(Number.isFinite(scrollTop))body.scrollTop=Math.min(Math.max(0,scrollTop),Math.max(0,body.scrollHeight-body.clientHeight));
+      }
     }
   });
+  const diffCounts=Object.create(null);
+  root.querySelectorAll('.assistant-code-diff').forEach(pre=>{
+    const key=_assistantDiffScrollKeyForElement(pre,diffCounts);
+    if(!key||!state.has(key)) return;
+    const saved=state.get(key);
+    if(!saved||typeof saved!=='object'||saved.diffScroll!==true) return;
+    _setAssistantDiffExpandedState(pre,!!saved.expanded);
+    const top=Number(saved.scrollTop);
+    const left=Number(saved.scrollLeft);
+    if(Number.isFinite(top)) pre.scrollTop=Math.min(Math.max(0,top),Math.max(0,pre.scrollHeight-pre.clientHeight));
+    if(Number.isFinite(left)) pre.scrollLeft=Math.min(Math.max(0,left),Math.max(0,pre.scrollWidth-pre.clientWidth));
+  });
+  // Restore nested disclosures before their scroll viewports, so dimensions
+  // are available for content that the user had expanded before the rebuild.
+  if(typeof _restoreToolResultPresentationState==='function')_restoreToolResultPresentationState(root,state,restoreGuard);
 }
 function _thinkingCardHtml(text, open){
   const clean=_sanitizeThinkingDisplayText(text);
@@ -12032,7 +14245,7 @@ function _syncWorklogReasonFromAnchor(group, anchor, displayTextOverride){
     list.appendChild(reason);
   }
   reason.innerHTML=html;
-  if(anchor){
+  if(anchor && !(anchor.querySelector&&anchor.querySelector('.assistant-modified-files'))){
     anchor.classList.add('assistant-segment-worklog-source');
     anchor.setAttribute('aria-hidden','true');
     anchor.hidden=true;
@@ -12096,7 +14309,7 @@ function _appendWorklogReason(list, anchor){
   if(anchorKey) reason.setAttribute('data-worklog-anchor-key',anchorKey);
   reason.innerHTML=html;
   list.appendChild(reason);
-  if(anchor){
+  if(anchor && !(anchor.querySelector&&anchor.querySelector('.assistant-modified-files'))){
     anchor.classList.add('assistant-segment-worklog-source');
     anchor.setAttribute('aria-hidden','true');
     anchor.hidden=true;
@@ -12204,19 +14417,54 @@ function _appendWorklogStep(group, anchor, cards, thinkingText, opts){
   }
   const toolCards=_filterNewWorklogTools(cards, opts&&opts.seenTools);
   if(toolCards.length){
-    const last=list.lastElementChild;
-    let tools=(!wroteProse&&last&&last.classList&&last.classList.contains('wl-step-tools')&&last.getAttribute('data-worklog-tools')==='1')
-      ? last
-      : null;
-    if(!tools){
-      tools=document.createElement('div');
-      tools.className='wl-step-tools tool-worklog-tools';
-      tools.setAttribute('data-worklog-tools','1');
-      list.appendChild(tools);
+    const regularToolCards=[];
+    for(const tc of toolCards){
+      const tcMutationItems=_assistantLiveMutationItemsFromToolCall(tc);
+      if(tcMutationItems.length){
+        const mutationItems=opts&&opts.live
+          ? _mergeLiveAssistantModifiedItems(tcMutationItems)
+          : tcMutationItems;
+        list.appendChild(_assistantModifiedFilesNode(
+          mutationItems,
+          'assistant-worklog-modified-files-row assistant-timeline-mutation-event',
+          {collapsed:!!(opts&&opts.live===false),simulateDiffStream:!!(opts&&opts.live)}
+        ));
+      }else{
+        regularToolCards.push(tc);
+      }
     }
-    for(const tc of toolCards) tools.appendChild(buildToolCard(tc));
-    _syncToolRowsContainer(tools, !!(opts&&opts.live));
+    if(regularToolCards.length){
+      const last=list.lastElementChild;
+      let tools=(!wroteProse&&last&&last.classList&&last.classList.contains('wl-step-tools')&&last.getAttribute('data-worklog-tools')==='1')
+        ? last
+        : null;
+      if(!tools){
+        tools=document.createElement('div');
+        tools.className='wl-step-tools tool-worklog-tools';
+        tools.setAttribute('data-worklog-tools','1');
+        list.appendChild(tools);
+      }
+      for(const tc of regularToolCards) tools.appendChild(buildToolCard(tc));
+      _syncToolRowsContainer(tools, !!(opts&&opts.live));
+    }
   }
+}
+function _anchorSceneToolRowSemanticMutationKey(row){
+  if(!row||row.role!=='tool') return '';
+  const tool=(row.tool&&typeof row.tool==='object')?row.tool:{};
+  const payload=(row.payload&&typeof row.payload==='object')?row.payload:{};
+  const name=String(tool.name||payload.name||'').replace(/^functions\./,'').toLowerCase();
+  if(!/^(write_file|patch|edit_file|create_file|mcp_filesystem_write_file|mcp_filesystem_edit_file)$/.test(name)) return '';
+  const args=(tool.args&&typeof tool.args==='object')?tool.args:((payload.args&&typeof payload.args==='object')?payload.args:{});
+  const path=String(args.path||args.file_path||args.file||args.target||'');
+  if(!path) return '';
+  const discriminator=[
+    args.mode||'',
+    args.old_string||'',
+    args.new_string||'',
+    args.content||'',
+  ].join('\x1f');
+  return [name,path,discriminator].join('\x1f');
 }
 function _anchorSceneRowsForRendering(scene, opts){
   const rows=Array.isArray(scene&&scene.activity_rows)?scene.activity_rows:[];
@@ -12228,7 +14476,11 @@ function _anchorSceneRowsForRendering(scene, opts){
   const proseTextKey=(value)=>String(value||'').replace(/\s+/g,' ').trim();
   const keyFor=(row)=>{
     if(!row) return '';
-    if(row.role==='tool') return `tool:${_anchorSceneToolRowLogicalKey(row)||row.row_id||row.event_id||row.local_id||out.length}`;
+    if(row.role==='tool'){
+      const semanticMutationKey=_anchorSceneToolRowSemanticMutationKey(row);
+      if(semanticMutationKey) return `tool-mutation:${semanticMutationKey}`;
+      return `tool:${_anchorSceneToolRowLogicalKey(row)||row.row_id||row.event_id||row.local_id||out.length}`;
+    }
     if(row.role==='prose') return `prose:${row.local_id||row.row_id||out.length}`;
     if(row.role==='thinking') return `thinking:${row.local_id||row.row_id||out.length}`;
     if(row.role==='lifecycle'){
@@ -12296,10 +14548,13 @@ function _anchorSceneToolCallFromRow(row, opts){
   const rowTs=typeof _anchorSceneRowTimestampSeconds==='function'
     ? _anchorSceneRowTimestampSeconds(row)
     : firstValidTimestampSeconds(row&&row.created_at, row&&row.timestamp, row&&row.ts, row&&row.started_at, row&&row.completed_at);
-  const id=tool.id||row.tool_call_id||payload.tid||payload.id||payload.tool_call_id||payload.tool_use_id||payload.call_id||'';
+  const uiPart=(row&&row.ui_part&&typeof row.ui_part==='object')?row.ui_part:((payload.ui_part&&typeof payload.ui_part==='object')?payload.ui_part:{});
+  const id=tool.id||row.tool_call_id||payload.tid||payload.id||payload.tool_call_id||payload.tool_use_id||payload.call_id||uiPart.tool_call_id||'';
   const settled=!!(opts&&opts.settled);
+  const mutationPreview=tool.mutation_preview||tool.mutationPreview||payload.mutation_preview||payload.mutationPreview||uiPart.mutation_preview||uiPart.mutationPreview||null;
+  const metadataValue=(key)=>tool[key]!==undefined?tool[key]:(payload[key]!==undefined?payload[key]:uiPart[key]);
   return {
-    name:tool.name||payload.name||'tool',
+    name:tool.name||payload.name||uiPart.tool_name||'tool',
     args:(tool.args&&typeof tool.args==='object')?tool.args:((payload.args&&typeof payload.args==='object')?payload.args:{}),
     command:tool.command||payload.command||payload.cmd||'',
     raw_command:tool.raw_command||payload.raw_command||'',
@@ -12307,6 +14562,23 @@ function _anchorSceneToolCallFromRow(row, opts){
     snippet:tool.snippet||payload.snippet||payload.result||payload.output||(
       row&&row.status!=='running'&&row.status!=='pending'?row.text:''
     )||'',
+    result:tool.result||payload.result||'',
+    output:tool.output||payload.output||'',
+    mutation_preview:mutationPreview,
+    mutationPreview:mutationPreview,
+    metadata:metadataValue('metadata'),
+    result_metadata:metadataValue('result_metadata'),
+    resultMetadata:metadataValue('resultMetadata'),
+    output_kind:metadataValue('output_kind'),
+    severity:metadataValue('severity'),
+    status:metadataValue('status'),
+    exit_code:metadataValue('exit_code'),
+    status_code:metadataValue('status_code'),
+    http_status:metadataValue('http_status'),
+    success:metadataValue('success'),
+    ok:metadataValue('ok'),
+    url:metadataValue('url'),
+    warnings:metadataValue('warnings'),
     done:settled?true:(tool.done!==null&&tool.done!==undefined?tool.done:(row.status!=='running'&&row.status!=='pending')),
     is_error:!!(tool.is_error||payload.is_error||row.status==='error'||row.status==='failed'),
     is_diff:!!(tool.is_diff||payload.is_diff||payload.isDiff),
@@ -12338,6 +14610,20 @@ function _anchorSceneRowTimestampSeconds(row){
     if(stamp) return stamp;
   }
   return null;
+}
+
+function _assistantAnchorSceneMutationItemsFromRow(row, opts){
+  if(!row||row.role!=='tool') return [];
+  const toolCall=_anchorSceneToolCallFromRow(row,opts||{});
+  if(!toolCall) return [];
+  const eventKey=_anchorSceneToolRowSemanticMutationKey(row)||_assistantMutationEventKeyFromToolCall(toolCall,row.row_id||row.local_id||'anchor-mutation');
+  let items=[];
+  if(typeof assistantMessageModifiedFiles==='function'){
+    items=assistantMessageModifiedFiles({tool_calls:[toolCall]}).slice(0,24);
+  }else{
+    items=_assistantLiveMutationItemsFromToolCall(toolCall);
+  }
+  return _assistantMutationItemsWithEventKey(items,eventKey);
 }
 function _anchorSceneNodeForRow(row, opts){
   const settled=!!(opts&&opts.settled);
@@ -12372,7 +14658,16 @@ function _anchorSceneNodeForRow(row, opts){
     if(!text) return null;
     node=_thinkingActivityNode(text, false, row.row_id||row.local_id||'anchor-thinking');
   }else if(row.role==='tool'){
-    node=buildToolCard(_anchorSceneToolCallFromRow(row,opts));
+    const mutationItems=_assistantAnchorSceneMutationItemsFromRow(row,opts);
+    if(mutationItems.length){
+      node=_assistantModifiedFilesNode(
+        mutationItems,
+        'assistant-anchor-modified-files-row assistant-timeline-mutation-event',
+        {collapsed:settled,simulateDiffStream:!!(!settled&&opts&&opts.animateMutationDiffs)}
+      );
+    }else{
+      node=buildToolCard(_anchorSceneToolCallFromRow(row,opts));
+    }
   }else if(row.role==='lifecycle'){
     if(row.source_event_type==='compressing'||row.source_event_type==='compressed'){
       node=_autoCompressionWorklogNode({
@@ -12455,9 +14750,29 @@ function _anchorSceneTransparentNodeForRow(row, opts){
     });
   }else if(row.role==='tool'){
     const toolCall=_anchorSceneToolCallFromRow(row,{settled});
-    node=_decorateTransparentEventRow(buildToolCard(toolCall),{
+    let mutationItems=[];
+    let baseNode=null;
+    try{
+      mutationItems=_assistantAnchorSceneMutationItemsFromRow(row,{settled});
+      baseNode=mutationItems.length
+        ? _assistantModifiedFilesNode(
+            mutationItems,
+            'assistant-anchor-modified-files-row assistant-timeline-mutation-event',
+            {collapsed:settled,simulateDiffStream:!!(!settled&&opts&&opts.animateMutationDiffs)}
+          )
+        : buildToolCard(toolCall);
+    }catch(error){
+      // Keep chronological tool activity alive when one malformed DiffCard
+      // cannot render. This covers live, settled, and reveal/replay callers.
+      baseNode=typeof _anchorSceneFallbackNodeForRenderError==='function'
+        ? _anchorSceneFallbackNodeForRenderError(row,{settled},error)
+        : buildToolCard({...toolCall,mutation_preview:null,mutationPreview:null});
+      mutationItems=[];
+    }
+    if(!baseNode) return null;
+    node=_decorateTransparentEventRow(baseNode,{
       type:'tool',
-      name:toolCall&&toolCall.name,
+      name:mutationItems.length?'Modified file':toolCall&&toolCall.name,
       status:_transparentToolStatus(toolCall,settled),
       toolCall,
       ts:eventTs,
@@ -12545,6 +14860,73 @@ function _anchorSceneWorklogGroup(blocks, opts){
   if(opts&&opts.turnStartedAt!==undefined&&opts.turnStartedAt!==null) group.setAttribute('data-turn-started-at',String(opts.turnStartedAt));
   return group;
 }
+function _anchorSceneReportRenderError(row, error){
+  if(!row||typeof row!=='object') return;
+  const root=(typeof window!=='undefined')?window:globalThis;
+  const warningKey=String(row.row_id||row.local_id||row.event_id||`${row.role||'activity'}:${row.source_event_type||''}`);
+  try{
+    const warned=root._anchorSceneRowRenderWarnings||(root._anchorSceneRowRenderWarnings=new Set());
+    if(!warned.has(warningKey)){
+      warned.add(warningKey);
+      if(typeof console!=='undefined'&&console.warn){
+        console.warn('assistant activity row render failed; using fallback',{
+          row_id:warningKey,
+          role:row.role||'activity',
+          source_event_type:row.source_event_type||'',
+          error,
+        });
+      }
+    }
+  }catch(_){/* Rendering must remain fail-soft even when diagnostics fail. */}
+}
+function _anchorSceneFallbackNodeForRenderError(row, opts, error){
+  if(!row||typeof row!=='object') return null;
+  _anchorSceneReportRenderError(row,error);
+
+  let node=null;
+  if(row.role==='tool'){
+    try{
+      const toolCall=_anchorSceneToolCallFromRow(row,opts||{});
+      // A malformed mutation preview must not keep retrying the DiffCard path.
+      // The ordinary tool row still communicates the live edit/tool activity.
+      node=buildToolCard({
+        ...(toolCall||{}),
+        mutation_preview:null,
+        mutationPreview:null,
+      });
+    }catch(_){ node=null; }
+  }
+  if(!node){
+    try{
+      const tool=(row.tool&&typeof row.tool==='object')?row.tool:{};
+      const payload=(row.payload&&typeof row.payload==='object')?row.payload:{};
+      const label=String(
+        row.text||tool.name||payload.name||row.source_event_type||
+        (row.role==='thinking'?'Thinking':'Working')
+      ).trim()||'Working';
+      node=_activityStatusNode({
+        kind:row.role==='tool'?'tool':'warning',
+        label,
+        status:row.status==='running'||row.status==='pending'?'running':'done',
+        id:row.row_id||row.local_id||'',
+      });
+    }catch(_){ node=null; }
+  }
+  if(!node){
+    try{
+      node=document.createElement('div');
+      node.className='agent-activity-status';
+      node.textContent=String(row.text||row.source_event_type||'Working');
+    }catch(_){ return null; }
+  }
+  node.setAttribute('data-anchor-scene-row','1');
+  node.setAttribute('data-anchor-row-id',String(row.row_id||row.local_id||''));
+  if(row.local_id) node.setAttribute('data-anchor-local-id',String(row.local_id));
+  node.setAttribute('data-anchor-row-role',String(row.role||'activity'));
+  node.setAttribute('data-anchor-source-event-type',String(row.source_event_type||''));
+  node.setAttribute('data-anchor-render-fallback','1');
+  return node;
+}
 function _renderAnchorSceneRowsIntoWorklog(group, rows, opts){
   const list=_toolWorklogListEl(group);
   if(!group||!list) return false;
@@ -12552,8 +14934,40 @@ function _renderAnchorSceneRowsIntoWorklog(group, rows, opts){
   let wrote=false;
   let currentTools=null;
   for(const row of rows){
-    const node=_anchorSceneNodeForRow(row,opts);
+    let node=null;
+    let isMutationNode=false;
+    try{
+      const rowMutationItems=_assistantAnchorSceneMutationItemsFromRow(row,opts);
+      if(rowMutationItems.length){
+        const mutationItems=opts&&opts.live
+          ? _mergeLiveAssistantModifiedItems(rowMutationItems)
+          : rowMutationItems;
+        const mutationNode=_assistantModifiedFilesNode(
+          mutationItems,
+          'assistant-anchor-modified-files-row assistant-timeline-mutation-event',
+          {
+            collapsed:!(opts&&opts.live),
+            simulateDiffStream:!!(opts&&opts.live&&opts.animateMutationDiffs),
+          }
+        );
+        mutationNode.setAttribute('data-anchor-scene-row','1');
+        mutationNode.setAttribute('data-anchor-row-id',String(row.row_id||row.local_id||'anchor-mutation'));
+        mutationNode.setAttribute('data-anchor-row-role','tool');
+        mutationNode.setAttribute('data-anchor-source-event-type',String(row.source_event_type||''));
+        node=mutationNode;
+        isMutationNode=true;
+      }
+      if(!node) node=_anchorSceneNodeForRow(row,opts);
+    }catch(error){
+      node=_anchorSceneFallbackNodeForRenderError(row,opts,error);
+    }
     if(!node) continue;
+    if(isMutationNode){
+      currentTools=null;
+      list.appendChild(node);
+      wrote=true;
+      continue;
+    }
     if(row.role==='tool'){
       if(!currentTools){
         currentTools=document.createElement('div');
@@ -12569,7 +14983,18 @@ function _renderAnchorSceneRowsIntoWorklog(group, rows, opts){
     wrote=true;
   }
   if(wrote){
-    _syncToolCallGroupSummary(group);
+    try{
+      _syncToolCallGroupSummary(group);
+    }catch(error){
+      // Summary decoration is optional. Never let it suppress already-rendered
+      // realtime activity rows or every subsequent SSE repaint.
+      _anchorSceneReportRenderError({
+        row_id:'worklog-summary',
+        role:'activity',
+        source_event_type:'worklog_summary',
+        text:'Working',
+      },error);
+    }
   }
   return wrote;
 }
@@ -12619,6 +15044,63 @@ function isLiveAnchorActivitySceneOwner(streamId){
   if(!owner) return false;
   const current=turn.getAttribute('data-anchor-stream-id')||'';
   return !streamId||!current||String(streamId)===current;
+}
+function _liveAnchorToolRowKey(node,streamId){
+  if(!node||!node.getAttribute)return'';
+  const rowId=String(node.getAttribute('data-anchor-row-id')||'').trim();
+  if(!rowId)return'';
+  const role=String(node.getAttribute('data-anchor-row-role')||'tool').trim();
+  // source_event_type legitimately changes across one tool row's lifecycle
+  // (tool_started -> tool_completed). Stable anchor id + role are the identity;
+  // including source would remount the exact card at completion.
+  return `${String(streamId||'')}\u0000${rowId}\u0000${role}`;
+}
+function _captureLiveAnchorToolRows(root,streamId){
+  const rows=new Map();
+  if(!root||!root.querySelectorAll)return rows;
+  root.querySelectorAll('.tool-card-row[data-anchor-scene-row="1"][data-anchor-row-id]').forEach(node=>{
+    const key=_liveAnchorToolRowKey(node,streamId);
+    if(key&&!rows.has(key))rows.set(key,{
+      node,
+      // Capture geometry while the row is still connected. Detached overflow
+      // elements report zero dimensions and are easily misclassified as
+      // tail-followers even when the user is inspecting the middle.
+      presentation:typeof _captureWorklogDetailDisclosureState==='function'
+        ?_captureWorklogDetailDisclosureState(node)
+        :null,
+    });
+  });
+  return rows;
+}
+function _reuseLiveAnchorToolRows(root,preserved,streamId){
+  if(!root||!root.querySelectorAll||!preserved||!preserved.size)return 0;
+  let reused=0;
+  root.querySelectorAll('.tool-card-row[data-anchor-scene-row="1"][data-anchor-row-id]').forEach(replacement=>{
+    const key=_liveAnchorToolRowKey(replacement,streamId);
+    const preservedEntry=key&&preserved.get(key);
+    const existing=preservedEntry&&preservedEntry.node;
+    if(!existing||existing===replacement)return;
+    const compatible=existing.getAttribute('data-anchor-row-role')===replacement.getAttribute('data-anchor-row-role');
+    if(!compatible)return;
+    let reconciled=false;
+    if(typeof _reconcileLiveStructuredCommandCard==='function'){
+      reconciled=_reconcileLiveStructuredCommandCard(existing,replacement);
+    }
+    if(!reconciled&&typeof _reconcileLiveToolResultCardInPlace==='function'){
+      reconciled=_reconcileLiveToolResultCardInPlace(existing,replacement);
+    }
+    if(!reconciled)return;
+    // The compact scene builds the candidate in the new group while the old
+    // row is temporarily detached. Put the reconciled old row back so every
+    // browser-owned nested scroll viewport keeps its identity.
+    replacement.replaceWith(existing);
+    if(preservedEntry.presentation&&typeof _restoreLiveToolPresentation==='function'){
+      _restoreLiveToolPresentation(existing,preservedEntry.presentation);
+    }
+    preserved.delete(key);
+    reused+=1;
+  });
+  return reused;
 }
 function _projectLiveAnchorActivitySceneForStream(streamId, mode){
   const api=(typeof window!=='undefined')?window.HermesAssistantTurnAnchors:null;
@@ -12792,6 +15274,10 @@ function renderLiveAnchorActivityScene(streamId, scene, opts){
   const liveDisclosureState=typeof _captureWorklogDetailDisclosureState==='function'
     ? _captureWorklogDetailDisclosureState(blocks)
     : null;
+  const activeAnchorStreamId=String(streamId||S.activeStreamId||'');
+  const preservedToolRows=typeof _captureLiveAnchorToolRows==='function'
+    ? _captureLiveAnchorToolRows(blocks,activeAnchorStreamId)
+    : null;
   const scrollSnapshot=_captureMessageScrollSnapshot();
   const scrollRebuildGuard=_prepareLiveAnchorScrollRebuildGuard(scrollSnapshot);
   blocks.querySelectorAll('[data-anchor-scene-owner="1"],[data-anchor-scene-row="1"]').forEach(el=>el.remove());
@@ -12808,13 +15294,21 @@ function renderLiveAnchorActivityScene(streamId, scene, opts){
     streamId:streamId||S.activeStreamId||'',
     turnStartedAt:S.session&&S.session.pending_started_at,
   });
-  const ok=_renderAnchorSceneRowsIntoWorklog(group,rows,{live:true,settled:false});
+  const ok=_renderAnchorSceneRowsIntoWorklog(group,rows,{
+    live:true,
+    settled:false,
+    animateMutationDiffs:!!opts.animateMutationDiffs,
+  });
+  if(ok&&typeof _reuseLiveAnchorToolRows==='function'){
+    _reuseLiveAnchorToolRows(group,preservedToolRows,activeAnchorStreamId);
+  }
   if(!ok){
     const list=_toolWorklogListEl(group);
     if(list) list.innerHTML='';
     _syncToolCallGroupSummary(group);
   }
-  if(typeof _restoreWorklogDetailDisclosureState==='function') _restoreWorklogDetailDisclosureState(blocks, liveDisclosureState);
+  if(typeof _restoreLiveToolPresentation==='function') _restoreLiveToolPresentation(blocks, liveDisclosureState);
+  else if(typeof _restoreWorklogDetailDisclosureState==='function') _restoreWorklogDetailDisclosureState(blocks, liveDisclosureState);
   if(typeof _startActivityElapsedTimer==='function') _startActivityElapsedTimer(group);
   _dedupeLiveProcessedWorklogAnchors(turn);
   if(typeof _moveLiveRunStatusToTurnEnd==='function') _moveLiveRunStatusToTurnEnd();
@@ -12898,6 +15392,7 @@ function _renderLiveAnchorActivitySceneTransparent(streamId, scene, opts){
     const node=_anchorSceneTransparentNodeForRow(row,{
       live:true,
       settled:false,
+      animateMutationDiffs:!!opts.animateMutationDiffs,
       streamId:streamId||S.activeStreamId||'',
       sessionId:S.session&&S.session.session_id,
     });
@@ -12949,16 +15444,14 @@ function _transparentLiveRowKey(node, streamId){
   if(!rowId) return '';
   const rowStreamId = String(streamId || node.getAttribute('data-anchor-stream-id') || '').trim();
   const rowRole = String(node.getAttribute('data-anchor-row-role') || 'activity').trim();
-  const rowSource = String(node.getAttribute('data-anchor-source-event-type') || '').trim();
-  return `${rowStreamId}\u0000${rowId}\u0000${rowRole}\u0000${rowSource}`;
+  return `${rowStreamId}\u0000${rowId}\u0000${rowRole}`;
 }
 
 function _transparentLiveRowsCompatible(existing, candidate){
   if(!existing || !candidate) return false;
   return !!(
     existing.getAttribute('data-anchor-row-id') === candidate.getAttribute('data-anchor-row-id') &&
-    existing.getAttribute('data-anchor-row-role') === candidate.getAttribute('data-anchor-row-role') &&
-    existing.getAttribute('data-anchor-source-event-type') === candidate.getAttribute('data-anchor-source-event-type')
+    existing.getAttribute('data-anchor-row-role') === candidate.getAttribute('data-anchor-row-role')
   );
 }
 
@@ -13126,6 +15619,9 @@ function _refreshTransparentLiveRow(existing, node, opts){
   if(!existing || !node || !existing.getAttribute) return node;
   if(existing===node) return existing;
   const preservedState = _transparentLiveRowInteractiveState(existing);
+  const nestedDisclosureState=typeof _captureWorklogDetailDisclosureState==='function'
+    ? _captureWorklogDetailDisclosureState(existing)
+    : null;
   const candidateIsFadeProse = node.getAttribute('data-anchor-row-role') === 'prose' &&
     node.querySelector &&
     !!node.querySelector('.msg-body.stream-fade-active,.stream-fade-word');
@@ -13146,14 +15642,39 @@ function _refreshTransparentLiveRow(existing, node, opts){
     existing.setAttribute(name, value);
   }
   existing.className = node.className || '';
+  const existingToolCard=existing.querySelector&&existing.querySelector('.tool-card');
+  const candidateToolCard=node.querySelector&&node.querySelector('.tool-card');
+  if(existingToolCard&&candidateToolCard){
+    let reconciled=false;
+    if(typeof _reconcileLiveStructuredCommandCard==='function'){
+      reconciled=_reconcileLiveStructuredCommandCard(existing,node);
+    }
+    if(!reconciled&&typeof _reconcileLiveToolResultCardInPlace==='function'){
+      reconciled=_reconcileLiveToolResultCardInPlace(existing,node);
+    }
+    if(reconciled){
+      _rehydrateTransparentLiveRow(existing,node,preservedState);
+      return existing;
+    }
+  }
   if(_refreshTransparentThinkingLiveRow(existing, node)){
     _rehydrateTransparentLiveRow(existing, node, preservedState);
+    if(nestedDisclosureState&&nestedDisclosureState.size&&typeof _restoreLiveToolPresentation==='function'){
+      _restoreLiveToolPresentation(existing,nestedDisclosureState);
+    }else if(nestedDisclosureState&&nestedDisclosureState.size&&typeof _restoreWorklogDetailDisclosureState==='function'){
+      _restoreWorklogDetailDisclosureState(existing,nestedDisclosureState);
+    }
     return existing;
   }
   const newHtml = node.innerHTML || '';
   const htmlChanged = existing.innerHTML !== newHtml;
   if(htmlChanged) existing.innerHTML = newHtml;
   _rehydrateTransparentLiveRow(existing, node, preservedState);
+  if(nestedDisclosureState&&nestedDisclosureState.size&&typeof _restoreLiveToolPresentation==='function'){
+    _restoreLiveToolPresentation(existing,nestedDisclosureState);
+  }else if(nestedDisclosureState&&nestedDisclosureState.size&&typeof _restoreWorklogDetailDisclosureState==='function'){
+    _restoreWorklogDetailDisclosureState(existing,nestedDisclosureState);
+  }
   if(opts.preserveEventAt){
     const header = existing.querySelector ? existing.querySelector('.tool-card-header,.thinking-card-header') : null;
     if(header) _syncTransparentEventTimestamp(existing, header, {ts:opts.preserveEventAt, live:false});
@@ -13778,6 +16299,7 @@ function ensureRunActivityGroup(inner, opts){
 const _liveRunStatusTimers={};  // keyed by sessionId, max 1 active
 let _liveRunStatusTokens=null;
 let _liveRunStatusSessionId=null;
+let _threadElapsedTimerSessionId=null;
 function _formatRunElapsed(seconds){
   const n=Number(seconds);
   if(!Number.isFinite(n)||n<0)return'00:00';
@@ -13790,6 +16312,56 @@ function _formatRunElapsed(seconds){
   const m=Math.floor(total/60);
   const s=total%60;
   return String(m).padStart(2,'0')+':'+String(s).padStart(2,'0');
+}
+function _formatThreadElapsed(seconds){
+  const n=Number(seconds);
+  const total=Number.isFinite(n)?Math.max(0,Math.floor(n)):0;
+  if(total<60) return `${total}s`;
+  if(total<3600) return `${Math.floor(total/60)}m ${total%60}s`;
+  if(total<86400) return `${Math.floor(total/3600)}h ${Math.floor((total%3600)/60)}m`;
+  return `${Math.floor(total/86400)}d ${Math.floor((total%86400)/3600)}h`;
+}
+function _threadElapsedNowSeconds(){
+  const nowMs=typeof _serverNowMs==='function'?Number(_serverNowMs()):Date.now();
+  return (Number.isFinite(nowMs)?nowMs:Date.now())/1000;
+}
+function _renderThreadElapsedTimer(sid,startedAt){
+  const el=$('threadElapsedTimer');
+  if(!el)return;
+  const currentSid=S.session&&S.session.session_id;
+  const isCurrent=sid&&sid===_threadElapsedTimerSessionId&&sid===currentSid;
+  const isRunning=!!(isCurrent&&(S.busy||S.activeStreamId||(S.session&&(S.session.active_stream_id||S.session.pending_user_message))));
+  const start=Number(startedAt);
+  if(!isRunning||!Number.isFinite(start)||start<=0){
+    el.style.display='none';
+    el.textContent='';
+    el.removeAttribute('title');
+    el.removeAttribute('aria-label');
+    return;
+  }
+  const text=_formatThreadElapsed(_threadElapsedNowSeconds()-start);
+  el.textContent=text;
+  el.style.display='';
+  el.title=`Running for ${text}`;
+  el.setAttribute('aria-label',`Current process running for ${text}`);
+}
+function showThreadElapsedTimer(sid,startedAt){
+  sid=String(sid||'');
+  const start=Number(startedAt);
+  if(!sid||!Number.isFinite(start)||start<=0)return;
+  if(_threadElapsedTimerSessionId&&_threadElapsedTimerSessionId!==sid){
+    _clearLiveRunStatusTimer(_threadElapsedTimerSessionId);
+  }
+  _threadElapsedTimerSessionId=sid;
+  _startLiveRunStatusTimer(sid,start);
+}
+function hideThreadElapsedTimer(sid){
+  if(sid&&_threadElapsedTimerSessionId&&sid!==_threadElapsedTimerSessionId)return;
+  const owner=sid||_threadElapsedTimerSessionId;
+  if(owner)_clearLiveRunStatusTimer(owner);
+  _threadElapsedTimerSessionId=null;
+  const el=$('threadElapsedTimer');
+  if(el){el.style.display='none';el.textContent='';el.removeAttribute('title');el.removeAttribute('aria-label');}
 }
 function _moveLiveRunStatusToTurnEnd(el){
   el=el||$('liveRunStatus');
@@ -13820,6 +16392,8 @@ function placeLiveRunStatusHost(){
   return _moveLiveRunStatusToTurnEnd(el);
 }
 function showLiveRunStatus(sid,opts){
+  const startedAt=opts&&opts.startedAt||null;
+  showThreadElapsedTimer(sid,startedAt);
   if(typeof isCompactWorklogMode==='function'&&isCompactWorklogMode()){
     _liveRunStatusSessionId=sid;
     _liveRunStatusTokens=opts&&opts.tokens||null;
@@ -13830,11 +16404,10 @@ function showLiveRunStatus(sid,opts){
   const el=placeLiveRunStatusHost();
   if(!el)return;
   _liveRunStatusSessionId=sid;
-  const startedAt=opts&&opts.startedAt||null;
   _liveRunStatusTokens=opts&&opts.tokens||null;
   el.hidden=false;
   _renderLiveRunStatusContent(el,startedAt);
-  _startLiveRunStatusTimer(sid,startedAt);
+  showThreadElapsedTimer(sid,startedAt);
 }
 function _renderLiveRunStatusContent(el,startedAt){
   if(!el)return;
@@ -13878,22 +16451,40 @@ function hideLiveRunStatus(sid){
   const el=$('liveRunStatus');
   if(el){el.hidden=true;el.innerHTML='';}
   _clearLiveRunStatusTimer(sid||_liveRunStatusSessionId);
+  hideThreadElapsedTimer(sid||_threadElapsedTimerSessionId);
   _liveRunStatusTokens=null;
   _liveRunStatusSessionId=null;
 }
 function _startLiveRunStatusTimer(sid,startedAt){
   if(!sid)return;
+  const start=Number(startedAt);
+  if(!Number.isFinite(start)||start<=0)return;
+  for(const otherSid of Object.keys(_liveRunStatusTimers)){
+    if(otherSid!==sid)_clearLiveRunStatusTimer(otherSid);
+  }
+  const existing=_liveRunStatusTimers[sid];
+  if(existing&&Math.abs(Number(existing.startedAt)-start)<0.001){
+    _renderThreadElapsedTimer(sid,start);
+    return;
+  }
   _clearLiveRunStatusTimer(sid);
-  _liveRunStatusTimers[sid]={startedAt,interval:setInterval(()=>{
+  _renderThreadElapsedTimer(sid,start);
+  _liveRunStatusTimers[sid]={startedAt:start,interval:setInterval(()=>{
+    const currentSid=S.session&&S.session.session_id;
+    const currentRunning=!!(currentSid===sid&&(S.busy||S.activeStreamId||(S.session&&(S.session.active_stream_id||S.session.pending_user_message))));
+    if(!currentRunning){_clearLiveRunStatusTimer(sid);return;}
+    _renderThreadElapsedTimer(sid,start);
     const el=$('liveRunStatus');
-    if(!el||el.hidden){_clearLiveRunStatusTimer(sid);return;}
-    if(_liveRunStatusSessionId!==sid)return;
-    _renderLiveRunStatusContent(el,startedAt);
+    if(el&&!el.hidden&&_liveRunStatusSessionId===sid)_renderLiveRunStatusContent(el,start);
   },1000)};
 }
 function _clearLiveRunStatusTimer(sid){
   const t=_liveRunStatusTimers[sid];
   if(t){clearInterval(t.interval);delete _liveRunStatusTimers[sid];}
+  if(_threadElapsedTimerSessionId===sid){
+    const el=$('threadElapsedTimer');
+    if(el){el.style.display='none';el.textContent='';el.removeAttribute('title');el.removeAttribute('aria-label');}
+  }
 }
 function ensureRunActivityForCurrentTurn(){
   // Phase C: disabled — top live run Activity card removed
@@ -15556,6 +18147,10 @@ function _maybeRecoverVirtualizedBlankViewport(options, preserveScroll, virtualW
     _sessionHtmlCache.delete(_sessionHtmlCacheSid);
   }
   _messageVirtualWindowKey='';
+  if(typeof _streamUiDiagnostic==='function') _streamUiDiagnostic('virtualization','virtual-window-invalidated',{
+    reason:'blank-viewport-recovery',
+    previous_window:virtualWindow,
+  });
   renderMessages({preserveScroll:true,_virtualFallback:true});
   return true;
 }
@@ -15575,6 +18170,14 @@ function renderMessages(options){
     _hydrateIdLinkedHistoricalToolScenes(S.messages,{sessionId:sid,mode:activityMode});
   }
   const msgCount=S.messages.length;
+  const liveInflight=sid&&INFLIGHT[sid];
+  if(typeof _streamUiDiagnostic==='function') _streamUiDiagnostic('chat-component','render-started',{
+    session_id:sid,
+    message_count:msgCount,
+    preserve_scroll:preserveScroll,
+    content_version:Number(liveInflight&&liveInflight.streamContentVersion)||0,
+    stored_content_length:String(liveInflight&&liveInflight.lastAssistantText||'').length,
+  });
   // During session switch, S.messages is intentionally cleared while the full
   // message fetch is still in flight. Other async updates can still call
   // renderMessages() in this window. Keep the existing loading placeholder.
@@ -15593,6 +18196,14 @@ function renderMessages(options){
     ? {virtualized:false,start:0,end:visWithIdx.length,topPad:0,bottomPad:0,total:visWithIdx.length,tailStart:visWithIdx.length}
     : _currentMessageVirtualWindow(visWithIdx,_messageVirtualKeepTailCount());
   const renderWindowKey=_messageVirtualWindowKeyFor(virtualWindow);
+  if(typeof _streamUiDiagnostic==='function') _streamUiDiagnostic('virtualization','virtual-window-evaluated',{
+    session_id:sid,
+    virtualized:!!virtualWindow.virtualized,
+    start:virtualWindow.start,
+    end:virtualWindow.end,
+    total:virtualWindow.total,
+    key:renderWindowKey,
+  });
   const windowStart=virtualWindow.start;
   const windowEnd=virtualWindow.end;
   const renderHeadVisWithIdx=visWithIdx.slice(windowStart, windowEnd);
@@ -15633,6 +18244,12 @@ function renderMessages(options){
       requestAnimationFrame(()=>_postProcessWithAnchorSuppression(inner));
       if(typeof _initMediaPlaybackObserver==='function') _initMediaPlaybackObserver();
       if(typeof loadTodos==='function'&&document.getElementById('panelTodos')&&document.getElementById('panelTodos').classList.contains('active')){loadTodos();}
+      if(typeof _streamUiDiagnostic==='function') _streamUiDiagnostic('chat-component','render-committed',{
+        session_id:sid,
+        source:'session-html-cache',
+        message_count:msgCount,
+        rendered_text_length:String(inner.textContent||'').length,
+      });
       return;
     }
   }
@@ -15911,6 +18528,7 @@ function renderMessages(options){
     }
     return -1;
   })();
+  const assistantModifiedFilesByFinalRawIdx=_assistantTurnModifiedFilesByFinalRawIdx(renderVisWithIdx);
   // Windowed render loop replaces the legacy full loop:
   // for(let vi=0;vi<visWithIdx.length;vi++)
   for(let vi=0;vi<renderVisWithIdx.length;vi++){
@@ -16014,7 +18632,11 @@ function renderMessages(options){
         return _renderAttachmentHtml(fname,fileUrl);
       }).join('')}</div>`;
     }
-    let bodyHtml = _getCachedRender(displayContent, isUser);
+    const persistedParts = isUser && _browserWorkbenchContextPartsHaveElement(m.parts) ? m.parts : (m&&m.browser_context_parts);
+    const browserContextParts = isUser ? (_browserWorkbenchContextPartsHaveElement(persistedParts)?persistedParts:parseBrowserWorkbenchContext(displayContent)) : null;
+    const hasParsedBrowserContext = _browserWorkbenchContextPartsHaveElement(browserContextParts);
+    const contextHtml = isUser && !hasParsedBrowserContext ? _browserContextMessageHtml(m.context_items) : '';
+    let bodyHtml = hasParsedBrowserContext ? _renderBrowserWorkbenchContextPartsHtml(browserContextParts, isUser) : _getCachedRender(displayContent, isUser);
     if(!isUser&&m.provider_details){
       const summary=m.provider_details_label||'Provider details';
       bodyHtml += `<details class="provider-error-details"><summary>${esc(String(summary))}</summary><pre><code>${esc(String(m.provider_details))}</code></pre></details>`;
@@ -16027,6 +18649,7 @@ function renderMessages(options){
     const statusHtml = (!isUser&&m._statusCard) ? _statusCardHtml(m._statusCard) : '';
     const isEditableUser=isUser&&rawIdx===lastUserRawIdx;
     const editBtn  = isEditableUser ? `<button class="msg-action-btn" title="${t('edit_message')}" onclick="editMessage(this)">${li('pencil',13)}</button>` : '';
+    const redoBtn  = isUser ? `<button class="msg-action-btn" title="${t('redo_from_here')}" onclick="redoFromMessage(this)">${li('rotate-ccw',13)}</button>` : '';
     const undoBtn  = isLastAssistant ? `<button class="msg-action-btn" title="${t('undo_exchange')}" onclick="undoLastExchange()">${li('undo',13)}</button>` : '';
     const retryBtn = isLastAssistant ? `<button class="msg-action-btn" title="${t('regenerate')}" onclick="regenerateResponse(this)">${li('rotate-ccw',13)}</button>` : '';
     const copyBtn  = `<button class="msg-copy-btn msg-action-btn" title="${t('copy')}" onclick="copyMsg(this)">${li('copy',13)}</button>`;
@@ -16054,7 +18677,7 @@ function renderMessages(options){
     const questionJumpBtn = (_qJumpTarget!==undefined&&_qJumpTarget!==null)
       ? _questionJumpButtonHtml(_qJumpTarget, assistantRawIdxByQuestionRawIdx.get(_qJumpTarget)??rawIdx)
       : '';
-    const footHtml = `<div class="msg-foot">${timeHtml}<span class="msg-actions">${editBtn}${ttsBtn}${forkBtn}${copyBtn}${retryBtn}</span>${questionJumpBtn}</div>`;
+    const footHtml = `<div class="msg-foot">${timeHtml}<span class="msg-actions">${editBtn}${redoBtn}${ttsBtn}${forkBtn}${copyBtn}${retryBtn}</span>${questionJumpBtn}</div>`;
 
     if(_isContextCompactionMessage(m)){
       continue;
@@ -16101,7 +18724,7 @@ function renderMessages(options){
       let row=_msgNodeRecycleEnabled?_recycleStash.get(rawIdx):null;
       if(row&&(!row.classList.contains('msg-row')||row.classList.contains('assistant-turn'))) row=null;
       const newRawText=String(displayContent).trim();
-      const nextRowHtml=`${filesHtml}<div class="msg-body">${bodyHtml}</div>${footHtml}`;
+      const nextRowHtml=`${filesHtml}${contextHtml}<div class="msg-body">${bodyHtml}</div>${footHtml}`;
       if(row){
         row.className='msg-row';
         row.id=_userMessageDomId(rawIdx);
@@ -16223,7 +18846,13 @@ function renderMessages(options){
     seg.dataset.rawText=String(content).trim();
     if(m._activityBurstId!==undefined&&m._activityBurstId!==null) seg.setAttribute('data-activity-burst-id',String(m._activityBurstId));
     if(Number.isFinite(Number(m._liveSegmentSeq))) seg.setAttribute('data-live-segment-seq',String(Number(m._liveSegmentSeq)));
-    const messageBelongsInWorklog=!S.busy&&isCompactWorklogMode()&&_assistantMessageBelongsInWorklog(m, rawIdx, toolCallAssistantIdxs, displayContent, {isTurnFinalAssistant});
+    const modifiedFilesHtml=(!m._live&&isTurnFinalAssistant&&!_assistantMessageHasAnchorMutationFiles(m))
+      // Live mutation cards stay expanded while work is streaming. The recap
+      // repeats those diffs after settlement, so keep both its group and file
+      // rows compact until the reader explicitly opens what they need.
+      ? _assistantModifiedFilesSummaryHtml(assistantModifiedFilesByFinalRawIdx.get(rawIdx)||[],{finalRecap:true})
+      : '';
+    const messageBelongsInWorklog=!S.busy&&isCompactWorklogMode()&&!modifiedFilesHtml&&_assistantMessageBelongsInWorklog(m, rawIdx, toolCallAssistantIdxs, displayContent, {isTurnFinalAssistant});
     if(messageBelongsInWorklog){
       seg.classList.add('assistant-segment-worklog-source');
       seg.setAttribute('aria-hidden','true');
@@ -16258,7 +18887,7 @@ function renderMessages(options){
     // Stays OUT of the inline-content `thinkingText` extraction block (#2565) and
     // only fires for empty-content/no-inline-thinking turns, so answer-bearing
     // messages are unchanged.
-    if(!isUser&&!m._live&&!isSimplifiedToolCalling()&&!thinkingText&&!String(content||'').trim()&&!filesHtml&&!statusHtml){
+    if(!isUser&&!m._live&&!isSimplifiedToolCalling()&&!thinkingText&&!String(content||'').trim()&&!filesHtml&&!contextHtml&&!statusHtml){
       const _reasoningPayload=_assistantReasoningPayloadText(m);
       if(_reasoningPayload) thinkingText=_reasoningPayload;
     }
@@ -16266,11 +18895,21 @@ function renderMessages(options){
       if((isCompactWorklogMode()||isTransparentStream())&&_assistantThinkingBelongsInWorklog(m, rawIdx, toolCallAssistantIdxs)) assistantThinking.set(rawIdx, thinkingText);
       else if(window._showThinking!==false) seg.insertAdjacentHTML('beforeend', _thinkingCardHtml(thinkingText));
     }
-    const hasVisibleBody=!!(String(content||'').trim()||filesHtml||statusHtml||recoveryHtml);
+    const hasVisibleBody=!!(String(content||'').trim()||filesHtml||contextHtml||statusHtml||recoveryHtml||modifiedFilesHtml);
     if(statusHtml){
-      seg.insertAdjacentHTML('beforeend', statusHtml);
+      // A terminal status supplements the settled answer; it must never replace
+      // text the agent already streamed/persisted (for example the graceful
+      // summary produced after reaching the tool-iteration limit).
+      const bodyPart=String(content||'').trim()||filesHtml||contextHtml
+        ? `${filesHtml}${contextHtml}<div class="msg-body">${bodyHtml}</div>`
+        : '';
+      const bodyFoot=bodyPart||modifiedFilesHtml?footHtml:'';
+      seg.insertAdjacentHTML('beforeend', `${statusHtml}${bodyPart}${modifiedFilesHtml}${bodyFoot}`);
     }else if(hasVisibleBody){
-      seg.insertAdjacentHTML('beforeend', `${filesHtml}<div class="msg-body">${bodyHtml}</div>${footHtml}`);
+      const bodyPart=String(content||'').trim()||filesHtml||contextHtml
+        ? `${filesHtml}${contextHtml}<div class="msg-body">${bodyHtml}</div>`
+        : '';
+      seg.insertAdjacentHTML('beforeend', `${bodyPart}${modifiedFilesHtml}${footHtml}`);
     }else if(!(thinkingText&&window._showThinking!==false&&!isSimplifiedToolCalling())){
       seg.classList.add('assistant-segment-anchor');
     }
@@ -16447,7 +19086,7 @@ function renderMessages(options){
       if(matchEntry){
         usedLiveToolMetadata.add(matchEntry.idx);
         const live=matchEntry.tc||{};
-        for(const key of ['activityBurstId','duration','started_at']){
+        for(const key of ['activityBurstId','duration','started_at','result','output','metadata','result_metadata','resultMetadata','output_kind','outputKind','severity','status','exit_code','exitCode','status_code','statusCode','http_status','httpStatus','success','ok','url','warnings']){
           if((next[key]===undefined||next[key]===null)&&live[key]!==undefined&&live[key]!==null) next[key]=live[key];
         }
       }
@@ -16769,9 +19408,17 @@ function renderMessages(options){
         }
         for(const toolCall of cards){
           event.toolCall=toolCall;
-          const toolRow=_decorateTransparentEventRow(buildToolCard(event.toolCall),{
+          const mutationItems=_assistantLiveMutationItemsFromToolCall(event.toolCall);
+          const baseNode=mutationItems.length
+            ? _assistantModifiedFilesNode(
+                mutationItems,
+                'assistant-anchor-modified-files-row assistant-timeline-mutation-event',
+                {collapsed:true}
+              )
+            : buildToolCard(event.toolCall);
+          const toolRow=_decorateTransparentEventRow(baseNode,{
             type:'tool',
-            name:event.toolCall&&event.toolCall.name,
+            name:mutationItems.length?'Modified file':event.toolCall&&event.toolCall.name,
             status:_transparentToolStatus(event.toolCall,true),
             toolCall:event.toolCall,
             ts:event.ts,
@@ -16790,7 +19437,14 @@ function renderMessages(options){
       _renderSettledAnchorSceneForMessage(msg, seg, rawIdx);
     }
   }
-  _restoreWorklogDetailDisclosureState(inner, worklogDetailDisclosureState);
+  // Reapply once now and once after Prism/structured-output layout settles.
+  // Streaming-adjacent renderMessages() rebuilds otherwise preserve the card's
+  // open state but can still clamp a nested Read/Shell/Raw viewport to line 1.
+  if(typeof _restoreLiveToolPresentation==='function'){
+    _restoreLiveToolPresentation(inner, worklogDetailDisclosureState);
+  }else{
+    _restoreWorklogDetailDisclosureState(inner, worklogDetailDisclosureState);
+  }
   // #5839 fix: deferred settled worklogs have no rows yet at restore time, so
   // the disclosure restore above can't reach their detail elements. Stash the
   // captured state on each still-deferred group; _materializeDeferredWorklogRows
@@ -17140,6 +19794,14 @@ function renderMessages(options){
   }
   _recycleStash.clear();
   if(typeof _deferClearProgrammaticScroll==='function') _deferClearProgrammaticScroll(160);
+  if(typeof _streamUiDiagnostic==='function') _streamUiDiagnostic('chat-component','render-committed',{
+    session_id:sid,
+    source:'transcript-rebuild',
+    message_count:msgCount,
+    rendered_text_length:String(inner.textContent||'').length,
+    virtual_window_key:renderWindowKey,
+    content_version:Number(liveInflight&&liveInflight.streamContentVersion)||0,
+  });
 }
 
 function _toolDisplayName(tc){
@@ -17650,6 +20312,1705 @@ function _toolDetailLeadText(kind, tc){
   if(!target) return '';
   return target;
 }
+function _toolDiagnosticRawOutput(tc){
+  if(!tc||typeof tc!=='object')return'';
+  // Completion adapters are not uniform: some put the meaningful structured
+  // wrapper at `result`/`output` while leaving a generic or truncated preview
+  // in `snippet`. Prefer an authoritative document wrapper in that case so
+  // recursive classification and the raw drawer are based on the same value.
+  // Ordinary result metadata (for example `{exit_code: 0}`) must not displace
+  // the actual snippet/stdout.
+  const structuredRaw=value=>{
+    if(value===undefined||value===null||value==='')return null;
+    let parsed=value;
+    if(typeof value==='string'){
+      const trimmed=value.trim();
+      if(!trimmed||!(trimmed[0]==='{'||trimmed[0]==='['))return null;
+      const envelope=_toolOutputSafeJsonEnvelope(value);
+      if(!envelope.ok)return null;
+      parsed=envelope.value;
+    }
+    if(!parsed||typeof parsed!=='object'||Array.isArray(parsed))return null;
+    // Detect the document by its parsed VALUES, not a key allowlist. Search,
+    // inspection, and MCP tools routinely return dynamically named fields such
+    // as `matches_text` or `geometry_dump`; their authoritative object must win
+    // over a generic `snippet` just as a `{content: ...}` wrapper does.
+    if(!_toolOutputStructuredDocument(parsed,0,false))return null;
+    if(typeof value==='string')return value;
+    try{return JSON.stringify(value,null,2);}catch(_){return String(value);}
+  };
+  for(const value of [tc.result,tc.output]){
+    const authoritative=structuredRaw(value);
+    if(authoritative!==null)return authoritative;
+  }
+  // Some adapters put the full search/read/browser result in result_metadata
+  // while `snippet` is only an invalid, ellipsis-truncated JSON preview. Let
+  // metadata replace that unusable preview, but do not displace ordinary exact
+  // stdout merely because metadata also contains a multiline `stdout` field.
+  const preview=String(tc.snippet??tc.preview??'').trim();
+  let invalidStructuredPreview=false;
+  if(preview&&(preview[0]==='{'||preview[0]==='[')){
+    try{JSON.parse(preview);}catch(_){invalidStructuredPreview=true;}
+  }
+  const genericPreview=/^(?:completed|complete|success|ok|done|running|failed|(?:search|read|browser|operation|command|tool)(?:\s+\w+){0,3}\s+completed)$/i.test(preview);
+  if(!preview||invalidStructuredPreview||genericPreview){
+    for(const value of [tc.result_metadata,tc.resultMetadata,tc.metadata]){
+      const authoritative=structuredRaw(value);
+      if(authoritative!==null)return authoritative;
+    }
+  }
+  for(const value of [tc.snippet,tc.output,tc.result,tc.preview,tc.result_metadata,tc.resultMetadata,tc.metadata]){
+    if(value===undefined||value===null||value==='')continue;
+    if(typeof value==='string')return value;
+    try{return JSON.stringify(value,null,2);}catch(_){return String(value);}
+  }
+  return'';
+}
+function _toolOutputStructuredMetadata(tc){
+  if(!tc||typeof tc!=='object')return{};
+  const candidates=[tc.result,tc.output,tc.metadata,tc.result_metadata,tc.resultMetadata];
+  const merged={};
+  for(const value of candidates){
+    if(value&&typeof value==='object'&&!Array.isArray(value))Object.assign(merged,value);
+  }
+  return merged;
+}
+function _toolOutputExitCode(tc,metadata){
+  const meta=metadata&&typeof metadata==='object'?metadata:_toolOutputStructuredMetadata(tc);
+  const values=[tc&&tc.exit_code,tc&&tc.exitCode,meta.exit_code,meta.exitCode,meta.return_code,meta.returnCode];
+  for(const value of values){
+    if(value===undefined||value===null||value==='')continue;
+    const parsed=Number(value);
+    if(Number.isInteger(parsed))return parsed;
+  }
+  return null;
+}
+function _toolOutputHttpStatus(tc,metadata,raw){
+  const meta=metadata&&typeof metadata==='object'?metadata:_toolOutputStructuredMetadata(tc);
+  const values=[tc&&tc.http_status,tc&&tc.status_code,tc&&tc.statusCode,meta.http_status,meta.httpStatus,meta.status_code,meta.statusCode];
+  for(const value of values){
+    const parsed=Number(value);
+    if(Number.isInteger(parsed)&&parsed>=100&&parsed<=599)return parsed;
+  }
+  const source=String(raw||'');
+  const match=source.match(/\bHTTP(?:\/\d(?:\.\d)?)?\s+([1-5]\d{2})\b/i)
+    ||source.match(/\b[A-Za-z][A-Za-z0-9_-]*_http\s*=\s*([1-5]\d{2})\b/i);
+  return match?Number(match[1]):null;
+}
+function _toolOutputTestSummary(raw,metadata){
+  const meta=metadata&&typeof metadata==='object'?metadata:{};
+  const nested=meta.tests&&typeof meta.tests==='object'?meta.tests:{};
+  let source=String(raw||'');
+  const parsed=_toolOutputSafeJsonEnvelope(source);
+  const structuredSources=[];
+  if(parsed.ok&&parsed.value&&typeof parsed.value==='object'&&!Array.isArray(parsed.value))structuredSources.push(parsed.value);
+  structuredSources.push(meta);
+  for(const candidate of structuredSources){
+    const document=_toolOutputStructuredDocument(candidate,0,false);
+    if(document&&typeof document.value==='string'&&document.value.split(/\r?\n/).length>1){
+      source=document.value;
+      break;
+    }
+  }
+  const count=(name,aliases)=>{
+    // `total_count` is a common repository/search result field and is not a
+    // test signal. Only accept test-specific total fields at the top level;
+    // generic count names remain valid inside an explicit `tests` object.
+    const metadataValues=name==='total'
+      ?[nested[name],typeof meta.tests==='number'?meta.tests:undefined,meta.total_tests,meta.totalTests,meta.test_count,meta.testCount]
+      :[nested[name],meta[name],meta[`${name}_count`]];
+    for(const value of metadataValues){
+      const parsed=Number(value);
+      if(Number.isInteger(parsed)&&parsed>=0)return{value:parsed,found:true};
+    }
+    const words=(aliases||[name]).join('|');
+    const after=source.match(new RegExp(`(?:^|\\n)\\s*(?:[ℹ#]\\s*)?(?:${words})\\s*[:=]?\\s*(\\d+)\\s*$`,'im'));
+    if(after)return{value:Number(after[1]),found:true};
+    const before=source.match(new RegExp(`\\b(\\d+)\\s+(?:${words})\\b`,'i'));
+    return before?{value:Number(before[1]),found:true}:{value:0,found:false};
+  };
+  const passed=count('passed',['pass','passed']);
+  const failed=count('failed',['fail','failed','failure','failures']);
+  const skipped=count('skipped',['skip','skipped']);
+  const total=count('total',['tests?','total(?:\\s+tests?)?']);
+  let duration='';
+  for(const value of [nested.duration,meta.duration,meta.duration_ms,meta.durationMs]){
+    if(value===undefined||value===null||value==='')continue;
+    duration=String(value)+(String(value).match(/(?:ms|s)$/i)?'':'ms');
+    break;
+  }
+  if(!duration){
+    const durationMatch=source.match(/(?:^|\n)\s*(?:[ℹ#]\s*)?duration(?:_ms)?\s*[:=]?\s*([0-9.]+)\s*(ms|s)?\s*$/im);
+    if(durationMatch)duration=`${durationMatch[1]}${durationMatch[2]||'ms'}`;
+  }
+  return{
+    // Duration is ordinary command metadata too (Prettier, builds, searches,
+    // and migrations all expose it), so it cannot classify a result as tests
+    // without at least one real test-count signal.
+    detected:passed.found||failed.found||skipped.found||total.found,
+    total:total.value,
+    passed:passed.value,
+    failed:failed.value,
+    skipped:skipped.value,
+    duration,
+    source,
+  };
+}
+function _toolOutputTestCounts(raw,metadata){
+  const summary=_toolOutputTestSummary(raw,metadata);
+  return{passed:summary.passed,failed:summary.failed,skipped:summary.skipped};
+}
+function _toolOutputExecutionStatus(tc,metadata,exitCode){
+  const meta=metadata&&typeof metadata==='object'?metadata:{};
+  const status=String(meta.execution_status||meta.executionStatus||meta.status||tc&&tc.status||'').trim().toLowerCase();
+  if(/^(?:cancelled|canceled|interrupted|aborted)$/.test(status))return'cancelled';
+  if(tc&&tc.done===false)return'running';
+  if(tc&&tc.is_error||meta.success===false||meta.ok===false||(Number.isInteger(exitCode)&&exitCode!==0)||/^(?:error|failed|failure|fatal)$/.test(status))return'failed';
+  return'completed';
+}
+function _toolOutputKind(tc,toolKind){
+  if(!tc)return null;
+  const raw=_toolDiagnosticRawOutput(tc);
+  const name=String(tc.name||'').replace(/^functions\./,'').toLowerCase();
+  const command=String(_toolFullCommandLabel(tc)||_toolTargetLabel(tc)||'');
+  const args=tc.args&&typeof tc.args==='object'&&!Array.isArray(tc.args)?tc.args:{};
+  const codeInvocation=String(args.code||args.script||tc.code||tc.script||'');
+  // A shell start event already has a stable command even though it has no
+  // result body yet. Route that event through the same command model used at
+  // completion; non-shell streaming content continues to use its existing
+  // cheap/plain renderer until it settles.
+  if(tc.done===false)return toolKind==='shell'&&(command||codeInvocation)?'command-output':null;
+  const metadata=_toolOutputStructuredMetadata(tc);
+  const explicit=String(metadata.output_kind||metadata.outputKind||metadata.severity||metadata.level||metadata.kind||'').trim().toLowerCase().replace(/[_ ]+/g,'-');
+  const explicitKinds={
+    'live-diff':'live-diff',diff:'live-diff',patch:'live-diff',
+    error:'error',failed:'error',failure:'error',fatal:'error',exception:'error',
+    warning:'warning',warn:'warning',deprecated:'warning',
+    success:'success',passed:'success',completed:'success',complete:'success',ok:'success',
+    info:'info',information:'info',notice:'info',
+    'test-result':'test-result',tests:'test-result',test:'test-result',
+    'repository-summary':'repository-summary','change-summary':'repository-summary',
+    'command-output':'command-output',command:'command-output',raw:'raw',debug:'raw',
+  };
+  const isDiff=tc.is_diff===true||(typeof _workspaceDiffLooksUseful==='function'
+    ? _workspaceDiffLooksUseful(raw)
+    : (typeof _snippetLooksLikeDiff==='function'&&_snippetLooksLikeDiff(raw)));
+  const isWrite=toolKind==='write'||/^(?:write_file|patch|edit_file|create_file|apply_patch|mcp_filesystem_write_file|mcp_filesystem_edit_file)$/.test(name);
+  const writeStatus=String(metadata.status||tc.status||'').toLowerCase();
+  const writeExitCode=_toolOutputExitCode(tc,metadata);
+  const writeFailed=!!tc.is_error||metadata.success===false||metadata.ok===false||(writeExitCode!==null&&writeExitCode!==0)||/^(?:error|failed|failure|fatal)$/.test(writeStatus)||/(?:patch (?:validation )?failed|patch could not be applied|could not apply patch|hunk\s+#?\d+[^\n]*(?:failed|not found|context|match))/i.test(raw);
+  if(isDiff||(explicitKinds[explicit]==='live-diff'&&!writeFailed)||(isWrite&&!writeFailed))return'live-diff';
+  const preview=tc.mutation_preview||tc.mutationPreview||{};
+  const structuredFiles=preview&&Array.isArray(preview.files)?preview.files:[];
+  const repository=typeof _toolChangeSummaryData==='function'
+    ?_toolChangeSummaryData(raw,command,structuredFiles)
+    :{detected:false};
+  const repositoryFailed=writeFailed||/(?:command not found|not recognized as (?:an internal|a command)|authentication failed|permission denied|fatal:|error:|failed to|could not|unable to|unauthorized|forbidden|timed?\s*out|no such file)/i.test(raw);
+  if(repository.detected&&!repositoryFailed)return'repository-summary';
+  if(explicitKinds[explicit]&&explicitKinds[explicit]!=='live-diff')return explicitKinds[explicit];
+  const parsedRaw=_toolOutputSafeJsonEnvelope(raw);
+  if(parsedRaw.ok&&parsedRaw.value&&typeof parsedRaw.value==='object'&&!Array.isArray(parsedRaw.value)){
+    const schema=parsedRaw.value;
+    const schemaStatus=String(schema.status||'').toLowerCase();
+    if(schema.success===false||schema.ok===false||schema.error||/^(?:error|failed|failure|fatal)$/.test(schemaStatus))return'error';
+    if(schema.warning||schema.warnings&&(!Array.isArray(schema.warnings)||schema.warnings.length)||/^(?:warning|warn|degraded)$/.test(schemaStatus))return'warning';
+    if(schema.success===true||schema.ok===true||/^(?:success|passed|completed|complete|ok)$/.test(schemaStatus))return'success';
+  }
+  const testSummary=_toolOutputTestSummary(raw,metadata);
+  const counts={passed:testSummary.passed,failed:testSummary.failed,skipped:testSummary.skipped};
+  const testSignal=/\b(?:pytest|vitest|jest|mocha|ava|cargo\s+test|go\s+test|npm\s+(?:run\s+)?test|pnpm\s+(?:run\s+)?test|yarn\s+test)\b/i.test(command)
+    ||/(?:^|\s)(?:node|tsx)\s+--test(?:\s|$)|(?:^|\s)--test(?:\s|$)/i.test(command)
+    ||testSummary.detected||counts.passed>0||counts.failed>0||counts.skipped>0||/^\s*(?:PASS|FAIL)\s+/m.test(raw);
+  if(testSignal)return'test-result';
+  const parsedStatusMetadata=parsedRaw.ok&&parsedRaw.value&&typeof parsedRaw.value==='object'&&!Array.isArray(parsedRaw.value)
+    ?{...parsedRaw.value,...metadata}
+    :metadata;
+  const exitCode=_toolOutputExitCode(tc,parsedStatusMetadata);
+  const httpStatus=_toolOutputHttpStatus(tc,parsedStatusMetadata,raw);
+  if(parsedStatusMetadata.success===false||parsedStatusMetadata.ok===false||parsedStatusMetadata.error||tc.is_error||exitCode!==null&&exitCode!==0||httpStatus!==null&&httpStatus>=400)return'error';
+  const warnings=parsedStatusMetadata.warnings||parsedStatusMetadata.warning;
+  if(warnings&&(!Array.isArray(warnings)||warnings.length))return'warning';
+  const status=String(parsedStatusMetadata.status||tc.status||'').toLowerCase();
+  if(/^(?:error|failed|failure|fatal)$/.test(status))return'error';
+  if(/^(?:warning|warn|degraded)$/.test(status))return'warning';
+  if(/^(?:success|passed|completed|complete|ok)$/.test(status)||metadata.success===true||metadata.ok===true)return'success';
+  // Content heuristics are deliberately restricted to command output. Source
+  // code can contain words such as `error` or `warning` without being a result.
+  if(toolKind==='shell'){
+    if(/(?:^|\n)\s*(?:warning:|warn:)|\bdeprecated\b/i.test(raw))return'warning';
+    if(/(?:command not found|not recognized as (?:an internal|a command)|permission denied|fatal:|error:|failed to|exception:|traceback \(most recent call last\)|connection refused|timed?\s*out)/i.test(raw))return'error';
+    if(exitCode===0)return'success';
+    return'command-output';
+  }
+  if(explicit==='info')return'info';
+  return'raw';
+}
+function _toolOutputDisplayText(raw){
+  const text=String(raw??'');
+  const trimmed=text.trim();
+  if(trimmed.length>=2&&trimmed[0]==='"'&&trimmed[trimmed.length-1]==='"'){
+    try{
+      const decoded=JSON.parse(trimmed);
+      if(typeof decoded==='string')return decoded.replace(/\r\n/g,'\n');
+    }catch(_){/* Ordinary output containing literal backslashes stays literal. */}
+  }
+  return text.replace(/\r\n/g,'\n');
+}
+function _toolOutputCollapsedLines(text){
+  const lines=String(text??'').split('\n');
+  const out=[];
+  for(const line of lines){
+    const previous=out[out.length-1];
+    if(line&&previous&&previous.text===line){previous.count+=1;continue;}
+    out.push({text:line,count:1});
+  }
+  return out;
+}
+function _toolOutputDefaultExpanded(kind,raw,counts){
+  const text=String(raw||'');
+  const lines=text?text.split('\n').length:0;
+  if(kind==='error')return true;
+  if(kind==='test-result')return !!(counts&&counts.failed>0);
+  if(kind==='warning')return lines<=14&&text.length<=1600;
+  if(kind==='info'||kind==='command-output')return lines<=10&&text.length<=1000;
+  return false;
+}
+function _toolOutputLooksLikeUrl(value){
+  return /^https?:\/\/[^\s]+$/i.test(String(value||'').trim());
+}
+function _toolOutputBrowserContext(tc,toolKind,metadata,parsedValue){
+  const name=String(tc&&tc.name||'').replace(/^functions\./,'').toLowerCase();
+  const meta=metadata&&typeof metadata==='object'?metadata:{};
+  const explicit=String(meta.output_kind||meta.outputKind||meta.kind||'').toLowerCase().replace(/[_ ]+/g,'-');
+  const value=parsedValue&&typeof parsedValue==='object'&&!Array.isArray(parsedValue)?parsedValue:null;
+  const knownShape=!!(value&&typeof value.url==='string'&&['title','snapshot','page_snapshot','accessibility_tree','rows','ready'].some(key=>Object.prototype.hasOwnProperty.call(value,key)));
+  const explicitBrowser=/(?:browser|playwright|puppeteer|accessibility|page_snapshot|page_inspect|dom_inspect|geometry)/.test(name)
+    ||/^(?:browser-result|page-snapshot|page-inspection|browser-check)$/.test(explicit);
+  return explicitBrowser||(toolKind!=='shell'&&knownShape);
+}
+function _toolOutputOperationLabel(tc,toolKind){
+  const raw=String(tc&&tc.name||'').replace(/^functions\./,'').trim();
+  const normalized=raw
+    .replace(/([a-z0-9])([A-Z])/g,'$1_$2')
+    .replace(/[^A-Za-z0-9]+/g,'_')
+    .replace(/^_+|_+$/g,'')
+    .toLowerCase();
+  const aliases={
+    read_file:'Read file',read_text:'Read text',view_file:'View file',
+    search_files:'Search files',list_files:'List files',write_file:'Write file',
+    edit_file:'Edit file',apply_patch:'Apply patch',browser_inspect:'Browser inspect',
+    page_snapshot:'Page snapshot',skill_manage:'Manage skill',skill_view:'View skill',
+    execute_code:'Execute code',
+  };
+  if(aliases[normalized])return aliases[normalized];
+  if(String(toolKind||'')==='shell')return'';
+  if(normalized){
+    const words=normalized.replace(/_/g,' ');
+    return words.replace(/^\w/,char=>char.toUpperCase());
+  }
+  const fallback={read:'Read file',list:'List files',search:'Search',web:'Web check',write:'File update',skill:'Skill operation',memory:'Memory update',delegate:'Delegated task',unknown:'Tool operation'};
+  return fallback[String(toolKind||'')]||fallback.unknown;
+}
+function _toolOutputInvocationInfo(tc,toolKind,metadata,targetLabel){
+  const tool=tc&&typeof tc==='object'?tc:{};
+  const args=tool.args&&typeof tool.args==='object'&&!Array.isArray(tool.args)?tool.args:{};
+  const meta=metadata&&typeof metadata==='object'?metadata:{};
+  const name=String(tool.name||'').replace(/^functions\./,'').toLowerCase().replace(/[^a-z0-9]+/g,'_');
+  const redact=value=>{
+    const source=String(value??'');
+    if(typeof _redactToolTargetLabel==='function'){
+      try{return _redactToolTargetLabel(source)}catch(_){return source}
+    }
+    return source;
+  };
+  const codeValue=args.code??args.script??tool.code??tool.script;
+  if(String(toolKind||'')==='shell'&&typeof codeValue==='string'&&codeValue){
+    const pythonCode=name==='execute_code'||/(?:^|_)(?:execute|run)_code(?:_|$)/.test(name);
+    const language=String(args.language||args.lang||meta.language||meta.code_language||meta.codeLanguage||meta.shell||(pythonCode?'python':''));
+    const label=args.code!==undefined||tool.code!==undefined?'Code':'Script';
+    return{kind:'code',label,value:redact(codeValue),language:_toolOutputPrismLanguage(language,codeValue,pythonCode?'python':'')};
+  }
+  const fullCommand=String(_toolFullCommandLabel(tool)||'');
+  if(fullCommand&&!_toolOutputLooksLikeUrl(fullCommand)){
+    const shell=String(meta.shell||meta.shell_type||meta.shellType||args.shell||'bash');
+    return{kind:'command',label:'Command',value:fullCommand,language:_toolOutputPrismLanguage(shell,fullCommand,'bash')};
+  }
+  const fields={};
+  const excluded=new Set(['command','cmd','code','script','patch','diff','old_string','new_string','content']);
+  for(const [key,value] of Object.entries(args)){
+    if(Object.keys(fields).length>=8||excluded.has(String(key).toLowerCase())||value===undefined||value===null)continue;
+    let display='';
+    if(typeof value==='string')display=redact(value);
+    else if(typeof value==='number'||typeof value==='boolean')display=String(value);
+    else{
+      try{display=redact(JSON.stringify(value))}catch(_){display=''}
+    }
+    if(!display||display===String(targetLabel||''))continue;
+    fields[key]=display.length>800?display.slice(0,797)+'…':display;
+  }
+  return Object.keys(fields).length?{kind:'parameters',label:'Inputs',fields}:null;
+}
+function _toolStructuredOutputInfo(tc,toolKind){
+  if(!tc)return null;
+  const raw=_toolDiagnosticRawOutput(tc);
+  const metadata=_toolOutputStructuredMetadata(tc);
+  const name=String(tc.name||'').replace(/^functions\./,'').toLowerCase();
+  const fullCommand=String(_toolFullCommandLabel(tc)||'');
+  const targetLabel=String(_toolTargetLabel(tc)||'');
+  const invocation=_toolOutputInvocationInfo(tc,toolKind,metadata,targetLabel);
+  const runningShell=tc.done===false&&toolKind==='shell'&&!!(invocation&&/^(?:command|code)$/.test(invocation.kind));
+  if(!raw.trim()&&!runningShell)return null;
+  const classifiedKind=_toolOutputKind(tc,toolKind);
+  if(!classifiedKind||classifiedKind==='live-diff'||classifiedKind==='repository-summary')return null;
+  const parsed=runningShell?{ok:false,value:null,remainder:''}:_toolOutputSafeJsonEnvelope(raw);
+  const parsedValue=parsed.ok?parsed.value:null;
+  const parsedMetadata=parsedValue&&typeof parsedValue==='object'&&!Array.isArray(parsedValue)
+    ?{...parsedValue,...metadata}
+    :metadata;
+  // A completed, non-error structured document is a successful tool result
+  // even when its schema does not redundantly include `success: true`. Keep
+  // unknown plain text neutral; only the confidently parsed/value-classified
+  // document path earns this status.
+  const completedStructuredResult=classifiedKind==='raw'&&tc.done!==false&&!tc.is_error&&parsed.ok&&parsedValue&&typeof parsedValue==='object'&&!Array.isArray(parsedValue)&&!!_toolOutputStructuredDocument(parsedValue,0,false);
+  const kind=completedStructuredResult?'success':classifiedKind;
+  const browserSignal=_toolOutputBrowserContext(tc,toolKind,metadata,parsedValue);
+  const targetIsUrl=_toolOutputLooksLikeUrl(targetLabel);
+  const fullCommandIsUrl=_toolOutputLooksLikeUrl(fullCommand);
+  const pathTarget=toolKind!=='shell'&&!fullCommand&&!targetIsUrl&&(/^(?:[A-Za-z]:[\\/]|\.{0,2}[\\/]|\/).+/.test(targetLabel)||/^[^\s]+\.[A-Za-z0-9]+(?::\d+(?::\d+)?)?$/.test(targetLabel));
+  const command=invocation&&invocation.kind==='command'
+    ?String(invocation.value||'')
+    :(fullCommand&&!fullCommandIsUrl?fullCommand:(toolKind==='shell'&&!targetIsUrl?targetLabel:''));
+  const target=pathTarget?targetLabel:'';
+  const exitCode=_toolOutputExitCode(tc,parsedMetadata);
+  const executionStatus=_toolOutputExecutionStatus(tc,parsedMetadata,exitCode);
+  const httpStatus=runningShell?null:_toolOutputHttpStatus(tc,parsedMetadata,raw);
+  const testSummary=runningShell
+    ?{detected:false,total:0,passed:0,failed:0,skipped:0,duration:'',source:''}
+    :_toolOutputTestSummary(raw,metadata);
+  const counts={passed:testSummary.passed,failed:testSummary.failed,skipped:testSummary.skipped};
+  const outputKind=browserSignal&&kind==='raw'?'info':kind;
+  const severity=outputKind==='test-result'?(counts.failed>0?'error':'success'):(outputKind==='command-output'||outputKind==='raw'?'info':outputKind);
+  const labels={error:'Error',warning:'Warning',success:'Success',info:'Info','test-result':'Tests','command-output':'Command',raw:'Raw'};
+  let label=labels[outputKind]||'Output';
+  let title={error:'Operation failed',warning:'Operation warning',success:'Operation completed',info:'Information','test-result':'Test results','command-output':'Command output',raw:'Raw output'}[outputKind]||'Output';
+  const operation=_toolOutputOperationLabel(tc,toolKind);
+  if(toolKind==='shell'){
+    label=executionStatus==='running'?'Running':executionStatus==='failed'?'Failed':executionStatus==='cancelled'?'Cancelled':'Completed';
+    title=invocation&&invocation.kind==='code'?(invocation.label==='Script'?'Script execution':'Code execution'):'Shell command';
+  }
+  if(browserSignal){
+    label='Browser result';
+    title=kind==='error'?'Browser check failed':'Browser check completed';
+  }
+  else if(operation&&toolKind!=='shell'){
+    if(outputKind==='error'||executionStatus==='failed')title=`${operation} failed`;
+    else if(outputKind==='warning')title=`${operation} warning`;
+    else if(executionStatus==='cancelled')title=`${operation} cancelled`;
+    else title=`${operation} completed`;
+  }
+  if(httpStatus!==null&&httpStatus>=400)title='Request failed';
+  else if(kind==='error'&&/\b(?:tsc|typescript)\b/i.test(command+raw))title='TypeScript compilation failed';
+  else if(kind==='error'&&/\bvalidat(?:e|ion)\b/i.test(command+raw))title='Validation failed';
+  const firstLine=runningShell?'':((raw.match(/(?:^|\r?\n)\s*([^\r\n]*\S)/)||[])[1]||'').trim();
+  let summary=firstLine.length>180?firstLine.slice(0,177)+'…':firstLine;
+  if(runningShell)summary='';
+  const metadataStructured=[metadata.data,metadata.result,metadata.output,metadata.body].find(value=>value!==null&&typeof value==='object');
+  const structuredValue=parsed.ok?parsed.value:metadataStructured;
+  const structuredDocument=structuredValue&&typeof structuredValue==='object'?_toolOutputStructuredDocument(structuredValue,0,false):null;
+  if(structuredValue!==null&&typeof structuredValue==='object'){
+    if(Array.isArray(structuredValue))summary=`Structured result · ${structuredValue.length} items`;
+    else if(Object.prototype.hasOwnProperty.call(structuredValue,'content')){
+      const content=structuredValue.content;
+      const lines=typeof content==='string'?content.split(/\r?\n/).length:0;
+      summary=lines>1?`Content · ${lines} lines`:'Structured content';
+    }else summary=`Structured result · ${Object.keys(structuredValue).length} fields`;
+  }else if(parsed.ok&&typeof parsed.value==='string'){
+    const decodedFirst=parsed.value.split(/\r?\n/).map(line=>line.trim()).find(Boolean)||'';
+    summary=decodedFirst.length>180?decodedFirst.slice(0,177)+'…':decodedFirst;
+  }
+  if(outputKind==='test-result')summary=[counts.passed?`${counts.passed} passed`:'',counts.failed?`${counts.failed} failed`:'',counts.skipped?`${counts.skipped} skipped`:''].filter(Boolean).join(' · ')||'Test command completed';
+  if(browserSignal)summary='';
+  // Keep compact summaries for ordinary read/content results. Semantic
+  // documents (for example a created skill) and documents unwrapped from
+  // stdout already have a dedicated body, so repeating their serialized
+  // first line in the header would be noise.
+  if(structuredDocument&&!browserSignal&&(structuredDocument.skillLike||structuredDocument.viaStdout))summary='';
+  if(structuredDocument&&structuredDocument.skillLike)title=outputKind==='error'?'Skill creation failed':'Skill created';
+  // A safely unwrapped read_file preview is already the primary source block.
+  // Repeating its first numbered line in the card summary both looks like raw
+  // output and leaves prefixes such as `108|` visible outside the gutter.
+  if(!parsed.ok&&!browserSignal&&/^(?:code|markdown)$/.test(_toolOutputContentKind(raw,targetLabel||metadata.language||'')))summary='';
+  const assignment=runningShell?null:raw.trim().match(/^([A-Za-z][A-Za-z0-9_-]*)_http\s*=\s*([1-5]\d{2})$/i);
+  if(assignment){
+    const service=assignment[1].replace(/[_-]+/g,' ').replace(/\b\w/g,char=>char.toUpperCase());
+    const status=Number(assignment[2]);
+    summary=`${service} ${status>=200&&status<400?'available':'unavailable'} · HTTP ${status}`;
+  }
+  let suggestion='';
+  if(!runningShell&&/command not found|not recognized as (?:an internal|a command)/i.test(raw))suggestion='Install the required command-line tool or use the configured alternative.';
+  else if(!runningShell&&/connection refused|failed to connect/i.test(raw))suggestion='Check whether the target service is running, then try again.';
+  const parsedUrl=parsedValue&&typeof parsedValue==='object'&&!Array.isArray(parsedValue)?parsedValue.url:'';
+  const url=String(metadata.url||parsedUrl||tc.url||(targetIsUrl?targetLabel:'')||(runningShell?'':((raw.match(/https?:\/\/[^\s<>"]+/)||[])[0])||''));
+  return {kind:outputKind,severity,label,title,summary,raw,command,invocation,operation,target,metadata,toolKind,executionStatus,exitCode,httpStatus,counts,testSummary,url,suggestion,expanded:executionStatus==='running'||_toolOutputDefaultExpanded(outputKind,raw,counts)};
+}
+function _toolOutputTokenHtml(text){
+  const source=String(text??'');
+  const pattern=/https?:\/\/[^\s<>"']+|(?:(?:[A-Za-z]:)?(?:\.{0,2}[\\/])|[A-Za-z0-9_@.-]+[\\/])(?:[^\s:]+[\\/])*[^\s:]+\.(?:[cm]?[jt]sx?|py|rb|rs|go|java|kt|swift|css|scss|sass|less|html?|vue|svelte|json|ya?ml|toml|md)(?::\d+(?::\d+)?)?|\b[A-Za-z0-9_@().-]+\.(?:[cm]?[jt]sx?|py|rb|rs|go|java|kt|swift|css|scss|sass|less|html?|vue|svelte|json|ya?ml|toml|md)(?::\d+(?::\d+)?)?|\x60[^\x60\n]+\x60|\b\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z\b|\b(?:pid|process\s+id)\s*[:=]?\s*\d+\b|\bERR_[A-Z0-9_]+\b|\b(?:error|failed|failure|fatal|exception|denied|invalid)\b|\b(?:warning|warn|deprecated|caution)\b|\b(?:success|passed|completed|created|updated)\b|\b(?:info|notice|checking|processing)\b|\bexit(?:\s+code)?\s*[:=]?\s*-?\d+\b|\bHTTP(?:\/\d(?:\.\d)?)?\s+[1-5]\d{2}\b|\b\d+\s+(?:passed|failed|skipped)\b|\b(?:git|pnpm|npm|yarn|bun|pytest|python3?|node|cargo|go)\s+[A-Za-z0-9_./:@=-]+/gi;
+  let html='';
+  let last=0;
+  source.replace(pattern,(match,offset)=>{
+    html+=esc(source.slice(last,offset));
+    const lower=match.toLowerCase();
+    if(/^https?:\/\//i.test(match))html+=`<a class="tool-output-url" href="${esc(match)}" target="_blank" rel="noopener noreferrer">${esc(match)}</a>`;
+    else{
+      const location=match.match(/^(.*?):(\d+)(?::(\d+))?$/);
+      const looksPath=/\.(?:[cm]?[jt]sx?|py|rb|rs|go|java|kt|swift|css|scss|sass|less|html?|vue|svelte|json|ya?ml|toml|md)(?::\d+)?(?::\d+)?$/i.test(match);
+      if(location&&looksPath){
+        const column=location[3]?`<span class="tool-output-location-separator">:</span><span class="tool-output-location-column">${esc(location[3])}</span>`:'';
+        html+=`<button type="button" class="tool-output-location" data-path="${esc(location[1])}" data-line="${esc(location[2])}" data-column="${esc(location[3]||'')}" onclick="if(typeof openChangedTurnPath==='function')openChangedTurnPath(this.dataset.path)"><span class="tool-output-location-path">${esc(location[1])}</span><span class="tool-output-location-separator">:</span><span class="tool-output-location-line">${esc(location[2])}</span>${column}</button>`;
+      }else if(looksPath)html+=`<button type="button" class="tool-output-path" data-path="${esc(match)}" onclick="if(typeof openChangedTurnPath==='function')openChangedTurnPath(this.dataset.path)">${esc(match)}</button>`;
+      else if(/^\x60[^\x60\n]+\x60$/.test(match))html+=`<code class="tool-output-inline-code">${esc(match)}</code>`;
+      else if(/^\d{4}-\d{2}-\d{2}T/i.test(match)||/^(?:pid|process\s+id)\b/i.test(match))html+=`<span class="tool-output-token-meta">${esc(match)}</span>`;
+      else if(/^ERR_/i.test(match))html+=`<span class="tool-output-token-status is-error">${esc(match)}</span>`;
+      else if(/^(?:error|failed|failure|fatal|exception|denied|invalid)$/i.test(match))html+=`<span class="tool-output-token-error">${esc(match)}</span>`;
+      else if(/^(?:warning|warn|deprecated|caution)$/i.test(match))html+=`<span class="tool-output-token-warning">${esc(match)}</span>`;
+      else if(/^(?:success|passed|completed|created|updated)$/i.test(match))html+=`<span class="tool-output-token-success">${esc(match)}</span>`;
+      else if(/^(?:info|notice|checking|processing)$/i.test(match))html+=`<span class="tool-output-token-info">${esc(match)}</span>`;
+      else if(/^HTTP/i.test(match)){
+        const status=Number((match.match(/\b([1-5]\d{2})\b/)||[])[1]);
+        html+=`<span class="tool-output-token-http ${status>=400?'is-error':status>=300?'is-warning':status>=200?'is-success':'is-info'}">${esc(match)}</span>`;
+      }else if(/^exit/i.test(match)){
+        const code=Number((match.match(/-?\d+/)||[])[0]);
+        html+=`<span class="tool-output-token-exit ${code===0?'is-success':'is-error'}">${esc(match)}</span>`;
+      }else if(/^\d+\s+(?:passed|failed|skipped)$/i.test(match)){
+        const count=match.match(/^\d+/)[0];
+        const status=match.slice(count.length);
+        html+=`<span class="tool-output-token-test ${lower.includes('failed')?'is-failed':lower.includes('skipped')?'is-skipped':'is-passed'}"><span class="tool-output-test-count">${esc(count)}</span>${esc(status)}</span>`;
+      }else if(/^(?:git|pnpm|npm|yarn|bun|pytest|python3?|node|cargo|go)\s/i.test(match))html+=`<code class="tool-output-command-token">${esc(match)}</code>`;
+      else html+=esc(match);
+    }
+    last=offset+match.length;
+    return match;
+  });
+  return html+esc(source.slice(last));
+}
+function _toolOutputFormattedHtml(text){
+  return _toolOutputCollapsedLines(_toolOutputDisplayText(text)).map(line=>{
+    if(!line.text)return'<span class="tool-output-line is-blank"> </span>';
+    const heading=/^(?:(?:-{3,}|={3,})\s*.+?\s*(?:-{3,}|={3,})|#{1,4}\s+.+|(?:Errors?|Warnings?|Failed|Failures?|Tests?|Summary|Reason|Suggestion|Output)\s*:?)$/i.test(line.text.trim());
+    const trace=/^\s*(?:at\s+|File\s+.+,\s+line\s+\d+|Traceback \(most recent call last\))/.test(line.text);
+    const caret=/^\s*\^+\s*$/.test(line.text);
+    const testPass=/^\s*[✔✓]\s+/.test(line.text);
+    const testFail=/^\s*[✖✗×]\s+/.test(line.text);
+    const testInfo=/^\s*ℹ\s+/.test(line.text);
+    const assertion=/^\s*(?:Expected(?:\s+(?:pattern|value))?|Actual(?:\s+(?:input|value))?|Received)\s*:/i.test(line.text);
+    const repeated=line.count>1?`<span class="tool-output-repeat">Repeated ${line.count} times</span>`:'';
+    return `<span class="tool-output-line${heading?' is-heading':''}${trace?' is-trace':''}${caret?' is-caret':''}${testPass?' is-test-pass':''}${testFail?' is-test-fail':''}${testInfo?' is-test-info':''}${assertion?' is-assertion':''}">${_toolOutputTokenHtml(line.text)}</span>${repeated}`;
+  }).join('\n');
+}
+function _toolOutputSafeJsonParse(text){
+  const source=String(text??'');
+  const trimmed=source.trim();
+  if(!trimmed||trimmed.length>500000)return{ok:false,value:null};
+  const first=trimmed[0];
+  const last=trimmed[trimmed.length-1];
+  if(!((first==='{'&&last==='}')||(first==='['&&last===']')||(first==='"'&&last==='"')))return{ok:false,value:null};
+  try{return{ok:true,value:JSON.parse(trimmed)}}catch(_){return{ok:false,value:null}}
+}
+function _toolOutputSafeJsonEnvelope(text){
+  const source=String(text??'');
+  const exact=_toolOutputSafeJsonParse(source);
+  if(exact.ok)return{...exact,json:source.trim(),remainder:''};
+  if(!source||source.length>500000)return{ok:false,value:null,json:'',remainder:''};
+  let start=0;
+  while(start<source.length&&/\s/.test(source[start]))start+=1;
+  const first=source[start];
+  if(first!=='{'&&first!=='[')return{ok:false,value:null,json:'',remainder:''};
+  const stack=[first==='{'?'}':']'];
+  let quoted=false;
+  let escaped=false;
+  for(let index=start+1;index<source.length;index+=1){
+    const char=source[index];
+    if(quoted){
+      if(escaped)escaped=false;
+      else if(char==='\\')escaped=true;
+      else if(char==='"')quoted=false;
+      continue;
+    }
+    if(char==='"'){quoted=true;continue;}
+    if(char==='{'){stack.push('}');if(stack.length>64)return{ok:false,value:null,json:'',remainder:''};continue;}
+    if(char==='['){stack.push(']');if(stack.length>64)return{ok:false,value:null,json:'',remainder:''};continue;}
+    if(char!=='}'&&char!==']')continue;
+    if(stack[stack.length-1]!==char)return{ok:false,value:null,json:'',remainder:''};
+    stack.pop();
+    if(stack.length)continue;
+    const json=source.slice(start,index+1);
+    const remainder=source.slice(index+1);
+    // A mixed payload has a separately-delimited suffix. Reject `{...}junk`
+    // so malformed JSON-like text still falls back to unchanged raw output.
+    if(remainder&&!/^\s/.test(remainder))return{ok:false,value:null,json:'',remainder:''};
+    try{
+      const value=JSON.parse(json);
+      if(value===null||typeof value!=='object')return{ok:false,value:null,json:'',remainder:''};
+      return{ok:true,value,json,remainder};
+    }catch(_){
+      return{ok:false,value:null,json:'',remainder:''};
+    }
+  }
+  return{ok:false,value:null,json:'',remainder:''};
+}
+function _toolOutputContentKind(text,hint){
+  const source=String(text??'');
+  const trimmed=source.trim();
+  const format=String(hint||'').toLowerCase();
+  if(/(?:^|[+./_-])(?:json|application\/json)(?:$|[+./_-])/.test(format)){
+    const parsed=_toolOutputSafeJsonParse(source);
+    if(parsed.ok)return'json';
+  }
+  const hintedLanguage=_toolOutputPrismLanguage(format,'','');
+  if(hintedLanguage==='markdown')return'markdown';
+  if(hintedLanguage)return'code';
+  if(/^\s*(?:Traceback \(most recent call last\)|(?:[A-Za-z.]+(?:Error|Exception):)|at\s+\S+|File\s+"?.+?"?,\s+line\s+\d+)/m.test(source))return'stack';
+  if((trimmed[0]==='{'||trimmed[0]==='[')&&!_toolOutputSafeJsonParse(source).ok)return'text';
+  const frontMatter=/^---[ \t]*\r?\n[\s\S]*?\r?\n---[ \t]*(?:\r?\n|$)/.test(source);
+  const markdownSignals=(source.match(/^\s{0,3}(?:#{1,6}\s+|[-*+]\s+|\d+[.)]\s+|```|~~~)/gm)||[]).length;
+  if(frontMatter&&markdownSignals>=1)return'markdown';
+  if((/^\s*<!doctype\s+html/i.test(source)||/<([A-Za-z][\w:-]*)\b[^>]*>[\s\S]*<\/\1\s*>/i.test(source)||/<[A-Z][\w.]*\b[^>]*\/?>(?:[\s\S]*<\/[A-Z][\w.]*\s*>)?/.test(source))&&trimmed.length>4)return'code';
+  const numbered=(source.match(/^\s*\d+\s*\|/gm)||[]).length;
+  const codeLines=(source.match(/^\s*(?:const|let|var|function|class|def|import|export|from|return|if|for|while|try|catch|interface|type|SELECT|INSERT|UPDATE|CREATE)\b/gm)||[]).length;
+  if(numbered>=2||codeLines>=2||(codeLines>=1&&/[;{}()[\]=>]/.test(source)))return'code';
+  const kvMatches=Array.from(source.matchAll(/^\s*([A-Za-z][A-Za-z0-9 _.-]{0,48})\s*:\s*\S.*$/gm));
+  const kvKeys=new Set(kvMatches.map(match=>match[1].trim().toLowerCase()));
+  if(kvMatches.length>=2&&kvKeys.size>=2)return'key-value';
+  return'text';
+}
+function _toolOutputStructuredDocument(value,depth,viaStdout){
+  const level=Number(depth)||0;
+  if(level>=3||!value||typeof value!=='object'||Array.isArray(value))return null;
+  const hintedFields=new Set(['content','markdown','document','body','source','snapshot','stdout','output','result','data','details','message']);
+  let best=null;
+  const consider=(candidate,score)=>{
+    if(!candidate)return;
+    const next={...candidate,_score:Number(score)||0};
+    if(!best||next._score>best._score)best=next;
+  };
+  for(const field of Object.keys(value)){
+    const fieldValue=value[field];
+    if(fieldValue===undefined||fieldValue===null)continue;
+    const hinted=hintedFields.has(field);
+    const throughStdout=!!viaStdout||field==='stdout';
+    if(typeof fieldValue==='object'){
+      const nested=_toolOutputStructuredDocument(fieldValue,level+1,throughStdout);
+      if(nested)consider(nested,(nested._score||0)+(throughStdout?12:0));
+      else if(hinted&&field!=='stdout')consider({owner:value,field,value:fieldValue,rawValue:'',kind:'json',viaStdout:!!viaStdout,skillLike:false},42);
+      continue;
+    }
+    if(typeof fieldValue!=='string')continue;
+    const parsed=_toolOutputSafeJsonParse(fieldValue);
+    if(parsed.ok&&parsed.value!==null&&typeof parsed.value==='object'){
+      const nested=_toolOutputStructuredDocument(parsed.value,level+1,throughStdout);
+      // stdout is a transport wrapper, so promote the meaningful nested
+      // document out of it. For an ordinary content/body field, retain the
+      // parsed JSON as an inspectable tree; its own string leaves are still
+      // classified recursively by the JSON renderer.
+      if(throughStdout&&nested)consider(nested,(nested._score||0)+16);
+      else consider({owner:value,field,value:parsed.value,rawValue:fieldValue,kind:'json',viaStdout:throughStdout,skillLike:false},58+(hinted?8:0));
+      continue;
+    }
+    const kind=_toolOutputContentKind(fieldValue,field);
+    const lineCount=fieldValue.split(/\r?\n/).length;
+    // A newline produced by the one successful outer parse is authoritative.
+    // A literal two-character `\\n` never increments lineCount and therefore
+    // cannot be decoded or promoted by this value-driven branch.
+    const shapeScore=kind==='markdown'?64:kind==='code'?60:kind==='stack'?58:lineCount>1?48:0;
+    const hintedPlain=hinted&&field!=='stdout'&&(fieldValue.length>0&&(field==='content'||field==='markdown'||fieldValue.length>240));
+    const confirmed=shapeScore>0||hintedPlain;
+    if(!confirmed)continue;
+    const skillLike=field==='content'&&kind==='markdown'&&typeof value.name==='string'&&(Array.isArray(value.tags)||Array.isArray(value.related_skills));
+    const sizeScore=Math.min(12,Math.max(0,lineCount-1))+Math.min(8,Math.floor(fieldValue.length/400));
+    consider({owner:value,field,value:fieldValue,rawValue:fieldValue,kind,viaStdout:throughStdout,skillLike},shapeScore+(hinted?8:0)+sizeScore);
+  }
+  if(best)delete best._score;
+  return best;
+}
+function _toolOutputStructuredFieldLabel(field){
+  const key=String(field||'').trim();
+  const labels={content:'Content',markdown:'Markdown document',document:'Document',body:'Body',source:'Source',snapshot:'Snapshot',stdout:'Output'};
+  if(labels[key])return labels[key];
+  const words=key
+    .replace(/([a-z0-9])([A-Z])/g,'$1 $2')
+    .replace(/[_-]+/g,' ')
+    .replace(/\s+(?:text|string)$/i,'')
+    .trim();
+  return (words||'Content').replace(/\b\w/g,char=>char.toUpperCase());
+}
+function _toolOutputPatchFailures(raw){
+  const source=String(raw??'');
+  if(!/(?:patch (?:validation )?failed|patch could not be applied|could not apply patch|hunk\s+#?\d+[^\n]*(?:failed|not found|context|match))/i.test(source))return null;
+  const files=[];
+  const intro=[];
+  let currentFile=null;
+  let currentHunk=null;
+  const fileFor=path=>{
+    const clean=String(path||'').trim().replace(/^['"`]|['"`]$/g,'');
+    let file=files.find(item=>item.path===clean);
+    if(!file){file={path:clean||'Unknown file',details:[],hunks:[]};files.push(file);}
+    return file;
+  };
+  for(const line of source.replace(/\r\n/g,'\n').split('\n')){
+    let match=line.match(/^\s*(?:\*{3}\s+(?:Update|Add|Delete) File:|File\s*:?)\s*(.+?\.[A-Za-z0-9]+)\s*$/i);
+    if(match){currentFile=fileFor(match[1]);currentHunk=null;continue;}
+    match=line.match(/^\s*file\s+(.+?\.[A-Za-z0-9]+)\s*:\s*(.*)$/i);
+    if(match){
+      currentFile=fileFor(match[1]);
+      const remainder=match[2];
+      const hunkMatch=remainder.match(/\bhunk\s+#?(\d+)\b/i);
+      if(hunkMatch){
+        const reason=remainder.slice((hunkMatch.index||0)+hunkMatch[0].length).replace(/^\s*[:—-]?\s*/,'');
+        currentHunk={number:Number(hunkMatch[1]),details:reason?[reason]:[]};
+        currentFile.hunks.push(currentHunk);
+      }
+      else{currentHunk=null;if(remainder)currentFile.details.push(remainder);}
+      continue;
+    }
+    match=line.match(/\bhunk\s+#?(\d+)\b/i);
+    if(match){
+      if(!currentFile)currentFile=fileFor('Unknown file');
+      const reason=line.slice((match.index||0)+match[0].length).replace(/^\s*[:—-]?\s*/,'');
+      currentHunk={number:Number(match[1]),details:reason?[reason]:[]};
+      currentFile.hunks.push(currentHunk);
+      continue;
+    }
+    if(currentHunk&&line.trim())currentHunk.details.push(line);
+    else if(currentFile&&line.trim())currentFile.details.push(line);
+    else if(line.trim())intro.push(line);
+  }
+  return{files,intro};
+}
+function _toolOutputPrismLanguage(hint,text,fallback){
+  const sourceHint=String(hint||'').trim().toLowerCase();
+  const source=String(text||'');
+  const aliases={
+    sh:'bash',shell:'bash',zsh:'bash',fish:'bash',bash:'bash',
+    ps1:'powershell',psm1:'powershell',pwsh:'powershell',powershell:'powershell',
+    bat:'batch',cmd:'batch',batch:'batch',
+    js:'javascript',mjs:'javascript',cjs:'javascript',javascript:'javascript',
+    ts:'typescript',mts:'typescript',cts:'typescript',typescript:'typescript',
+    jsx:'jsx',tsx:'tsx',html:'markup',htm:'markup',xml:'markup',svg:'markup',vue:'markup',svelte:'markup',template:'markup',markup:'markup',
+    py:'python',python:'python',rb:'ruby',ruby:'ruby',rs:'rust',rust:'rust',go:'go',
+    java:'java',kt:'kotlin',kts:'kotlin',swift:'swift',c:'c',h:'c',cc:'cpp',cpp:'cpp',cxx:'cpp',hpp:'cpp',cs:'csharp',csharp:'csharp',
+    php:'php',dart:'dart',lua:'lua',pl:'perl',perl:'perl',r:'r',css:'css',scss:'scss',sass:'sass',less:'less',
+    json:'json',yaml:'yaml',yml:'yaml',toml:'toml',md:'markdown',markdown:'markdown',sql:'sql',
+  };
+  const normalized=sourceHint.replace(/^language-/,'');
+  if(aliases[normalized])return aliases[normalized];
+  const pathMatch=normalized.match(/\.([A-Za-z0-9]+)(?::\d+(?::\d+)?)?$/);
+  if(pathMatch&&aliases[pathMatch[1]])return aliases[pathMatch[1]];
+  if(/<\/?[A-Za-z][^>]*>/.test(source))return'markup';
+  if(/^\s*(?:interface|type)\s+\w+|\b(?:as const|satisfies|keyof|unknown)\b/m.test(source))return'typescript';
+  if(/^\s*(?:import|export|const|let|var|function|class)\b/m.test(source))return'javascript';
+  if(/^\s*(?:def|from\s+\w+\s+import|import\s+\w+|class\s+\w+.*:)\b/m.test(source))return'python';
+  if(/^\s*(?:param\s*\(|function\s+[\w-]+|Get-|Set-|Write-Host)|\$env:/im.test(source))return'powershell';
+  if(/^(?:@echo\s+off|set\s+\w+=|if\s+errorlevel|\w+:\\)/im.test(source))return'batch';
+  if(/^\s*#!.*\b(?:ba|z|k)?sh\b/m.test(source)||/\b(?:then|fi|do|done|esac)\b|\$\([^)]+\)|(?:^|\s)(?:&&|\|\|)(?:\s|$)/m.test(source))return'bash';
+  return aliases[String(fallback||'').toLowerCase()]||String(fallback||'');
+}
+function _toolOutputNestedStringModel(value,hint,depth){
+  const text=String(value??'');
+  const level=Number(depth)||0;
+  if(level>=3||!text||text.length>200000)return null;
+  const parsed=_toolOutputSafeJsonParse(text);
+  if(parsed.ok&&parsed.value!==null&&typeof parsed.value==='object')return{kind:'json',value:parsed.value,text,depth:level+1,label:'Nested JSON'};
+  const actualLines=text.split(/\r?\n/).length;
+  const kind=_toolOutputContentKind(text,hint);
+  if(kind==='markdown')return{kind:'markdown',text,language:'markdown',depth:level+1,label:'Markdown source'};
+  if(kind==='code'){
+    const languageProbe=text.replace(/^\s*\d+\s*\|\s?/gm,'');
+    return{kind:'code',text,language:_toolOutputPrismLanguage(hint,languageProbe,''),depth:level+1,label:'Source'};
+  }
+  if(kind==='stack')return{kind:'stack',text,depth:level+1,label:'Stack trace'};
+  if(actualLines>1){
+    const shellLanguage=_toolOutputPrismLanguage(hint,text,'');
+    if(shellLanguage==='bash'||shellLanguage==='powershell'||shellLanguage==='batch')return{kind:'code',text,language:shellLanguage,depth:level+1,label:'Shell'};
+    return{kind:'text',text,depth:level+1,label:'Multiline output'};
+  }
+  return null;
+}
+function _toolOutputRunningCommandModel(tc,info,metadata,raw){
+  const payload=metadata&&typeof metadata==='object'?metadata:{};
+  const args=tc&&tc.args&&typeof tc.args==='object'&&!Array.isArray(tc.args)?tc.args:{};
+  const infoInvocation=info&&info.invocation&&typeof info.invocation==='object'?info.invocation:null;
+  const commandValue=String(info&&info.command||payload.command||payload.cmd||'');
+  const command=_toolOutputLooksLikeUrl(commandValue)?'':commandValue;
+  const shell=String(payload.shell||payload.shell_type||payload.shellType||args.shell||'bash');
+  const stdoutValue=payload.stdout??payload.standard_output??payload.standardOutput;
+  const stderrValue=payload.stderr??payload.standard_error??payload.standardError;
+  const stdout=stdoutValue===undefined||stdoutValue===null?String(raw||''):String(stdoutValue);
+  const stderr=stderrValue===undefined||stderrValue===null?'':String(stderrValue);
+  const commandMetadata={};
+  for(const [key,value] of [
+    ['cwd',payload.cwd??payload.working_directory??payload.workingDirectory??args.cwd??args.workdir??args.working_directory??args.workingDirectory],
+    ['timeout',payload.timeout??payload.timeout_seconds??payload.timeoutSeconds??args.timeout??args.timeout_seconds??args.timeoutSeconds],
+    ['duration',payload.duration??payload.duration_seconds??payload.elapsed],
+    ['shell',shell],
+  ])if(value!==undefined&&value!==null&&value!=='')commandMetadata[key]=value;
+  const invocation=infoInvocation||(command?{kind:'command',label:'Command',value:command,language:_toolOutputPrismLanguage(shell,command,'bash')}:null);
+  return{kind:'command-result',raw:String(raw||''),command,shell:_toolOutputPrismLanguage(shell,command,'bash'),invocation,stdout,stderr,output:null,status:'running',exitCode:null,metadata:commandMetadata};
+}
+function _toolOutputDisplayModel(tc,info){
+  const raw=String((info&&info.raw)??'');
+  const tcValue=tc&&typeof tc==='object'?tc:{};
+  const metadata={};
+  for(const value of [tcValue.metadata,tcValue.result_metadata,tcValue.resultMetadata,info&&info.metadata]){
+    if(value&&typeof value==='object'&&!Array.isArray(value))Object.assign(metadata,value);
+  }
+  if(info&&info.url&&!metadata.url)metadata.url=info.url;
+  const name=String(tcValue.name||'').replace(/^functions\./,'').toLowerCase();
+  const toolArgs=tcValue.args&&typeof tcValue.args==='object'?tcValue.args:{};
+  const runningInvocation=info&&info.invocation&&typeof info.invocation==='object'?info.invocation:null;
+  const runningShell=String(info&&info.executionStatus||'')==='running'&&String(info&&info.toolKind||'')==='shell'&&!!(runningInvocation&&/^(?:command|code)$/.test(runningInvocation.kind));
+  const explicitHint=String(metadata.content_type||metadata.contentType||metadata.format||metadata.mime_type||metadata.mimeType||metadata.language||'');
+  const targetHint=String(toolArgs.path||toolArgs.file_path||toolArgs.filePath||toolArgs.filename||toolArgs.file||'');
+  // A recovered read_file card may only carry the already-unwrapped source
+  // preview plus its original path. Keep that path as the language hint so the
+  // same path-driven language renderer is selected whether the structured
+  // wrapper is still present or was safely unwrapped before truncation.
+  const hint=explicitHint||((String(info&&info.toolKind||'')==='read'||/(?:^|_)(?:read|read_file|read_text)(?:_|$)/.test(name))?targetHint:'');
+  const identity=String(tcValue.id||tcValue.tool_call_id||tcValue.tool_use_id||tcValue.call_id||'');
+  const structuredValue=metadata.content??metadata.snapshot??metadata.page_snapshot??metadata.accessibility_tree??metadata.data??metadata.rows;
+  const structuredStamp=typeof structuredValue==='string'?`${structuredValue.length}:${structuredValue.slice(0,128)}:${structuredValue.slice(-128)}`:String(structuredValue&&typeof structuredValue==='object'?Object.keys(structuredValue).join(','):structuredValue??'');
+  const metadataVersion=[metadata.url,metadata.title,metadata.status,metadata.warning,metadata.stealth_warning,metadata.output_kind,metadata.kind,structuredStamp].map(value=>String(value??'')).join('\u0001');
+  const invocationValue=String(info&&info.invocation&&info.invocation.value||'');
+  const invocationStamp=[info&&info.invocation&&info.invocation.kind||'',info&&info.invocation&&info.invocation.language||'',invocationValue.length,invocationValue.slice(0,128),invocationValue.slice(-128)].join(':');
+  const rawStamp=runningShell?`${raw.length}:${raw.slice(0,128)}:${raw.slice(-128)}`:raw;
+  const cacheKey=[identity,name,info&&info.kind||'',info&&info.executionStatus||'',hint,metadataVersion,invocationStamp,rawStamp].join('\u0000');
+  const cache=_toolOutputDisplayModel._cache||(_toolOutputDisplayModel._cache=new Map());
+  if(cache.has(cacheKey))return cache.get(cacheKey);
+  const remember=model=>{
+    if(cache.size>=32)cache.delete(cache.keys().next().value);
+    cache.set(cacheKey,model);
+    return model;
+  };
+  // A running command has already supplied its stable syntax source. Keep
+  // incomplete stdout/stderr as terminal text and avoid JSON/document/diff
+  // parsing on every growing output chunk. The settled event takes the normal
+  // rich classification path once.
+  if(runningShell)return remember(_toolOutputRunningCommandModel(tcValue,info,metadata,raw));
+  const patch=_toolOutputPatchFailures(raw);
+  if(patch)return remember({kind:'patch-failure',raw,...patch});
+  const parsed=_toolOutputSafeJsonEnvelope(raw);
+  const parsedValue=parsed.ok?parsed.value:null;
+  const browserPayload=parsedValue&&typeof parsedValue==='object'
+    ?parsedValue
+    :[metadata.data,metadata.result,metadata.output,metadata.body].find(value=>value&&typeof value==='object')||null;
+  const structuredMetadataPayload=[metadata.data,metadata.result,metadata.output,metadata.body].find(value=>value!==null&&typeof value==='object')||null;
+  const browserSignal=_toolOutputBrowserContext(tcValue,info&&info.toolKind,metadata,browserPayload);
+  const infoCommand=String(info&&info.command||'');
+  const shellSignal=!browserSignal&&(String(info&&info.toolKind||'')==='shell'||/^(?:terminal|shell|command|execute_code|execute_command|run_command|process)$/.test(name)||!!infoCommand);
+  const modelForText=(value,valueHint,allowStructuredParse)=>{
+    const text=String(value??'');
+    const parsedInner=allowStructuredParse===false?{ok:false,value:null}:_toolOutputSafeJsonParse(text);
+    if(parsedInner.ok&&parsedInner.value!==null&&typeof parsedInner.value==='object')return{kind:'json',value:parsedInner.value,raw:text,nested:true};
+    const contentKind=_toolOutputContentKind(text,valueHint);
+    const language=contentKind==='markdown'
+      ?'markdown'
+      :contentKind==='code'
+        ?_toolOutputPrismLanguage(valueHint,text,'')
+        :'';
+    return{kind:contentKind==='markdown'?'markdown':contentKind==='code'?'code':contentKind,text,language,raw:text};
+  };
+  const modelForValue=(value,valueHint)=>{
+    if(value!==null&&typeof value==='object')return{kind:'json',value,raw:''};
+    return modelForText(value,valueHint,true);
+  };
+  const mixedRemainderText=parsed.ok?String(parsed.remainder||'').trim():'';
+  const mixedRemainder=mixedRemainderText
+    ?modelForText(mixedRemainderText,'text',false)
+    :null;
+  const browserModelFor=value=>{
+    const source=value&&typeof value==='object'?value:metadata;
+    const metadataFields={};
+    const field=(...keys)=>{
+      for(const key of keys){
+        if(source&&source[key]!==undefined)return source[key];
+        if(metadata[key]!==undefined)return metadata[key];
+      }
+      return undefined;
+    };
+    for(const [target,...keys] of [
+      ['url','url'],['title','title'],['status','status'],['http_status','http_status','httpStatus'],
+      ['status_code','status_code','statusCode'],['warning','warning'],['stealth_warning','stealth_warning','stealthWarning'],
+    ]){
+      const valueField=field(...keys);
+      if(valueField!==undefined&&valueField!==null&&valueField!=='')metadataFields[target]=valueField;
+    }
+    const ready=field('ready','ready_state','readyState');
+    if(ready!==undefined&&ready!==null&&ready!=='')metadataFields.status=String(ready).replace(/[_-]+/g,' ').replace(/^\w/,char=>char.toUpperCase());
+    for(const key of ['errors','overflow']){
+      const valueField=field(key);
+      if(valueField!==undefined&&valueField!==null)metadataFields[key]=valueField;
+    }
+    const rows=source&&typeof source==='object'?source.rows:undefined;
+    const snapshotKeys=['snapshot','page_snapshot','accessibility_tree','accessibilityTree','tree','dom','html','content'];
+    const snapshotKey=!Array.isArray(source)?snapshotKeys.find(key=>source&&source[key]!==undefined):null;
+    let snapshot=null;
+    let snapshotLabel='Page snapshot';
+    if(Array.isArray(source)){
+      metadataFields.rows=source.length;
+      snapshot=modelForValue(source,'json');
+      snapshotLabel='Page rows';
+    }else if(Array.isArray(rows)){
+      metadataFields.rows=rows.length;
+      snapshot=modelForValue(rows,'json');
+      snapshotLabel='Page rows';
+    }else if(snapshotKey){
+      snapshot=modelForValue(source[snapshotKey],snapshotKey==='html'?'html':metadata.language||'text');
+    }else if(value===null||typeof value!=='object'){
+      const rawText=raw.trim();
+      const duplicateMetadata=Object.values(metadataFields).some(fieldValue=>String(fieldValue??'').trim()===rawText);
+      if(rawText&&!duplicateMetadata)snapshot=modelForText(raw,hint||'text');
+    }
+    const excluded=new Set(['success','ok','url','title','status','ready','ready_state','readyState','http_status','httpStatus','status_code','statusCode','warning','stealth_warning','stealthWarning','errors','overflow','rows',...snapshotKeys]);
+    const extra={};
+    if(source&&!Array.isArray(source))for(const key of Object.keys(source))if(!excluded.has(key))extra[key]=source[key];
+    return{kind:'browser-result',raw,metadata:metadataFields,snapshot,snapshotLabel,extra:Object.keys(extra).length?extra:null,remainder:mixedRemainder};
+  };
+  if(browserSignal)return remember(browserModelFor(browserPayload));
+  const documentSource=parsedValue&&typeof parsedValue==='object'&&!Array.isArray(parsedValue)?parsedValue:(structuredMetadataPayload||metadata);
+  const structuredDocument=_toolOutputStructuredDocument(documentSource,0,false);
+  if(structuredDocument&&(!shellSignal||structuredDocument.viaStdout||structuredDocument.skillLike)){
+    const owner=structuredDocument.owner||{};
+    const wrapperMetadata={};
+    const excluded=new Set([structuredDocument.field,'success','ok','exit_code','exitCode','return_code','returnCode','command','cmd','stderr','standard_error','standardError']);
+    for(const key of Object.keys(owner))if(!excluded.has(key))wrapperMetadata[key]=owner[key];
+    let content;
+    if(structuredDocument.kind==='json')content={kind:'json',value:structuredDocument.value,raw:String(structuredDocument.rawValue||''),nested:true};
+    else{
+      // `content` describes the wrapper field, not the source language. Read
+      // tools usually carry the authoritative filename in their arguments;
+      // prefer that (or explicit language metadata) so numbered source reaches
+      // the matching renderer in live, settled, and restored shapes alike.
+      // Content heuristics remain the final fallback.
+      const contentHintCandidates=[
+        structuredDocument.kind==='markdown'?'markdown':'',
+        owner.language,owner.content_language,owner.contentLanguage,
+        owner.path,owner.file_path,owner.filePath,owner.filename,owner.file,
+        metadata.language,metadata.content_language,metadata.contentLanguage,
+        toolArgs.language,toolArgs.content_language,toolArgs.contentLanguage,
+        toolArgs.path,toolArgs.file_path,toolArgs.filePath,toolArgs.filename,toolArgs.file,
+        hint,
+      ];
+      const contentHint=String(contentHintCandidates.find(value=>value!==undefined&&value!==null&&String(value).trim())||structuredDocument.field||'');
+      content=modelForText(structuredDocument.value,contentHint,false);
+    }
+    const contentLabel=structuredDocument.skillLike?'Skill content':_toolOutputStructuredFieldLabel(structuredDocument.field);
+    let contentRaw=String(structuredDocument.rawValue||'');
+    if(!contentRaw&&structuredDocument.value&&typeof structuredDocument.value==='object'){
+      try{contentRaw=JSON.stringify(structuredDocument.value,null,2);}catch(_){contentRaw='';}
+    }
+    return remember({kind:'content-wrapper',raw,metadata:wrapperMetadata,content,contentLabel,contentRaw,remainder:mixedRemainder});
+  }
+  if(shellSignal){
+    const payload=parsed.ok&&parsed.value&&typeof parsed.value==='object'&&!Array.isArray(parsed.value)?parsed.value:metadata;
+    const commandValue=String(infoCommand||payload.command||payload.cmd||'');
+    const command=_toolOutputLooksLikeUrl(commandValue)?'':commandValue;
+    const invocation=info&&info.invocation&&typeof info.invocation==='object'
+      ?info.invocation
+      :(command?{kind:'command',label:'Command',value:command,language:_toolOutputPrismLanguage(payload.shell||metadata.shell||'bash',command,'bash')}:null);
+    const shell=String(payload.shell||payload.shell_type||payload.shellType||metadata.shell||toolArgs.shell||'bash');
+    const stdoutValue=payload.stdout??payload.standard_output??payload.standardOutput;
+    const stderrValue=payload.stderr??payload.standard_error??payload.standardError;
+    // The outer structured object was parsed exactly once above. Promote its
+    // strongest multiline/document value regardless of field name, using the
+    // familiar output/result/body/data names only as an earlier preference.
+    // This keeps future wrappers such as `{test_log: "...\n..."}` out of the
+    // JSON tree without ever applying blind escape replacement.
+    const dynamicOutputDocument=structuredDocument&&typeof structuredDocument.value==='string'
+      ?structuredDocument
+      :null;
+    const outputValue=payload.output??payload.result??payload.body??payload.data??(dynamicOutputDocument&&dynamicOutputDocument.value);
+    const outputHint=dynamicOutputDocument&&outputValue===dynamicOutputDocument.value
+      ?dynamicOutputDocument.field
+      :(payload.language||hint);
+    let stdout=stdoutValue===undefined||stdoutValue===null?'':String(stdoutValue);
+    const stderr=stderrValue===undefined||stderrValue===null?'':String(stderrValue);
+    let output=null;
+    if(outputValue!==undefined&&outputValue!==null){
+      if(typeof outputValue==='object')output={kind:'json',value:outputValue,raw:''};
+      else output=modelForText(String(outputValue),outputHint,true);
+    }
+    if(!stdout&&!stderr&&!output){
+      if(parsed.ok&&parsed.value&&typeof parsed.value==='object')output={kind:'json',value:parsed.value,raw};
+      else stdout=raw;
+    }
+    const summaryText=String(info&&info.summary||'').trim();
+    const statusAssignment=/^[A-Za-z][A-Za-z0-9_-]*_http\s*=\s*[1-5]\d{2}$/i.test(stdout.trim());
+    if(!stderr&&!output&&stdout.trim()&&(stdout.trim()===summaryText||(statusAssignment&&/\bHTTP\s+[1-5]\d{2}\b/i.test(summaryText))))stdout='';
+    const commandMetadata={};
+    for(const [key,value] of [
+      ['cwd',payload.cwd??payload.working_directory??payload.workingDirectory??toolArgs.cwd??toolArgs.workdir??toolArgs.working_directory??toolArgs.workingDirectory],
+      ['timeout',payload.timeout??payload.timeout_seconds??payload.timeoutSeconds??toolArgs.timeout??toolArgs.timeout_seconds??toolArgs.timeoutSeconds],
+      ['duration',payload.duration??payload.duration_seconds??payload.elapsed],
+      ['shell',shell],
+    ])if(value!==undefined&&value!==null&&value!=='')commandMetadata[key]=value;
+    const payloadExit=payload.exit_code??payload.exitCode??payload.return_code??payload.returnCode;
+    const exitCode=Number.isInteger(info&&info.exitCode)?info.exitCode:(Number.isInteger(Number(payloadExit))?Number(payloadExit):null);
+    return remember({kind:'command-result',raw,command,shell:_toolOutputPrismLanguage(shell,command,'bash'),invocation,stdout,stderr,output,status:String(info&&info.executionStatus||''),exitCode,metadata:commandMetadata,testSummary:info&&info.testSummary||null,remainder:mixedRemainder});
+  }
+  if(!parsed.ok&&structuredMetadataPayload)return remember({kind:'json',raw,value:structuredMetadataPayload});
+  if(parsed.ok&&parsed.value!==null&&typeof parsed.value==='object'){
+    const value=parsed.value;
+    return remember({kind:'json',raw,value,remainder:mixedRemainder});
+  }
+  if(parsed.ok&&typeof parsed.value==='string'){
+    const decoded=modelForText(parsed.value,hint,false);
+    decoded.serialized=true;
+    decoded.raw=raw;
+    return remember(decoded);
+  }
+  const kind=_toolOutputContentKind(raw,hint);
+  if(kind==='key-value'){
+    const entries=[];
+    const remainder=[];
+    for(const line of raw.replace(/\r\n/g,'\n').split('\n')){
+      const match=line.match(/^\s*([A-Za-z][A-Za-z0-9 _.-]{0,48})\s*:\s*(.*)$/);
+      if(match)entries.push({key:match[1],value:match[2]});else if(line.trim())remainder.push(line);
+    }
+    return remember({kind:'key-value',raw,entries,remainder:remainder.join('\n')});
+  }
+  return remember({kind:kind==='code'?'code':kind,raw,text:_toolOutputDisplayText(raw),language:hint});
+}
+function _toolOutputNumberedTranscriptModel(text){
+  const source=String(text??'').replace(/\r\n/g,'\n');
+  if(!source||source.length>200000)return null;
+  const lines=source.split('\n');
+  if(lines.length>600)return null;
+  const rows=[];
+  let recordCount=0;
+  for(const line of lines){
+    if(!line){rows.push({kind:'blank'});continue;}
+    const numbered=line.match(/^(\s*\d+)\s*\|\s?(.*)$/);
+    if(!numbered)return null;
+    const body=numbered[2];
+    const record=body.match(/^(\d{1,2}:\d{2}:\d{2}(?:\.\d+)?)\s+([^|]+?)\s*\|\s*([^\s:]+)(?:\s+(ok|success|passed|completed|warning|warn|failed|failure|error|cancelled|canceled))?(?:\s+([0-9.]+(?:ns|µs|us|ms|s|m)))?\s*:\s*([\s\S]*)$/i);
+    if(!record){rows.push({kind:'line',lineNumber:numbered[1].trim(),text:body});continue;}
+    const payload=record[6]||'';
+    const parsed=/^\s*[\[{]/.test(payload)?_toolOutputSafeJsonParse(payload):{ok:false,value:null};
+    rows.push({
+      kind:'record',
+      lineNumber:numbered[1].trim(),
+      timestamp:record[1],
+      event:record[2].trim(),
+      tool:record[3],
+      status:String(record[4]||'').toLowerCase(),
+      duration:record[5]||'',
+      payload,
+      parsedPayload:parsed.ok&&parsed.value!==null&&typeof parsed.value==='object'?parsed.value:null,
+    });
+    recordCount+=1;
+  }
+  return recordCount?{rows,recordCount}:null;
+}
+function _toolOutputNumberedTranscriptHtml(text){
+  const transcript=_toolOutputNumberedTranscriptModel(text);
+  if(!transcript)return'';
+  const statusClass=status=>{
+    if(/^(?:ok|success|passed|completed)$/.test(status))return'success';
+    if(/^(?:failed|failure|error)$/.test(status))return'error';
+    if(/^(?:warning|warn)$/.test(status))return'warning';
+    if(/^(?:cancelled|canceled)$/.test(status))return'muted';
+    return'info';
+  };
+  const rows=transcript.rows.map(row=>{
+    if(row.kind==='blank')return'<div class="tool-output-numbered-record is-blank" aria-hidden="true"></div>';
+    const gutter=`<span class="tool-output-record-line-number">${esc(row.lineNumber)}</span>`;
+    if(row.kind!=='record')return `<div class="tool-output-numbered-record is-line">${gutter}<pre><code>${_toolOutputFormattedHtml(row.text)}</code></pre></div>`;
+    const status=row.status?`<span class="tool-output-record-status is-${statusClass(row.status)}">${esc(row.status)}</span>`:'';
+    const duration=row.duration?`<span class="tool-output-record-duration">${esc(row.duration)}</span>`:'';
+    const payload=row.parsedPayload!==null
+      ?`<div class="tool-output-record-payload is-structured">${_toolOutputJsonHtml(row.parsedPayload)}</div>`
+      :row.payload
+        ?`<pre class="tool-output-record-payload is-raw"><code>${_toolOutputFormattedHtml(row.payload)}</code></pre>`
+        :'';
+    return `<div class="tool-output-numbered-record is-tool-record">${gutter}<div class="tool-output-record-body"><div class="tool-output-record-header"><span class="tool-output-record-time">${esc(row.timestamp)}</span><span class="tool-output-record-event">${esc(row.event)}</span><span class="tool-output-record-separator">|</span><span class="tool-output-record-tool">${esc(row.tool)}</span>${status}${duration}</div>${payload}</div></div>`;
+  }).join('');
+  return `<div class="tool-output-numbered-transcript">${rows}</div>`;
+}
+function _toolOutputCodeHtml(text,language){
+  const source=String(text??'');
+  const transcript=_toolOutputNumberedTranscriptHtml(source);
+  if(transcript)return transcript;
+  const prismLanguage=_toolOutputPrismLanguage(language,source,'');
+  const prismClass=prismLanguage?` class="language-${esc(prismLanguage)}" data-tool-output-prism="1"`:'';
+  const lines=source.replace(/\r\n/g,'\n').split('\n').map(line=>{
+    const numbered=line.match(/^(\s*\d+)(\s*\|\s?)(.*)$/);
+    if(numbered)return `<span class="tool-output-code-line is-numbered"><span class="tool-output-code-line-number">${esc(numbered[1].trim())}</span><code${prismClass}>${esc(numbered[3])}</code></span>`;
+    return null;
+  });
+  const numbered=lines.every(Boolean)&&lines.length>0;
+  if(numbered)return `<pre class="tool-output-code is-numbered" data-language="${esc(prismLanguage)}">${lines.join('\n')}</pre>`;
+  return `<pre class="tool-output-code" data-language="${esc(prismLanguage)}"><code${prismClass}>${esc(source)}</code></pre>`;
+}
+function _toolOutputCommandHtml(command,shell){
+  const source=String(command??'');
+  const language=_toolOutputPrismLanguage(shell,source,'bash')||'bash';
+  return `<pre class="tool-output-command-block"><span class="tool-output-command-prompt" aria-hidden="true">$</span><code class="language-${esc(language)}" data-tool-output-prism="1" data-tool-output-command="1">${esc(source)}</code></pre>`;
+}
+function _toolOutputAnsiHtml(text){
+  const source=String(text??'');
+  const state={bold:false,dim:false,underline:false,fg:'',bg:'',fgStyle:'',bgStyle:''};
+  const colors=['black','red','green','yellow','blue','magenta','cyan','white'];
+  const ansi256=index=>{
+    const value=Math.max(0,Math.min(255,Number(index)||0));
+    if(value<16){
+      const base=[[0,0,0],[128,0,0],[0,128,0],[128,128,0],[0,0,128],[128,0,128],[0,128,128],[192,192,192],[128,128,128],[255,0,0],[0,255,0],[255,255,0],[0,0,255],[255,0,255],[0,255,255],[255,255,255]];
+      return`rgb(${base[value].join(',')})`;
+    }
+    if(value<232){const n=value-16;const level=[0,95,135,175,215,255];return`rgb(${level[Math.floor(n/36)]},${level[Math.floor(n/6)%6]},${level[n%6]})`;}
+    const gray=8+(value-232)*10;return`rgb(${gray},${gray},${gray})`;
+  };
+  const safeText=value=>{
+    const clean=String(value).replace(/\r\n/g,'\n').replace(/\r/g,'\n').replace(/[\x00-\x08\x0b\x0c\x0e-\x1a\x1c-\x1f\x7f]/g,'');
+    const pattern=/https?:\/\/[^\s<>"']+/g;
+    let html='';let last=0;
+    clean.replace(pattern,(match,offset)=>{html+=esc(clean.slice(last,offset));html+=`<a class="tool-output-url" href="${esc(match)}" target="_blank" rel="noopener noreferrer">${esc(match)}</a>`;last=offset+match.length;return match;});
+    return html+esc(clean.slice(last));
+  };
+  const styled=value=>{
+    if(!value)return'';
+    const classes=[];
+    if(state.bold)classes.push('tool-output-ansi-bold');
+    if(state.dim)classes.push('tool-output-ansi-dim');
+    if(state.underline)classes.push('tool-output-ansi-underline');
+    if(state.fg)classes.push(`tool-output-ansi-fg-${state.fg}`);
+    if(state.bg)classes.push(`tool-output-ansi-bg-${state.bg}`);
+    const styles=[];
+    if(state.fgStyle)styles.push(`color:${state.fgStyle}`);
+    if(state.bgStyle)styles.push(`background-color:${state.bgStyle}`);
+    const attrs=(classes.length?` class="${classes.join(' ')}"`:'')+(styles.length?` style="${styles.join(';')}"`:'');
+    return attrs?`<span${attrs}>${safeText(value)}</span>`:safeText(value);
+  };
+  const reset=()=>{state.bold=false;state.dim=false;state.underline=false;state.fg='';state.bg='';state.fgStyle='';state.bgStyle='';};
+  const apply=params=>{
+    const values=params===''?[0]:params.split(';').map(value=>Number(value)||0);
+    for(let index=0;index<values.length;index+=1){
+      const code=values[index];
+      if(code===0)reset();else if(code===1)state.bold=true;else if(code===2)state.dim=true;else if(code===4)state.underline=true;
+      else if(code===22){state.bold=false;state.dim=false;}else if(code===24)state.underline=false;
+      else if(code>=30&&code<=37){state.fg=colors[code-30];state.fgStyle='';}else if(code>=90&&code<=97){state.fg=colors[code-90];state.fgStyle='';}
+      else if(code===39){state.fg='';state.fgStyle='';}else if(code>=40&&code<=47){state.bg=colors[code-40];state.bgStyle='';}else if(code>=100&&code<=107){state.bg=colors[code-100];state.bgStyle='';}else if(code===49){state.bg='';state.bgStyle='';}
+      else if((code===38||code===48)&&values[index+1]===5&&values[index+2]!==undefined){const color=ansi256(values[index+2]);if(code===38)state.fgStyle=color;else state.bgStyle=color;index+=2;}
+      else if((code===38||code===48)&&values[index+1]===2&&values[index+4]!==undefined){const rgb=values.slice(index+2,index+5).map(value=>Math.max(0,Math.min(255,value)));const color=`rgb(${rgb.join(',')})`;if(code===38)state.fgStyle=color;else state.bgStyle=color;index+=4;}
+    }
+  };
+  const pattern=/\x1b\][^\x07\x1b\r\n]*(?:\x07|\x1b\\|(?=\r?\n|$))|\x1b\[[0-?]*[ -/]*[@-~]|\x1b./g;
+  let html='';let last=0;let hasAnsi=false;
+  source.replace(pattern,(match,offset)=>{
+    hasAnsi=true;html+=styled(source.slice(last,offset));
+    const sgr=match.match(/^\x1b\[([0-9;]*)m$/);if(sgr)apply(sgr[1]);
+    last=offset+match.length;return match;
+  });
+  html+=styled(source.slice(last));
+  return{hasAnsi,html};
+}
+function _toolOutputTestSections(text){
+  const lines=String(text??'').replace(/\r\n/g,'\n').split('\n');
+  const metricLine=line=>/^\s*(?:[ℹ#]\s*)?(?:(?:tests?|pass(?:ed)?|fail(?:ed)?|skip(?:ped)?|suites?|cancelled|todo)\s*[:=]?\s*\d+|duration(?:_ms)?\s*[:=]?\s*[0-9.]+\s*(?:ms|s)?)\s*$/i.test(line);
+  const failingIndex=lines.findIndex(line=>/^\s*[✖✗×]?\s*failing tests?\s*:?\s*$/i.test(line));
+  const mainSource=(failingIndex>=0?lines.slice(0,failingIndex):lines).filter(line=>!metricLine(line));
+  const failingSource=failingIndex>=0?lines.slice(failingIndex+1):[];
+  const trimBlankEdges=value=>{
+    const next=value.slice();
+    while(next.length&&!next[0].trim())next.shift();
+    while(next.length&&!next[next.length-1].trim())next.pop();
+    return next.join('\n');
+  };
+  return{main:trimBlankEdges(mainSource),failing:trimBlankEdges(failingSource)};
+}
+function _toolOutputTestResultHtml(text,summary){
+  const info=summary&&typeof summary==='object'?summary:{};
+  const sections=_toolOutputTestSections(text);
+  const badges=[];
+  if(Number(info.total)>0)badges.push(`<span class="tool-output-badge is-info">${esc(info.total)} tests</span>`);
+  if(Number(info.passed)>0)badges.push(`<span class="tool-output-badge is-passed">${esc(info.passed)} passed</span>`);
+  if(Number(info.failed)>0)badges.push(`<span class="tool-output-badge is-failed">${esc(info.failed)} failed</span>`);
+  if(Number(info.skipped)>0)badges.push(`<span class="tool-output-badge is-skipped">${esc(info.skipped)} skipped</span>`);
+  if(info.duration)badges.push(`<span class="tool-output-badge is-info">${esc(info.duration)}</span>`);
+  const clipped=value=>{
+    const source=String(value||'');
+    return source.length>100000?source.slice(0,100000)+'\n… display limit reached; full value remains in raw output …':source;
+  };
+  const main=sections.main?`<pre class="tool-output-test-log"><code>${_toolOutputFormattedHtml(clipped(sections.main))}</code></pre>`:'';
+  const failing=sections.failing
+    ?`<details class="tool-output-failing-tests"${Number(info.failed)>0?' open':''}><summary>Failing tests</summary><pre class="tool-output-test-failure-log"><code>${_toolOutputFormattedHtml(clipped(sections.failing))}</code></pre></details>`
+    :'';
+  return `<div class="tool-output-test-result"><div class="tool-output-test-summary">${badges.join('')}</div>${main}${failing}</div>`;
+}
+function _toolOutputJsonHtml(value){
+  const state={count:0,max:600,seen:new WeakSet(),limitShown:false};
+  const stringHtml=valueText=>{
+    const text=String(valueText);
+    return `<span class="tool-output-json-string">&quot;${_toolOutputTokenHtml(text)}&quot;</span>`;
+  };
+  const render=(item,depth,hint,serializedDepth)=>{
+    if(state.count>=state.max){
+      if(state.limitShown)return'';
+      state.limitShown=true;
+      return'<span class="tool-output-json-truncated">… node limit reached; view raw output …</span>';
+    }
+    state.count+=1;
+    if(item===null)return'<span class="tool-output-json-null">null</span>';
+    if(typeof item==='string'){
+      const nested=_toolOutputNestedStringModel(item,hint,serializedDepth||0);
+      if(!nested)return stringHtml(item);
+      let nestedHtml='';
+      if(nested.kind==='json')nestedHtml=render(nested.value,depth+1,hint,(serializedDepth||0)+1);
+      else if(nested.kind==='code'||nested.kind==='markdown')nestedHtml=_toolOutputCodeHtml(nested.text,nested.language||hint);
+      else{
+        const ansi=_toolOutputAnsiHtml(nested.text);
+        nestedHtml=`<pre class="tool-output-text is-${esc(nested.kind)}"><code>${ansi.hasAnsi?ansi.html:_toolOutputFormattedHtml(nested.text)}</code></pre>`;
+      }
+      return `<details class="tool-output-nested"><summary><span>${esc(nested.label)}</span><span class="tool-output-nested-size">${esc(nested.text.split(/\r?\n/).length)} lines</span></summary>${nestedHtml}</details>`;
+    }
+    if(typeof item==='number')return`<span class="tool-output-json-number">${esc(item)}</span>`;
+    if(typeof item==='boolean')return`<span class="tool-output-json-boolean">${esc(item)}</span>`;
+    if(typeof item!=='object')return`<span class="tool-output-json-null">${esc(String(item))}</span>`;
+    if(state.seen.has(item))return'<span class="tool-output-json-truncated">[Circular]</span>';
+    if(depth>=8)return'<span class="tool-output-json-truncated">… depth limit; view raw output …</span>';
+    state.seen.add(item);
+    const array=Array.isArray(item);
+    const entries=array?item.map((entry,index)=>[String(index),entry]):Object.keys(item).map(key=>[key,item[key]]);
+    const open=array?'[':'{';
+    const close=array?']':'}';
+    const label=array?`${entries.length} items`:`${entries.length} ${entries.length===1?'key':'keys'}`;
+    const row=(entry,index)=>{
+      const key=array?`<span class="tool-output-json-index">${esc(entry[0])}</span>`:`<span class="tool-output-json-key">${esc(JSON.stringify(entry[0]))}</span>`;
+      const rendered=render(entry[1],depth+1,entry[0],serializedDepth||0);
+      if(!rendered)return'';
+      return `<div class="tool-output-json-entry">${key}<span class="tool-output-json-colon">: </span>${rendered}${index<entries.length-1?'<span class="tool-output-json-comma">,</span>':''}</div>`;
+    };
+    const renderedEntries=entries.slice(0,200);
+    const initial=renderedEntries.slice(0,24).map(row).join('');
+    const remaining=renderedEntries.slice(24);
+    const omitted=entries.length-renderedEntries.length;
+    const omittedHtml=omitted>0?`<div class="tool-output-json-truncated">… ${omitted} more; view raw output …</div>`:'';
+    const more=remaining.length||omitted?`<details class="tool-output-json-more"><summary>Show ${entries.length-24} more</summary>${remaining.map((entry,index)=>row(entry,index+24)).join('')}${omittedHtml}</details>`:'';
+    state.seen.delete(item);
+    return `<details class="tool-output-json-node"${depth<2?' open':''}><summary><span class="tool-output-json-punctuation">${open}</span><span class="tool-output-json-count">${label}</span></summary><div class="tool-output-json-children">${initial}${more}</div><div class="tool-output-json-close">${close}</div></details>`;
+  };
+  return `<div class="tool-output-json-tree">${render(value,0,'',0)}</div>`;
+}
+function _toolOutputDisplayModelHtml(model){
+  const valueHtml=(value,key)=>{
+    if(typeof value==='string'){
+      if(key==='status'||key==='ready'){
+        const normalized=value.toLowerCase();
+        const statusKind=/^(?:complete|completed|ready|success|passed|ok)$/.test(normalized)?'success':/^(?:error|failed|failure|fatal)$/.test(normalized)?'error':/^(?:warning|warn|degraded)$/.test(normalized)?'warning':'info';
+        return `<span class="tool-output-value-status is-${statusKind}">${esc(value)}</span>`;
+      }
+      // Metadata is also value-driven. A wrapper may contain more than one
+      // dynamically named multiline field; render each independently instead
+      // of flattening secondary values into a single dense key/value line.
+      const nested=_toolOutputNestedStringModel(value,key,0);
+      if(nested){
+        if(nested.kind==='json')return _toolOutputJsonHtml(nested.value);
+        if(nested.kind==='code'||nested.kind==='markdown')return _toolOutputCodeHtml(nested.text,nested.language||key);
+        return textHtml(nested.text,nested.kind);
+      }
+      return _toolOutputTokenHtml(value);
+    }
+    if(value===null)return'<span class="tool-output-empty-value">Not provided</span>';
+    if(Array.isArray(value)&&value.length===0)return'<span class="tool-output-empty-value">None</span>';
+    if(value&&typeof value==='object'&&!Array.isArray(value)&&Object.keys(value).length===0)return'<span class="tool-output-empty-value">None</span>';
+    if(typeof value==='number')return`<span class="tool-output-json-number">${esc(value)}</span>`;
+    if(typeof value==='boolean')return`<span class="tool-output-json-boolean">${esc(value)}</span>`;
+    return _toolOutputJsonHtml(value);
+  };
+  const metadataHtml=(values,className)=>{
+    const rows=Object.keys(values||{}).map(key=>{
+      const labels={cwd:'Working Directory',duration:'Duration',shell:'Shell',url:'URL',title:'Title',status:'Status',ready:'Status',warning:'Warning',stealth_warning:'Warning',errors:'Errors',overflow:'Overflow',rows:'Rows',exit_code:'Exit Code',http_status:'HTTP Status',status_code:'Status Code'};
+      const label=labels[key]||key.replace(/_/g,' ').replace(/\b\w/g,char=>char.toUpperCase());
+      const labelKind=key==='warning'||key==='stealth_warning'?' is-warning':key==='errors'&&Number(values[key])>0?' is-error':'';
+      return `<div class="tool-output-kv-row"><span class="tool-output-kv-label${labelKind}">${esc(label)}</span><div class="tool-output-kv-value">${valueHtml(values[key],key)}</div></div>`;
+    }).join('');
+    return rows?`<div class="tool-output-kv ${className||''}">${rows}</div>`:'';
+  };
+  const textHtml=(text,kind)=>{
+    const source=String(text??'');
+    const limit=30000;
+    const first=source.slice(0,limit);
+    const rest=source.slice(limit,100000);
+    const body=`<pre class="tool-output-text is-${esc(kind||'text')}"><code>${_toolOutputFormattedHtml(first)}</code></pre>`;
+    if(!rest)return body;
+    const clipped=source.length>100000?'\n… display limit reached; full value remains in raw output …':'';
+    return body+`<details class="tool-output-show-more"><summary>Show more</summary><pre class="tool-output-text is-${esc(kind||'text')}"><code>${_toolOutputFormattedHtml(rest+clipped)}</code></pre></details>`;
+  };
+  if(!model)return'';
+  const remainderWarning=!!(model.remainder&&/\bwarning\b/i.test(String(model.remainder.text||'')));
+  const remainderHtml=model.remainder
+    ?`<section class="tool-output-mixed-remainder${remainderWarning?' is-warning':''}"><div class="tool-output-section-label">${remainderWarning?'Warning':'Additional output'}</div>${_toolOutputDisplayModelHtml(model.remainder)}</section>`
+    :'';
+  if(model.kind==='command-result'){
+    const testSummary=model.testSummary&&model.testSummary.detected?model.testSummary:null;
+    const testOutputModel=model.output&&typeof model.output.text==='string'?model.output:null;
+    const terminal=(value,stream)=>{
+      if(!value)return'';
+      const source=String(value);
+      if(testSummary&&stream==='stdout'&&!testOutputModel){
+        return `<section class="tool-output-terminal-section is-${esc(stream)}" data-tool-output-stream="${esc(stream)}"><div class="tool-output-section-label">Stdout</div>${_toolOutputTestResultHtml(source,testSummary)}</section>`;
+      }
+      const display=source.slice(0,100000);
+      const ansi=_toolOutputAnsiHtml(display);
+      const clipped=source.length>display.length?'\n… display limit reached; full value remains in raw output …':'';
+      const body=(ansi.hasAnsi?ansi.html:_toolOutputFormattedHtml(display))+esc(clipped);
+      return `<section class="tool-output-terminal-section is-${esc(stream)}" data-tool-output-stream="${esc(stream)}"><div class="tool-output-section-label">${stream==='stderr'?'Stderr':'Stdout'}</div><pre class="tool-output-terminal-output"><code>${body}</code></pre></section>`;
+    };
+    const invocation=model.invocation&&typeof model.invocation==='object'
+      ?model.invocation
+      :(model.command?{kind:'command',label:'Command',value:model.command,language:model.shell}:null);
+    const invocationHtml=invocation&&invocation.value
+      ?invocation.kind==='code'
+        ?`<section class="tool-output-terminal-section is-command is-code"><div class="tool-output-command-heading"><div class="tool-output-section-label">${esc(invocation.label||'Code')}</div><button type="button" class="tool-output-copy-command" onclick="event.stopPropagation();copyToolStructuredOutputCommand(this)">Copy ${esc(String(invocation.label||'Code').toLowerCase())}</button></div>${_toolOutputCodeHtml(invocation.value,invocation.language||'python')}</section>`
+        :`<section class="tool-output-terminal-section is-command"><div class="tool-output-command-heading"><div class="tool-output-section-label">${esc(invocation.label||'Command')}</div><button type="button" class="tool-output-copy-command" onclick="event.stopPropagation();copyToolStructuredOutputCommand(this)">Copy command</button></div>${_toolOutputCommandHtml(invocation.value,invocation.language||model.shell)}</section>`
+      :'';
+    const metadata=metadataHtml(model.metadata,'tool-output-command-metadata');
+    const status=Number.isInteger(model.exitCode)?`<div class="tool-output-terminal-status"><span class="tool-output-token-exit ${model.exitCode===0?'is-success':'is-error'}">Exit ${esc(model.exitCode)}</span></div>`:'';
+    const output=model.output?`<section class="tool-output-terminal-section is-output"><div class="tool-output-section-label">Output</div>${testSummary&&testOutputModel?_toolOutputTestResultHtml(testOutputModel.text,testSummary):_toolOutputDisplayModelHtml(model.output)}</section>`:'';
+    return `<div class="tool-output-command-result">${invocationHtml}${metadata}${terminal(model.stdout,'stdout')}${terminal(model.stderr,'stderr')}${output}${remainderHtml}${status}</div>`;
+  }
+  if(model.kind==='json'){
+    const tree=_toolOutputJsonHtml(model.value);
+    if(model.nested===true){
+      const count=Array.isArray(model.value)?`${model.value.length} items`:`${Object.keys(model.value||{}).length} keys`;
+      return `<details class="tool-output-nested" open><summary><span>Nested JSON</span><span class="tool-output-nested-size">${esc(count)}</span></summary>${tree}</details>`;
+    }
+    return`<section class="tool-output-structured"><div class="tool-output-section-label">Structured data</div>${tree}</section>${remainderHtml}`;
+  }
+  if(model.kind==='content-wrapper'){
+    const source=String(model.contentRaw||model.content&&model.content.text||model.content&&model.content.raw||'');
+    const lineCount=source?source.split(/\r?\n/).length:0;
+    const contentKind=model.content&&model.content.kind||'content';
+    const contentKindLabel=contentKind==='markdown'?'Markdown source':contentKind==='code'?'Source code':contentKind==='json'?'Structured content':contentKind==='stack'?'Stack trace':'Content';
+    const opened=source.length<=1800?' open':'';
+    return `${metadataHtml(model.metadata,'tool-output-wrapper-metadata')}<section class="tool-output-structured tool-output-content-section"><div class="tool-output-content-header"><div class="tool-output-section-label">${esc(model.contentLabel||'Content')}</div><button type="button" class="tool-output-copy-content" onclick="event.stopPropagation();copyToolStructuredOutputContent(this)">Copy content</button></div><details class="tool-output-content-document"${opened}><summary>${esc(contentKindLabel)}${lineCount?` · ${esc(lineCount)} lines`:''}</summary><div class="tool-output-content-body">${_toolOutputDisplayModelHtml(model.content)}</div></details></section>${remainderHtml}`;
+  }
+  if(model.kind==='browser-result'){
+    const snapshot=model.snapshot?`<details class="tool-output-browser-snapshot"><summary>${esc(model.snapshotLabel||'Page snapshot')}</summary>${_toolOutputDisplayModelHtml(model.snapshot)}</details>`:'';
+    const extra=model.extra?`<details class="tool-output-browser-extra"><summary>Additional data</summary>${_toolOutputJsonHtml(model.extra)}</details>`:'';
+    return `${metadataHtml(model.metadata,'tool-output-browser-metadata')}${snapshot}${extra}${remainderHtml}`;
+  }
+  if(model.kind==='patch-failure'){
+    const intro=model.intro&&model.intro.length?textHtml(model.intro.join('\n'),'error'):'';
+    const files=(model.files||[]).map(file=>{
+      const details=file.details&&file.details.length?textHtml(file.details.join('\n'),'error'):'';
+      const hunks=(file.hunks||[]).map(hunk=>`<section class="tool-output-patch-hunk"><div class="tool-output-patch-hunk-label">Hunk ${esc(hunk.number)}</div>${textHtml((hunk.details||[]).join('\n'),'error')}</section>`).join('');
+      return `<details class="tool-output-patch-file" open><summary><span>File</span>${_toolOutputTokenHtml(file.path)}</summary>${details}${hunks}</details>`;
+    }).join('');
+    return `<div class="tool-output-patch-failures">${intro}${files}</div>`;
+  }
+  if(model.kind==='key-value'){
+    const values={};
+    for(const entry of model.entries||[])values[entry.key]=entry.value;
+    return metadataHtml(values,'tool-output-command-metadata')+(model.remainder?textHtml(model.remainder,'text'):'');
+  }
+  if(model.kind==='code'||model.kind==='markdown')return _toolOutputCodeHtml(model.text,model.language||model.kind);
+  const numberedTranscript=_toolOutputNumberedTranscriptHtml(model.text);
+  if(numberedTranscript)return numberedTranscript;
+  return textHtml(model.text,model.kind);
+}
+function _toolDiagnosticHeading(line){
+  const text=String(line||'').trim();
+  let match=text.match(/^(?:-{3,}|={3,})\s*(.*?)\s*(?:-{3,}|={3,})$/);
+  if(!match)match=text.match(/^#{1,4}\s+(.+?)\s*#*$/);
+  if(!match)match=text.match(/^(Ahead\s*\/?\s*Behind|Recent commits?|Remotes?|Repository status|Git diagnostics|Errors?)\s*:\s*$/i);
+  const label=String(match&&match[1]||'').replace(/\s+/g,' ').trim();
+  return label&&label.length<=80?label:'';
+}
+function _toolDiagnosticIsErrorText(text){
+  return /(?:command not found|not recognized as (?:an internal|a command)|authentication failed|not authenticated|permission denied|access denied|fatal:|error:|failed to|could not|unable to|unauthorized|forbidden|timed?\s*out|no such file)/i.test(String(text||''));
+}
+function _toolDiagnosticSections(raw, tc){
+  const lines=String(raw||'').replace(/\r\n/g,'\n').split('\n');
+  const sections=[];
+  let current=null;
+  const flush=()=>{
+    if(!current)return;
+    const body=current.lines.join('\n').replace(/^\s+|\s+$/g,'');
+    if(body)sections.push({label:current.label||'Output',body,error:_toolDiagnosticIsErrorText(body)||/error|fail/i.test(current.label||'')});
+    current=null;
+  };
+  for(const line of lines){
+    const heading=_toolDiagnosticHeading(line);
+    if(heading){flush();current={label:heading,lines:[]};continue;}
+    if(!current)current={label:'',lines:[]};
+    current.lines.push(line);
+  }
+  flush();
+  if(sections.length===1&&sections[0].label==='Output'){
+    const command=String(tc&&(_toolFullCommandLabel(tc)||_toolTargetLabel(tc))||'');
+    if(_toolDiagnosticIsErrorText(raw)||tc&&tc.is_error)sections[0].label='Errors';
+    else if(/\bgit\s+log\b/i.test(command))sections[0].label='Recent commits';
+    else if(/\bgit\s+remote\b/i.test(command))sections[0].label='Remotes';
+    else if(/\bgit\s+(?:status|rev-list|branch)\b/i.test(command))sections[0].label='Ahead / Behind';
+  }
+  return sections;
+}
+function _toolChangeSummaryData(raw, command, structuredFiles){
+  const text=String(raw||'').replace(/\r\n/g,'\n');
+  const cmd=String(command||'').trim();
+  const diffCommand=/\bgit\b[^\n;&|]*\bdiff\b/i.test(cmd);
+  const statusCommand=/\bgit\b[^\n;&|]*\bstatus\b/i.test(cmd);
+  const inspectionCommand=diffCommand||statusCommand||
+    /\bgit\b[^\n;&|]*\b(?:rev-list|merge-base)\b/i.test(cmd)||
+    /\bgit\b[^\n;&|]*\bbranch\b[^\n;&|]*(?:-vv|--verbose)/i.test(cmd)||
+    /\b(?:ahead|behind)\b/i.test(cmd)||
+    /(?:changed[-_ ]files?|change[-_ ]summary|repo(?:sitory)?[-_ ]?(?:check|inspect|diagnostic)|migration[-_ ]?(?:check|inspect))/i.test(cmd);
+  const filesByPath=new Map();
+  let detected=false;
+  let added=null;
+  let removed=null;
+  let explicitFileCount=null;
+  const cleanPath=value=>{
+    let path=String(value||'').trim();
+    path=path.replace(/^[\u0027\u0022\u0060]+|[\u0027\u0022\u0060,;]+$/g,'').replace(/^\.\//,'');
+    if(!path||path.length>320||path.includes('://')||path==='/dev/null')return'';
+    if(!/[./]/.test(path))return'';
+    return path;
+  };
+  const integer=value=>{
+    const number=Number.parseInt(String(value),10);
+    return Number.isFinite(number)&&number>=0?number:null;
+  };
+  const addFile=(value,fileAdded,fileRemoved)=>{
+    const path=cleanPath(value);
+    if(!path)return;
+    const nextAdded=integer(fileAdded);
+    const nextRemoved=integer(fileRemoved);
+    const existing=filesByPath.get(path)||{path,added:null,removed:null};
+    if(nextAdded!==null)existing.added=existing.added===null?nextAdded:Math.max(existing.added,nextAdded);
+    if(nextRemoved!==null)existing.removed=existing.removed===null?nextRemoved:Math.max(existing.removed,nextRemoved);
+    filesByPath.set(path,existing);
+  };
+  if(Array.isArray(structuredFiles)&&structuredFiles.length){
+    for(const file of structuredFiles){
+      if(!file||typeof file!=='object')continue;
+      const stats=file.stats&&typeof file.stats==='object'?file.stats:{};
+      addFile(file.path,stats.added??file.added??file.insertions,stats.removed??file.removed??file.deletions);
+    }
+    if(filesByPath.size)detected=true;
+  }
+  for(const line of text.split('\n')){
+    let match=line.match(/^\s*(\d+)\s+files? changed(?:,\s*(\d+)\s+insertions?\(\+\))?(?:,\s*(\d+)\s+deletions?\(-\))?\s*$/i);
+    if(match){
+      explicitFileCount=integer(match[1]);
+      added=match[2]===undefined?added:integer(match[2]);
+      removed=match[3]===undefined?removed:integer(match[3]);
+      detected=true;
+      continue;
+    }
+    match=line.match(/^\s*(\d+|-)\t(\d+|-)\t(.+?)\s*$/);
+    if(match&&(diffCommand||inspectionCommand)){
+      addFile(match[3],match[1]==='-'?null:match[1],match[2]==='-'?null:match[2]);
+      detected=true;
+      continue;
+    }
+    match=line.match(/^\s*(.+?)\s+\|\s+(\d+)(?:\s+[+\-.]+)?\s*$/);
+    if(match){addFile(match[1]);detected=true;continue;}
+    if(statusCommand){
+      match=line.match(/^\s*(?:[ MADRCU?!]{1,2}|(?:modified|deleted|renamed|copied|new file|untracked):)\s+(.+?)\s*$/i);
+      if(match){
+        const path=match[1].includes(' -> ')?match[1].split(' -> ').pop():match[1];
+        addFile(path);
+        detected=true;
+        continue;
+      }
+    }
+    if(diffCommand&&/(?:--name-only|--name-status)/i.test(cmd)){
+      match=line.match(/^\s*(?:[MADRCU]\d*\s+)?([^\s].*?)\s*$/);
+      if(match&&cleanPath(match[1])){addFile(match[1]);detected=true;}
+    }
+  }
+  if((statusCommand||inspectionCommand)&&text.trim())detected=true;
+  const files=Array.from(filesByPath.values());
+  const structuredAdded=files.length&&files.every(file=>file.added!==null)
+    ? files.reduce((sum,file)=>sum+file.added,0):null;
+  const structuredRemoved=files.length&&files.every(file=>file.removed!==null)
+    ? files.reduce((sum,file)=>sum+file.removed,0):null;
+  if(added===null&&structuredAdded!==null)added=structuredAdded;
+  if(removed===null&&structuredRemoved!==null)removed=structuredRemoved;
+  return {
+    detected,
+    files,
+    file_count:explicitFileCount===null?(files.length?files.length:null):explicitFileCount,
+    added,
+    removed,
+    kind:diffCommand?'diff':statusCommand?'status':inspectionCommand?'inspection':'overview',
+  };
+}
+function _toolChangeSummaryInfo(tc,toolKind){
+  if(!tc||tc.done===false||tc.is_error)return null;
+  const name=String(tc.name||'').replace(/^functions\./,'').toLowerCase();
+  if(toolKind==='write'||/^(?:write_file|patch|edit_file|create_file|mcp_filesystem_write_file|mcp_filesystem_edit_file)$/.test(name))return null;
+  const raw=_toolDiagnosticRawOutput(tc);
+  if(!raw.trim())return null;
+  if(/(?:command not found|authentication failed|permission denied|fatal:|error:|failed to|could not|unable to|unauthorized|forbidden|timed?\s*out|no such file)/i.test(raw))return null;
+  const isDiff=typeof _workspaceDiffLooksUseful==='function'
+    ? _workspaceDiffLooksUseful(raw)
+    : (typeof _snippetLooksLikeDiff==='function'&&_snippetLooksLikeDiff(raw));
+  if(isDiff)return null;
+  const command=String(_toolFullCommandLabel(tc)||_toolTargetLabel(tc)||'');
+  const preview=tc.mutation_preview||tc.mutationPreview||{};
+  const metadata=typeof _toolOutputStructuredMetadata==='function'?_toolOutputStructuredMetadata(tc):{};
+  const explicitKind=String(metadata.output_kind||metadata.outputKind||metadata.kind||'').toLowerCase().replace(/[_ ]+/g,'-');
+  const metadataFiles=Array.isArray(metadata.files)?metadata.files:(Array.isArray(metadata.changed_files)?metadata.changed_files:[]);
+  const structuredFiles=preview&&Array.isArray(preview.files)&&preview.files.length?preview.files:metadataFiles;
+  const data=_toolChangeSummaryData(raw,command,structuredFiles);
+  const explicitSummary=explicitKind==='repository-summary'||explicitKind==='change-summary'||explicitKind==='diff-summary'||explicitKind==='change-inspection';
+  if(!data.detected&&!explicitSummary)return null;
+  if(explicitSummary){
+    data.detected=true;
+    const number=value=>{
+      const parsed=Number(value);
+      return Number.isFinite(parsed)&&parsed>=0?parsed:null;
+    };
+    data.file_count=number(metadata.file_count??metadata.fileCount)??data.file_count;
+    data.added=number(metadata.added??metadata.insertions)??data.added;
+    data.removed=number(metadata.removed??metadata.deletions)??data.removed;
+    if(explicitKind==='diff-summary')data.kind='diff';
+    else if(explicitKind==='change-inspection')data.kind='inspection';
+  }
+  let title='Change Overview';
+  if(data.kind==='diff')title='Diff Summary';
+  else if(data.kind==='status')title='Repository Changes';
+  else if(data.kind==='inspection')title='Change Inspection';
+  if(metadata.title)title=String(metadata.title).slice(0,100);
+  return {...data,title,raw,source:command||String(preview.source||name||'Repository inspection')};
+}
+function _toolChangeSummaryBodyHtml(info,opts){
+  opts=opts||{};
+  const files=Array.isArray(info&&info.files)?info.files:[];
+  const metrics=[];
+  if(Number.isFinite(info&&info.file_count))metrics.push(`<span class="tool-change-summary-metric"><strong>${esc(info.file_count)}</strong> ${info.file_count===1?'file':'files'}</span>`);
+  if(Number.isFinite(info&&info.added))metrics.push(`<span class="tool-change-summary-metric is-added">+${esc(info.added)}</span>`);
+  if(Number.isFinite(info&&info.removed))metrics.push(`<span class="tool-change-summary-metric is-removed">−${esc(info.removed)}</span>`);
+  const shown=opts.showFiles===false?[]:files.slice(0,12);
+  const fileRows=shown.map(file=>{
+    const additions=Number.isFinite(file.added)?`<span class="tool-change-summary-additions">+${esc(file.added)}</span>`:'';
+    const deletions=Number.isFinite(file.removed)?`<span class="tool-change-summary-deletions">−${esc(file.removed)}</span>`:'';
+    return `<div class="tool-change-summary-file"><span class="tool-change-summary-path">${esc(file.path)}</span>`+
+      `<span class="tool-change-summary-file-actions"><span class="tool-change-summary-file-stats">${additions}${deletions}</span>`+
+      `<button type="button" class="tool-change-summary-open" onclick="if(typeof openChangedTurnPath==='function')openChangedTurnPath(this.closest('.tool-change-summary-file').querySelector('.tool-change-summary-path').textContent)">Open file</button></span></div>`;
+  }).join('');
+  const more=opts.showFiles!==false&&files.length>shown.length?`<div class="tool-change-summary-more">+${files.length-shown.length} more files</div>`:'';
+  const source=info&&info.source?`<div class="tool-change-summary-source"><span>Source</span><code>${esc(info.source)}</code></div>`:'';
+  const rawAction=opts.rawAction===false?'':`<button type="button" class="tool-change-summary-raw-toggle" aria-expanded="false" onclick="toggleToolChangeSummaryRaw(this)">View raw output</button><pre class="tool-change-summary-raw" hidden><code></code></pre>`;
+  return `<div class="tool-change-summary-metrics">${metrics.join('')}</div>${source}`+
+    (fileRows?`<div class="tool-change-summary-files">${fileRows}${more}</div>`:'')+rawAction;
+}
+function toggleToolChangeSummaryRaw(button){
+  if(!button)return;
+  const row=button.closest('.tool-card-row');
+  const output=button.nextElementSibling;
+  if(!output)return;
+  const opening=output.hidden;
+  output.hidden=!opening;
+  button.setAttribute('aria-expanded',String(opening));
+  button.textContent=opening?'Hide raw output':'View raw output';
+  if(opening&&!output.dataset.loaded){
+    const code=output.querySelector('code');
+    const raw=String(row&&row._changeSummaryRaw||'');
+    if(code)code.textContent=raw.length>50000?raw.slice(0,50000)+'\n… raw output clipped …':raw;
+    output.dataset.loaded='1';
+  }
+}
+function _buildToolChangeSummaryCard(row,tc,info){
+  const neutral=typeof li==='function'?li('info',14):'';
+  row.innerHTML=`<div class="tool-card tool-change-summary-card">`+
+    `<div class="tool-change-summary-header"><span class="tool-change-summary-icon">${neutral}</span><span class="tool-change-summary-title">${esc(info.title||'Change Overview')}</span></div>`+
+    `<div class="tool-change-summary-body">${_toolChangeSummaryBodyHtml(info)}</div></div>`;
+  row.setAttribute('data-tool-change-summary','1');
+  row._changeSummaryRaw=String(info.raw||'');
+  row._tcData=tc;
+  return row;
+}
+function _toolCommandDiagnosticInfo(tc,toolKind){
+  if(!tc||tc.done===false)return null;
+  const raw=_toolDiagnosticRawOutput(tc);
+  if(!raw.trim())return null;
+  const isDiff=typeof _workspaceDiffLooksUseful==='function'
+    ? _workspaceDiffLooksUseful(raw)
+    : (typeof _snippetLooksLikeDiff==='function'&&_snippetLooksLikeDiff(raw));
+  if(isDiff)return null;
+  const command=String(_toolFullCommandLabel(tc)||_toolTargetLabel(tc)||'');
+  const headings=raw.split(/\r?\n/).map(_toolDiagnosticHeading).filter(Boolean);
+  const repositorySignal=/\b(?:git|gh)\b/i.test(command)||/(?:ahead\s*\/?\s*behind|recent commits?|\bremotes?\b|working tree|upstream branch|repository)/i.test(raw);
+  const errorSignal=!!tc.is_error||_toolDiagnosticIsErrorText(raw);
+  if(toolKind!=='shell'&&!headings.length&&!errorSignal)return null;
+  if(!repositorySignal&&!headings.length&&!errorSignal)return null;
+  let title='Command output';
+  if(repositorySignal&&errorSignal)title='Git diagnostics';
+  else if(repositorySignal)title='Repository status';
+  else if(errorSignal)title='Command output';
+  return {title,raw,sections:_toolDiagnosticSections(raw,tc),error:errorSignal};
+}
+function _buildToolDiagnosticCard(row,tc,info){
+  const warning='<svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M10.3 2.9 1.8 17a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 2.9a2 2 0 0 0-3.4 0Z"/><path d="M12 9v4"/><path d="M12 17h.01"/></svg>';
+  const neutral=typeof li==='function'?li('terminal',14):'';
+  const sections=(info.sections||[]).map(section=>{
+    const body=String(section.body||'');
+    const clipped=body.length>12000?body.slice(0,12000)+'\n… section clipped …':body;
+    return `<section class="tool-diagnostic-section${section.error?' is-error':''}"><div class="tool-diagnostic-section-label">${esc(section.label||'Output')}</div><pre><code>${esc(clipped)}</code></pre></section>`;
+  }).join('');
+  const raw=String(info.raw||'');
+  const clippedRaw=raw.length>50000?raw.slice(0,50000)+'\n… raw output clipped …':raw;
+  row.innerHTML=`<div class="tool-card tool-diagnostic-card${info.error?' is-error':''}">`+
+    `<div class="tool-diagnostic-header"><span class="tool-diagnostic-icon">${info.error?warning:neutral}</span><span class="tool-diagnostic-title">${esc(info.title||'Command output')}</span></div>`+
+    `<div class="tool-diagnostic-sections">${sections}</div>`+
+    `<details class="tool-diagnostic-raw"><summary>View raw output</summary><pre><code>${esc(clippedRaw)}</code></pre></details>`+
+    `</div>`;
+  row.setAttribute('data-tool-diagnostic','1');
+  row._tcData=tc;
+  return row;
+}
+function toggleToolStructuredOutputRaw(button){
+  if(!button)return;
+  const row=button.closest('.tool-card-row');
+  const body=button.closest('.tool-output-body');
+  const output=body&&body.querySelector('.tool-output-raw');
+  if(!output)return;
+  const opening=output.hidden;
+  output.hidden=!opening;
+  button.setAttribute('aria-expanded',String(opening));
+  button.textContent=opening?'Hide raw output':'View raw output';
+  if(opening&&!output.dataset.loaded){
+    const code=output.querySelector('code');
+    const liveRaw=typeof _materializeLiveToolOutputRawPreview==='function'
+      ?_materializeLiveToolOutputRawPreview(row)
+      :null;
+    let raw=liveRaw===null?String(row&&row._toolOutputRaw||''):liveRaw;
+    if(!raw&&row&&row._tcData)raw=_toolDiagnosticRawOutput(row._tcData);
+    if(!raw&&row&&typeof _transparentToolCallFromRowDataset==='function'){
+      const recovered=_transparentToolCallFromRowDataset(row);
+      if(recovered)raw=_toolDiagnosticRawOutput(recovered);
+    }
+    if(code)code.textContent=raw;
+    output.dataset.loaded='1';
+  }
+}
+function copyToolStructuredOutputRaw(button){
+  if(!button)return;
+  const row=button.closest('.tool-card-row');
+  const liveRaw=typeof _materializeLiveToolOutputRawPreview==='function'
+    ?_materializeLiveToolOutputRawPreview(row)
+    :null;
+  let raw=liveRaw===null&&row&&Object.prototype.hasOwnProperty.call(row,'_toolOutputRaw')?String(row._toolOutputRaw):(liveRaw||'');
+  if(!raw&&row&&row._tcData)raw=_toolDiagnosticRawOutput(row._tcData);
+  const original=button.textContent;
+  const done=label=>{button.textContent=label;setTimeout(()=>{button.textContent=original;},1200);};
+  if(typeof _copyText==='function')_copyText(raw).then(()=>done('Copied')).catch(()=>done('Copy failed'));
+}
+function copyToolStructuredOutputContent(button){
+  if(!button)return;
+  const row=button.closest('.tool-card-row');
+  const content=row&&Object.prototype.hasOwnProperty.call(row,'_toolOutputContentRaw')?String(row._toolOutputContentRaw):'';
+  const original=button.textContent;
+  const done=label=>{button.textContent=label;setTimeout(()=>{button.textContent=original;},1200);};
+  if(typeof _copyText==='function')_copyText(content).then(()=>done('Copied')).catch(()=>done('Copy failed'));
+}
+function copyToolStructuredOutputCommand(button){
+  if(!button)return;
+  const row=button.closest('.tool-card-row');
+  const command=row&&Object.prototype.hasOwnProperty.call(row,'_toolOutputCommand')?String(row._toolOutputCommand):'';
+  const original=button.textContent;
+  const done=label=>{button.textContent=label;setTimeout(()=>{button.textContent=original;},1200);};
+  if(typeof _copyText==='function')_copyText(command).then(()=>done('Copied')).catch(()=>done('Copy failed'));
+}
+function _toolOutputHighlightSettled(row){
+  if(!row||typeof row.querySelectorAll!=='function')return;
+  const highlight=()=>{
+    if(typeof Prism==='undefined'||typeof Prism.highlightElement!=='function')return;
+    const addCommandWrapHints=code=>{
+      if(!code||!code.hasAttribute||!code.hasAttribute('data-tool-output-command')||code.dataset.toolOutputWrapHints==='1')return;
+      const operators=code.querySelectorAll('.token.operator');
+      if(!operators.length)return;
+      code.dataset.toolOutputWrapHints='1';
+      for(const operator of operators){
+        if(!/^(?:&&|\|\||\||;)$/.test(operator.textContent||''))continue;
+        operator.after(document.createElement('wbr'));
+      }
+    };
+    if(Prism.hooks&&typeof Prism.hooks.add==='function'&&!Prism._hermesToolOutputCompleteHook){
+      Prism._hermesToolOutputCompleteHook=true;
+      Prism.hooks.add('complete',env=>addCommandWrapHints(env&&env.element));
+    }
+    for(const code of row.querySelectorAll('code[data-tool-output-prism]')){
+      if(code.dataset.toolOutputHighlighted==='1'||String(code.textContent||'').length>50000)continue;
+      code.dataset.toolOutputHighlighted='1';
+      try{
+        Prism.highlightElement(code);
+        addCommandWrapHints(code);
+      }catch(_){/* Escaped plain text remains readable if Prism/autoload fails. */}
+    }
+  };
+  if(typeof requestAnimationFrame==='function')requestAnimationFrame(highlight);else highlight();
+}
+function _buildToolStructuredOutputCard(row,tc,info){
+  const kind=String(info&&info.kind||'raw');
+  const severity=String(info&&info.severity||'info');
+  const iconName=severity==='error'?'x':severity==='warning'?'alert-triangle':severity==='success'?'check':'terminal';
+  const icon=typeof li==='function'?li(iconName,14):'';
+  const counts=info&&info.counts||{};
+  const badges=[];
+  const executionStatus=String(info&&info.executionStatus||'');
+  if(executionStatus)badges.push(`<span class="tool-output-badge is-execution is-${esc(executionStatus)}">${esc(executionStatus.replace(/^\w/,char=>char.toUpperCase()))}</span>`);
+  if(Number.isInteger(info&&info.exitCode))badges.push(`<span class="tool-output-badge is-exit ${info.exitCode===0?'is-success':'is-error'}">Exit ${esc(info.exitCode)}</span>`);
+  if(Number.isInteger(info&&info.httpStatus))badges.push(`<span class="tool-output-badge is-http ${info.httpStatus>=400?'is-error':info.httpStatus>=300?'is-warning':info.httpStatus>=200?'is-success':'is-info'}">HTTP ${esc(info.httpStatus)}</span>`);
+  if(Number(counts.passed)>0)badges.push(`<span class="tool-output-badge is-passed">${esc(counts.passed)} passed</span>`);
+  if(Number(counts.failed)>0)badges.push(`<span class="tool-output-badge is-failed">${esc(counts.failed)} failed</span>`);
+  if(Number(counts.skipped)>0)badges.push(`<span class="tool-output-badge is-skipped">${esc(counts.skipped)} skipped</span>`);
+  const displayModel=_toolOutputDisplayModel(tc,info);
+  const command=info&&info.command&&displayModel.kind!=='command-result'?`<div class="tool-output-meta"><span>Command</span><code class="tool-output-command">${esc(info.command)}</code></div>`:'';
+  const operation=info&&info.operation?`<div class="tool-output-meta"><span>Operation</span><code class="tool-output-operation">${esc(info.operation)}</code></div>`:'';
+  const invocationFields=info&&info.invocation&&info.invocation.kind==='parameters'&&info.invocation.fields?info.invocation.fields:null;
+  const invocation=invocationFields?`<details class="tool-output-invocation"><summary>${esc(info.invocation.label||'Inputs')}</summary><div class="tool-output-kv tool-output-invocation-fields">${Object.entries(invocationFields).map(([key,value])=>`<div class="tool-output-kv-row"><span class="tool-output-kv-label">${esc(String(key).replace(/_/g,' ').replace(/\b\w/g,char=>char.toUpperCase()))}</span><div class="tool-output-kv-value">${_toolOutputTokenHtml(value)}</div></div>`).join('')}</div></details>`:'';
+  const target=info&&info.target?`<div class="tool-output-meta"><span>Target</span><code class="tool-output-target">${_toolOutputTokenHtml(info.target)}</code></div>`:'';
+  const url=info&&info.url&&displayModel.kind!=='browser-result'?`<div class="tool-output-meta"><span>URL</span><a href="${esc(info.url)}" target="_blank" rel="noopener noreferrer">${esc(info.url)}</a></div>`:'';
+  const suggestion=info&&info.suggestion?`<div class="tool-output-suggestion"><span>Suggestion</span><p>${esc(info.suggestion)}</p></div>`:'';
+  const displayHtml=_toolOutputDisplayModelHtml(displayModel);
+  const summaryText=String(info&&info.summary||'').trim();
+  const duplicatePlainDetail=displayModel&&displayModel.kind==='text'&&String(displayModel.text||'').trim()===summaryText;
+  const formatted=duplicatePlainDetail?'':`<div class="tool-output-formatted" data-content-kind="${esc(displayModel&&displayModel.kind||'text')}">${displayHtml}</div>`;
+  const expanded=info&&info.expanded===true;
+  const running=executionStatus==='running';
+  const runIndicator=running?'<span class="tool-card-running-dot"></span>':'';
+  row.innerHTML=`<div class="tool-card tool-output-card is-${esc(severity)}${running?' tool-card-running':''}${expanded?' open':''}" data-tool-output-kind="${esc(kind)}" data-tool-execution-status="${esc(executionStatus)}">`+
+    `<div class="tool-card-header tool-output-header" role="button" tabindex="0" aria-expanded="${expanded?'true':'false'}" onclick="this.closest('.tool-card').classList.toggle('open');this.setAttribute('aria-expanded',String(this.closest('.tool-card').classList.contains('open')))" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();this.click()}">`+
+    runIndicator+
+    `<span class="tool-card-icon tool-output-icon">${icon}</span>`+
+    `<span class="tool-card-name tool-output-kind-label">${esc(info&&info.label||'Output')}</span>`+
+    `<span class="tool-output-title">${_toolOutputTokenHtml(info&&info.title||'Output')}</span>`+
+    `<span class="tool-output-badges">${badges.join('')}</span>`+
+    `<span class="tool-card-toggle">${typeof li==='function'?li('chevron-right',12):''}</span></div>`+
+    `<div class="tool-card-detail"><div class="tool-output-body">`+
+    (info&&info.summary?`<div class="tool-output-summary">${_toolOutputTokenHtml(info.summary)}</div>`:'')+
+    command+operation+target+invocation+url+suggestion+
+    formatted+
+    `<div class="tool-output-actions"><button type="button" class="tool-output-raw-toggle" aria-expanded="false" onclick="event.stopPropagation();toggleToolStructuredOutputRaw(this)">View raw output</button>`+
+    `<button type="button" class="tool-output-copy-raw" onclick="event.stopPropagation();copyToolStructuredOutputRaw(this)">Copy raw</button></div>`+
+    `<pre class="tool-output-raw" hidden><code></code></pre>`+
+    `</div></div></div>`;
+  row.setAttribute('data-tool-structured-output','1');
+  row.setAttribute('data-tool-output-kind',kind);
+  row.setAttribute('data-tool-output-model',String(displayModel&&displayModel.kind||''));
+  row.setAttribute('data-tool-execution-status',executionStatus);
+  row._toolOutputRaw=String(info&&info.raw||'');
+  row._toolOutputCommand=displayModel&&displayModel.kind==='command-result'?String(displayModel.invocation&&displayModel.invocation.value||displayModel.command||''):'';
+  row._toolOutputCommandLanguage=displayModel&&displayModel.kind==='command-result'?String(displayModel.invocation&&displayModel.invocation.language||displayModel.shell||''):'';
+  row._toolOutputContentRaw=displayModel&&displayModel.kind==='content-wrapper'?String(displayModel.contentRaw||displayModel.content&&displayModel.content.text||displayModel.content&&displayModel.content.raw||''):'';
+  row._tcData=tc;
+  if(typeof _toolOutputHighlightSettled==='function')_toolOutputHighlightSettled(row);
+  return row;
+}
 function buildToolCard(tc){
   const row=document.createElement('div');
   row.className='tool-card-row';
@@ -17662,6 +22023,12 @@ function buildToolCard(tc){
   row.dataset.toolActionLabel=typeof _toolActionLabelText==='function'?_toolActionLabelText(tc):_toolDisplayName(tc);
   const disclosureKey=typeof _toolDisclosureIdentity==='function'?_toolDisclosureIdentity(tc):'';
   if(disclosureKey) row.setAttribute('data-tool-disclosure-key', disclosureKey);
+  const changeSummaryInfo=typeof _toolChangeSummaryInfo==='function'?_toolChangeSummaryInfo(tc,toolKind):null;
+  if(changeSummaryInfo&&typeof _buildToolChangeSummaryCard==='function')return _buildToolChangeSummaryCard(row,tc,changeSummaryInfo);
+  const structuredOutputInfo=typeof _toolStructuredOutputInfo==='function'?_toolStructuredOutputInfo(tc,toolKind):null;
+  if(structuredOutputInfo&&typeof _buildToolStructuredOutputCard==='function')return _buildToolStructuredOutputCard(row,tc,structuredOutputInfo);
+  const diagnosticInfo=typeof _toolCommandDiagnosticInfo==='function'?_toolCommandDiagnosticInfo(tc,toolKind):null;
+  if(diagnosticInfo&&typeof _buildToolDiagnosticCard==='function')return _buildToolDiagnosticCard(row,tc,diagnosticInfo);
   const icon=toolIcon(tc.name);
   const hasRawDetail=!!(tc.snippet)||(tc.args&&Object.keys(tc.args).length>0);
   const allowsDetail=typeof _toolCardAllowsDetail==='function'?_toolCardAllowsDetail(toolKind,tc):true;
@@ -17895,6 +22262,480 @@ function _activityLiveProgressLabel(group){
   return 'Starting agent';
 }
 
+function _preserveLiveStructuredCommandPresentation(existing,replacement){
+  if(!existing||!replacement||typeof existing.getAttribute!=='function'||typeof replacement.getAttribute!=='function')return false;
+  if(existing.getAttribute('data-tool-output-model')!=='command-result'||replacement.getAttribute('data-tool-output-model')!=='command-result')return false;
+  const oldCommand=String(existing._toolOutputCommand||'');
+  const nextCommand=String(replacement._toolOutputCommand||'');
+  const oldLanguage=String(existing._toolOutputCommandLanguage||'');
+  const nextLanguage=String(replacement._toolOutputCommandLanguage||'');
+  if(!oldCommand||oldCommand!==nextCommand||oldLanguage!==nextLanguage)return false;
+  const oldSection=existing.querySelector&&existing.querySelector('.tool-output-terminal-section.is-command');
+  const nextSection=replacement.querySelector&&replacement.querySelector('.tool-output-terminal-section.is-command');
+  if(!oldSection||!nextSection||typeof nextSection.replaceWith!=='function')return false;
+  // Move the already-highlighted command subtree into the next lifecycle
+  // render. stdout/stderr/status can update independently without reparsing
+  // Prism syntax or losing the command's horizontal scroll position.
+  nextSection.replaceWith(oldSection);
+  return true;
+}
+
+function _syncLiveToolElementAttributes(existing,replacement){
+  if(!existing||!replacement||typeof existing.getAttributeNames!=='function'||typeof replacement.getAttributeNames!=='function')return;
+  const nextNames=new Set(replacement.getAttributeNames());
+  for(const name of existing.getAttributeNames())if(!nextNames.has(name))existing.removeAttribute(name);
+  for(const name of nextNames)existing.setAttribute(name,replacement.getAttribute(name));
+}
+
+const _liveToolPresentationRestoreQueue=new Map();
+let _liveToolPresentationRestoreFrame=0;
+let _liveToolPresentationRestoreMicrotask=false;
+function _flushLiveToolPresentationRestoreQueue(clearQueue){
+  const entries=Array.from(_liveToolPresentationRestoreQueue.entries());
+  if(clearQueue)_liveToolPresentationRestoreQueue.clear();
+  // A scene-level restore already covers queued row descendants. Keeping only
+  // the shallowest connected roots avoids O(rows²) stale restore bursts when
+  // Electron resumes a throttled frame after many streaming updates.
+  const active=entries.filter(([candidate])=>candidate&&candidate.isConnected!==false);
+  for(const [candidate,pending] of active){
+    const covered=active.some(([other])=>(
+      other!==candidate&&typeof other.contains==='function'&&other.contains(candidate)
+    ));
+    if(!covered)_restoreWorklogDetailDisclosureState(candidate,pending.state,pending.guard);
+  }
+}
+function _queueLiveToolPresentationRestore(root,state,guard){
+  if(!root||!state||!state.size)return;
+  _liveToolPresentationRestoreQueue.set(root,{state,guard});
+  // Reparented overflow nodes can reset in Chromium's layout flush before the
+  // next paint. Repair in a coalesced microtask so a background/throttled rAF
+  // cannot leave scrollTop=0 long enough for the following stream tick to
+  // capture that corrupted value as the new source of truth.
+  if(!_liveToolPresentationRestoreMicrotask&&typeof queueMicrotask==='function'){
+    _liveToolPresentationRestoreMicrotask=true;
+    queueMicrotask(()=>{
+      _liveToolPresentationRestoreMicrotask=false;
+      _flushLiveToolPresentationRestoreQueue(false);
+    });
+  }
+  if(typeof requestAnimationFrame!=='function')return;
+  if(_liveToolPresentationRestoreFrame)return;
+  _liveToolPresentationRestoreFrame=requestAnimationFrame(()=>{
+    _liveToolPresentationRestoreFrame=0;
+    _flushLiveToolPresentationRestoreQueue(true);
+  });
+}
+function _restoreLiveToolPresentation(root,state){
+  if(!root||!state||!state.size)return;
+  _restoreWorklogDetailDisclosureState(root,state);
+  // Prism and disclosure layout can settle one frame after the DOM update.
+  // Record the exact post-restore presentation so a throttled Electron rAF
+  // cannot replay stale state over a newer user scroll/expand interaction.
+  const guard=_captureToolPresentationRestoreGuard(root);
+  _queueLiveToolPresentationRestore(root,state,guard);
+}
+
+function _reconcileLiveStructuredCommandCard(existing,replacement){
+  if(!existing||!replacement||existing.getAttribute('data-tool-output-model')!=='command-result'||replacement.getAttribute('data-tool-output-model')!=='command-result')return false;
+  if(String(existing._toolOutputCommand||'')!==String(replacement._toolOutputCommand||'')||String(existing._toolOutputCommandLanguage||'')!==String(replacement._toolOutputCommandLanguage||''))return false;
+  const oldCard=existing.querySelector('.tool-output-card');
+  const nextCard=replacement.querySelector('.tool-output-card');
+  const oldHeader=oldCard&&oldCard.querySelector('.tool-output-header');
+  const nextHeader=nextCard&&nextCard.querySelector('.tool-output-header');
+  const oldDetail=oldCard&&oldCard.querySelector('.tool-card-detail');
+  const nextDetail=nextCard&&nextCard.querySelector('.tool-card-detail');
+  const oldBody=oldDetail&&oldDetail.querySelector('.tool-output-body');
+  const nextBody=nextDetail&&nextDetail.querySelector('.tool-output-body');
+  const oldFormatted=oldBody&&oldBody.querySelector('.tool-output-formatted');
+  const nextFormatted=nextBody&&nextBody.querySelector('.tool-output-formatted');
+  if(!oldCard||!nextCard||!oldHeader||!nextHeader||!oldDetail||!nextDetail||!oldBody||!nextBody||!oldFormatted||!nextFormatted)return false;
+  const state=_captureWorklogDetailDisclosureState(existing);
+  const detailMode=oldDetail.getAttribute('data-transparent-detail-mode')||'';
+
+  // Keep the already-highlighted command and every terminal viewport as the
+  // exact same DOM nodes. Only their contents/status decorations are updated.
+  _preserveLiveStructuredCommandPresentation(existing,replacement);
+  for(const stream of ['stdout','stderr']){
+    const oldSection=oldFormatted.querySelector(`[data-tool-output-stream="${stream}"]`);
+    const nextSection=nextFormatted.querySelector(`[data-tool-output-stream="${stream}"]`);
+    const oldPre=oldSection&&oldSection.querySelector('.tool-output-terminal-output');
+    const nextPre=nextSection&&nextSection.querySelector('.tool-output-terminal-output');
+    if(!oldPre||!nextPre)continue;
+    const oldCode=oldPre.querySelector('code');
+    const nextCode=nextPre.querySelector('code');
+    if(oldCode&&nextCode)oldCode.innerHTML=nextCode.innerHTML;
+    _syncLiveToolElementAttributes(oldPre,nextPre);
+    nextPre.replaceWith(oldPre);
+  }
+  const oldRaw=oldBody.querySelector('.tool-output-raw');
+  const nextRaw=nextBody.querySelector('.tool-output-raw');
+  if(oldRaw&&nextRaw)nextRaw.replaceWith(oldRaw);
+
+  _syncLiveToolElementAttributes(oldFormatted,nextFormatted);
+  oldFormatted.replaceChildren(...Array.from(nextFormatted.childNodes));
+  nextFormatted.replaceWith(oldFormatted);
+  _syncLiveToolElementAttributes(oldBody,nextBody);
+  oldBody.replaceChildren(...Array.from(nextBody.childNodes));
+  _syncLiveToolElementAttributes(oldDetail,nextDetail);
+  _syncLiveToolElementAttributes(oldHeader,nextHeader);
+  oldHeader.replaceChildren(...Array.from(nextHeader.childNodes));
+  _syncLiveToolElementAttributes(oldCard,nextCard);
+  _syncLiveToolElementAttributes(existing,replacement);
+  for(const prop of ['_toolOutputRaw','_toolOutputCommand','_toolOutputCommandLanguage','_toolOutputContentRaw','_tcData']){
+    if(Object.prototype.hasOwnProperty.call(replacement,prop))existing[prop]=replacement[prop];
+  }
+  if(replacement.getAttribute('data-tool-execution-status')!=='running'&&typeof _disposeLiveToolOutputStreamingState==='function'){
+    _disposeLiveToolOutputStreamingState(existing);
+  }
+  if(detailMode){
+    oldDetail.setAttribute('data-transparent-detail-mode',detailMode);
+    const tab=oldDetail.querySelector(`.transparent-detail-mode[data-mode="${detailMode}"]`);
+    if(tab&&typeof _setTransparentDetailMode==='function')_setTransparentDetailMode(tab,detailMode);
+  }
+  _restoreLiveToolPresentation(existing,state);
+  return true;
+}
+
+function _reconcileLiveToolResultCardInPlace(existing,replacement){
+  if(!existing||!replacement||!existing.querySelector||!replacement.querySelector)return false;
+  const oldCard=existing.querySelector('.tool-card');
+  const nextCard=replacement.querySelector('.tool-card');
+  if(!oldCard||!nextCard||!oldCard.replaceChildren||!nextCard.replaceWith)return false;
+  const state=_captureWorklogDetailDisclosureState(existing);
+  const oldDetail=oldCard.querySelector('.tool-card-detail');
+  const detailMode=oldDetail&&oldDetail.getAttribute('data-transparent-detail-mode')||'';
+
+  // Pair overflow containers by semantic role and ordinal, then move the old
+  // nodes into the fresh presentation from the leaves upward. Their generated
+  // contents change, but their browser-owned scroll state and node identity do
+  // not. This covers structured JSON/content, browser snapshots, diagnostics,
+  // logs, warnings/errors, and Raw Output without teaching each model a custom
+  // completion lifecycle.
+  const collect=root=>{
+    const counts=Object.create(null);
+    const map=new Map();
+    root.querySelectorAll(_toolResultScrollableSelector).forEach(el=>{
+      const role=_toolResultElementRole(el);
+      const idx=counts[role]||0;
+      counts[role]=idx+1;
+      map.set(`${role}#${idx}`,el);
+    });
+    return map;
+  };
+  const oldScrollers=collect(existing);
+  const nextScrollers=collect(replacement);
+  const depth=el=>{
+    let value=0;
+    for(let node=el&&el.parentElement;node;node=node.parentElement)value++;
+    return value;
+  };
+  const pairs=[];
+  for(const [key,next] of nextScrollers){
+    const old=oldScrollers.get(key);
+    if(old&&old.tagName===next.tagName&&typeof old.replaceChildren==='function'&&typeof next.replaceWith==='function')pairs.push({old,next});
+  }
+  pairs.sort((a,b)=>depth(b.next)-depth(a.next));
+  for(const {old,next} of pairs){
+    _syncLiveToolElementAttributes(old,next);
+    old.replaceChildren(...Array.from(next.childNodes));
+    next.replaceWith(old);
+  }
+
+  _syncLiveToolElementAttributes(oldCard,nextCard);
+  oldCard.replaceChildren(...Array.from(nextCard.childNodes));
+  nextCard.replaceWith(oldCard);
+  _syncLiveToolElementAttributes(existing,replacement);
+  existing.replaceChildren(...Array.from(replacement.childNodes));
+  for(const prop of ['_toolOutputRaw','_toolOutputCommand','_toolOutputCommandLanguage','_toolOutputContentRaw','_tcData']){
+    if(Object.prototype.hasOwnProperty.call(replacement,prop))existing[prop]=replacement[prop];
+  }
+  const restoredDetail=oldCard.querySelector('.tool-card-detail');
+  if(detailMode&&restoredDetail){
+    restoredDetail.setAttribute('data-transparent-detail-mode',detailMode);
+    const tab=restoredDetail.querySelector(`.transparent-detail-mode[data-mode="${detailMode}"]`);
+    if(tab&&typeof _setTransparentDetailMode==='function')_setTransparentDetailMode(tab,detailMode);
+  }
+  _restoreLiveToolPresentation(existing,state);
+  return true;
+}
+
+function _replaceLiveToolCardPreservingResultState(existing,replacement){
+  if(_reconcileLiveToolResultCardInPlace(existing,replacement))return existing;
+  const state=_captureWorklogDetailDisclosureState(existing);
+  _preserveLiveStructuredCommandPresentation(existing,replacement);
+  existing.replaceWith(replacement);
+  _restoreLiveToolPresentation(replacement,state);
+  return replacement;
+}
+
+// Running command output deliberately uses a much lighter renderer than the
+// settled result. Fast stdout producers can deliver tens of thousands of
+// characters per second; rebuilding semantic HTML for the entire visible tail
+// on every append turns that linear stream into quadratic work and starves the
+// Electron renderer. The final tool result still goes through the normal ANSI
+// and semantic formatter exactly once when the lifecycle settles.
+const _LIVE_TOOL_OUTPUT_FLUSH_MS=50;
+const _LIVE_TOOL_OUTPUT_TRIM_AT=120000;
+const _LIVE_TOOL_OUTPUT_KEEP_CHARS=100000;
+const _LIVE_TOOL_OUTPUT_UNPINNED_TRIM_AT=450000;
+const _LIVE_TOOL_OUTPUT_UNPINNED_KEEP_CHARS=400000;
+const _LIVE_TOOL_OUTPUT_RAW_KEEP_CHARS=200000;
+
+function _liveToolOutputNow(){
+  return typeof performance!=='undefined'&&typeof performance.now==='function'?performance.now():Date.now();
+}
+
+function _appendBoundedLiveToolRawPreview(row,text){
+  if(!row)return;
+  let state=row._liveOutputRawPreviewState;
+  if(!state){
+    const commandResult=row.querySelector&&row.querySelector('.tool-output-command-result');
+    const initial=['stdout','stderr'].map(stream=>{
+      const section=commandResult&&commandResult.querySelector(`[data-tool-output-stream="${stream}"]`);
+      const code=section&&section.querySelector('code');
+      return String(code&&code.textContent||'');
+    }).filter(Boolean).join('\n');
+    state=row._liveOutputRawPreviewState={parts:initial?[initial]:[],chars:initial.length};
+  }
+  const value=String(text??'');
+  if(!value)return;
+  state.parts.push(value);
+  state.chars+=value.length;
+  let excess=state.chars-_LIVE_TOOL_OUTPUT_RAW_KEEP_CHARS;
+  while(excess>0&&state.parts.length){
+    const first=state.parts[0];
+    if(first.length<=excess){
+      state.parts.shift();
+      state.chars-=first.length;
+      excess-=first.length;
+    }else{
+      state.parts[0]=first.slice(excess);
+      state.chars-=excess;
+      excess=0;
+    }
+  }
+}
+
+function _materializeLiveToolOutputRawPreview(row){
+  const state=row&&row._liveOutputRawPreviewState;
+  return state&&Array.isArray(state.parts)?state.parts.join(''):null;
+}
+
+function _liveToolOutputStreamingText(row,stream,text,final){
+  row._liveOutputControlStates=row._liveOutputControlStates||{};
+  const state=row._liveOutputControlStates[stream]||(row._liveOutputControlStates[stream]={ansiCarry:'',crCarry:''});
+  let source=state.ansiCarry+String(text??'');
+  state.ansiCarry='';
+  const escapeIndex=source.lastIndexOf('\x1b');
+  if(escapeIndex>=0){
+    const suffix=source.slice(escapeIndex);
+    const incomplete=suffix==='\x1b'
+      ||/^\x1b\[[0-?]*[ -/]*$/.test(suffix)
+      ||/^\x1b\][^\x07\x1b\r\n]*(?:\x1b)?$/.test(suffix);
+    if(incomplete){
+      if(!final)state.ansiCarry=suffix.slice(-4096);
+      source=source.slice(0,escapeIndex);
+    }
+  }
+  // Strip terminal controls from the lightweight live view. The authoritative
+  // completion payload is parsed by _toolOutputAnsiHtml, so terminal colours
+  // still appear after completion without exposing raw escape characters while
+  // the process is active.
+  source=source.replace(/\x1b\][^\x07\x1b\r\n]*(?:\x07|\x1b\\|(?=\r?\n|$))|\x1b\[[0-?]*[ -/]*[@-~]|\x1b./g,'');
+  source=state.crCarry+source;
+  state.crCarry='';
+  if(!final&&source.endsWith('\r')){
+    state.crCarry='\r';
+    source=source.slice(0,-1);
+  }
+  return source.replace(/\r\n/g,'\n').replace(/\r/g,'\n').replace(/[\x00-\x08\x0b\x0c\x0e-\x1a\x1c-\x1f\x7f]/g,'');
+}
+
+function _appendLiveToolOutputText(code,text,state,followTail){
+  if(!code||!state)return 0;
+  if(!state.textNode||state.textNode.parentNode!==code){
+    const initial=String(code.textContent||'');
+    state.textNode=document.createTextNode(initial);
+    state.markerNode=null;
+    state.omittedChars=0;
+    state.lineBreaks=(initial.match(/\n/g)||[]).length;
+    code.replaceChildren(state.textNode);
+  }
+  const value=String(text??'');
+  if(value){
+    state.textNode.appendData(value);
+    state.lineBreaks+=(value.match(/\n/g)||[]).length;
+  }
+  const trimAt=followTail?_LIVE_TOOL_OUTPUT_TRIM_AT:_LIVE_TOOL_OUTPUT_UNPINNED_TRIM_AT;
+  const keepChars=followTail?_LIVE_TOOL_OUTPUT_KEEP_CHARS:_LIVE_TOOL_OUTPUT_UNPINNED_KEEP_CHARS;
+  let removed=0;
+  if(state.textNode.length>trimAt){
+    removed=state.textNode.length-keepChars;
+    const removedText=state.textNode.data.slice(0,removed);
+    state.lineBreaks-= (removedText.match(/\n/g)||[]).length;
+    state.textNode.deleteData(0,removed);
+    state.omittedChars=(state.omittedChars||0)+removed;
+    if(!state.markerNode){
+      state.markerNode=document.createTextNode('');
+      code.insertBefore(state.markerNode,state.textNode);
+    }
+    state.markerNode.data=`[..., ${state.omittedChars} earlier output characters omitted from live view ...]\n`;
+  }
+  return removed;
+}
+
+function _disposeLiveToolOutputStreamingState(row){
+  if(!row)return;
+  const schedule=row._liveOutputScheduleState;
+  if(schedule){
+    if(schedule.timer)clearTimeout(schedule.timer);
+    if(schedule.raf&&typeof cancelAnimationFrame==='function')cancelAnimationFrame(schedule.raf);
+  }
+  delete row._liveOutputScheduleState;
+  delete row._liveOutputPendingChunks;
+  delete row._liveOutputPendingRawChunks;
+  delete row._liveOutputTextStates;
+  delete row._liveOutputRawDisplayState;
+  delete row._liveOutputControlStates;
+  delete row._liveOutputRawPreviewState;
+  delete row._liveOutputFlushNow;
+  delete row._liveOutputRenderPending;
+}
+
+function _flushLiveToolOutputRow(row,opts){
+  opts=opts||{};
+  if(!row)return false;
+  const schedule=row._liveOutputScheduleState||(row._liveOutputScheduleState={lastFlushAt:0,timer:0,raf:0});
+  if(schedule.timer){clearTimeout(schedule.timer);schedule.timer=0;}
+  if(schedule.raf&&typeof cancelAnimationFrame==='function'){cancelAnimationFrame(schedule.raf);schedule.raf=0;}
+  row._liveOutputRenderPending=false;
+  if(row.isConnected===false){_disposeLiveToolOutputStreamingState(row);return false;}
+  schedule.lastFlushAt=_liveToolOutputNow();
+  const commandResult=row.querySelector&&row.querySelector('.tool-output-command-result');
+  if(!commandResult)return false;
+  for(const nextStream of ['stdout','stderr']){
+    const pending=row._liveOutputPendingChunks&&row._liveOutputPendingChunks[nextStream]||[];
+    const delta=pending.length===1?pending[0]:pending.join('');
+    if(row._liveOutputPendingChunks)row._liveOutputPendingChunks[nextStream]=[];
+    const nextSection=commandResult.querySelector(`[data-tool-output-stream="${nextStream}"]`);
+    const code=nextSection&&nextSection.querySelector('code');
+    if(!code||(!delta&&!opts.final))continue;
+    const viewport=nextSection.querySelector('.tool-output-terminal-output');
+    const scrollState=_captureToolResultScrollPosition(viewport);
+    const displayDelta=_liveToolOutputStreamingText(row,nextStream,delta,!!opts.final);
+    row._liveOutputTextStates=row._liveOutputTextStates||{};
+    const textState=row._liveOutputTextStates[nextStream]||(row._liveOutputTextStates[nextStream]={});
+    _appendLiveToolOutputText(code,displayDelta,textState,!scrollState||scrollState.followTail);
+    nextSection.dataset.toolOutputLineCount=String(Math.max(0,Number(textState.lineBreaks)||0)+(textState.textNode&&textState.textNode.length?1:0));
+    _restoreToolResultScrollPosition(viewport,scrollState);
+  }
+  const rawPending=row._liveOutputPendingRawChunks||[];
+  const rawDelta=rawPending.length===1?rawPending[0]:rawPending.join('');
+  row._liveOutputPendingRawChunks=[];
+  const rawBlock=row.querySelector&&row.querySelector('.tool-output-raw');
+  if(rawBlock&&rawDelta){
+    const rawScrollState=rawBlock.hidden?null:_captureToolResultScrollPosition(rawBlock);
+    const rawCode=rawBlock.querySelector('code');
+    row._liveOutputRawDisplayState=row._liveOutputRawDisplayState||{};
+    _appendLiveToolOutputText(rawCode,rawDelta,row._liveOutputRawDisplayState,!rawScrollState||rawScrollState.followTail);
+    if(rawBlock.hidden)rawBlock.removeAttribute('data-loaded');else rawBlock.dataset.loaded='1';
+    _restoreToolResultScrollPosition(rawBlock,rawScrollState);
+  }
+  if(typeof scrollIfPinned==='function')scrollIfPinned();
+  const hasPending=row._liveOutputPendingChunks&&(
+    row._liveOutputPendingChunks.stdout.length||row._liveOutputPendingChunks.stderr.length
+  )||row._liveOutputPendingRawChunks&&row._liveOutputPendingRawChunks.length;
+  if(hasPending&&!opts.final)_scheduleLiveToolOutputRowFlush(row);
+  return true;
+}
+
+function _scheduleLiveToolOutputRowFlush(row){
+  if(!row||row._liveOutputRenderPending)return;
+  const schedule=row._liveOutputScheduleState||(row._liveOutputScheduleState={lastFlushAt:0,timer:0,raf:0});
+  row._liveOutputRenderPending=true;
+  const remaining=Math.max(0,_LIVE_TOOL_OUTPUT_FLUSH_MS-(_liveToolOutputNow()-schedule.lastFlushAt));
+  const requestPaint=()=>{
+    schedule.timer=0;
+    const paint=()=>{schedule.raf=0;_flushLiveToolOutputRow(row);};
+    if(typeof requestAnimationFrame==='function')schedule.raf=requestAnimationFrame(paint);else schedule.timer=setTimeout(paint,0);
+  };
+  if(remaining>1)schedule.timer=setTimeout(requestPaint,remaining);else requestPaint();
+}
+
+function appendLiveToolOutputChunk(tc,stream,chunk){
+  if(!tc||!S.session||!S.activeStreamId)return false;
+  const opts=arguments[3]||{};
+  if(opts.sessionId&&S.session.session_id!==opts.sessionId)return false;
+  if(opts.streamId&&S.activeStreamId!==opts.streamId)return false;
+  const tid=String(tc.tid||tc.id||tc.tool_call_id||tc.tool_use_id||tc.call_id||'');
+  if(!tid)return false;
+  const turn=$('liveAssistantTurn');
+  const row=turn&&turn.querySelector(`.tool-card-row[data-live-tid="${CSS.escape(tid)}"]`);
+  if(!row){
+    appendLiveToolCard(tc,opts);
+    return false;
+  }
+  const commandResult=row.querySelector('.tool-output-command-result');
+  if(!commandResult){
+    appendLiveToolCard(tc,opts);
+    return false;
+  }
+  const streamName=String(stream||'stdout').toLowerCase()==='stderr'?'stderr':'stdout';
+  let section=commandResult.querySelector(`[data-tool-output-stream="${streamName}"]`);
+  if(!section){
+    section=document.createElement('section');
+    section.className=`tool-output-terminal-section is-${streamName}`;
+    section.dataset.toolOutputStream=streamName;
+    const label=document.createElement('div');
+    label.className='tool-output-section-label';
+    label.textContent=streamName==='stderr'?'Stderr':'Stdout';
+    const pre=document.createElement('pre');
+    pre.className='tool-output-terminal-output';
+    pre.appendChild(document.createElement('code'));
+    section.append(label,pre);
+    const before=commandResult.querySelector('.tool-output-terminal-section.is-output,.tool-output-terminal-status');
+    if(before)commandResult.insertBefore(section,before);else commandResult.appendChild(section);
+  }
+  row._tcData=tc;
+  const rawBlock=row.querySelector('.tool-output-raw');
+  // A closed raw view remains lazy. An open raw view is updated in the same
+  // paint as stdout/stderr so its scroll lifecycle matches the terminal view.
+  if(rawBlock&&rawBlock.hidden)rawBlock.removeAttribute('data-loaded');
+  row._liveOutputPendingChunks=row._liveOutputPendingChunks||{stdout:[],stderr:[]};
+  const value=String(chunk??'');
+  row._liveOutputPendingChunks[streamName].push(value);
+  row._liveOutputPendingRawChunks=row._liveOutputPendingRawChunks||[];
+  row._liveOutputPendingRawChunks.push(value);
+  _appendBoundedLiveToolRawPreview(row,value);
+  row._liveOutputFlushNow=flushOpts=>_flushLiveToolOutputRow(row,flushOpts);
+  _scheduleLiveToolOutputRowFlush(row);
+  return true;
+}
+function flushLiveToolOutputChunks(tc,opts){
+  opts=opts||{};
+  if(opts.sessionId&&(!S.session||S.session.session_id!==opts.sessionId))return false;
+  if(opts.streamId&&S.activeStreamId!==opts.streamId)return false;
+  const tid=String(tc&&(tc.tid||tc.id||tc.tool_call_id||tc.tool_use_id||tc.call_id)||'');
+  if(!tid)return false;
+  const turn=$('liveAssistantTurn');
+  const row=turn&&turn.querySelector(`.tool-card-row[data-live-tid="${CSS.escape(tid)}"]`);
+  return !!(row&&typeof row._liveOutputFlushNow==='function'&&row._liveOutputFlushNow({final:!!opts.final}));
+}
+function flushAllLiveToolOutputChunks(opts){
+  const turn=$('liveAssistantTurn');
+  if(!turn||!turn.querySelectorAll)return 0;
+  let count=0;
+  for(const row of turn.querySelectorAll('.tool-card-row[data-live-tid]')){
+    if(typeof row._liveOutputFlushNow==='function'&&row._liveOutputFlushNow({final:!!(opts&&opts.final)}))count+=1;
+  }
+  return count;
+}
+if(typeof window!=='undefined'){
+  window.appendLiveToolOutputChunk=appendLiveToolOutputChunk;
+  window.flushLiveToolOutputChunks=flushLiveToolOutputChunks;
+  window.flushAllLiveToolOutputChunks=flushAllLiveToolOutputChunks;
+}
+
 // ── Live tool card helpers (called during SSE streaming) ──
 // Live cards are inserted INLINE inside #msgInner (tagged with data-live-tid)
 // so the streaming layout matches the settled layout produced by renderMessages
@@ -17911,7 +22752,13 @@ function appendLiveToolCard(tc){
   if(opts.streamId&&S.activeStreamId!==opts.streamId) return;
   if(typeof isFinalAnswerOnlyMode==='function'&&isFinalAnswerOnlyMode()) return;
   if(isLiveAnchorActivitySceneOwner(opts.streamId||S.activeStreamId)){
-    _renderLiveAnchorActivitySceneForStream(opts.streamId||S.activeStreamId, opts.sessionId||S.session.session_id);
+    if(!opts.anchorAlreadyRendered){
+      _renderLiveAnchorActivitySceneForStream(
+        opts.streamId||S.activeStreamId,
+        opts.sessionId||S.session.session_id,
+        {animateMutationDiffs:true}
+      );
+    }
     return;
   }
   let turn=$('liveAssistantTurn');
@@ -17931,6 +22778,9 @@ function appendLiveToolCard(tc){
   const burstAnchor=burstId?_findLatestVisibleLiveAssistantByBurst(inner, burstId):null;
   const anchor=segmentAnchor||burstAnchor||_findLatestVisibleLiveAssistant(inner)||children.filter(el=>el.matches('[data-live-assistant="1"]')).pop();
   const effectiveSegmentSeq=anchor&&anchor.getAttribute?anchor.getAttribute('data-live-segment-seq')||segmentSeq:segmentSeq;
+  if(typeof _appendLiveModifiedFilesCard==='function' && _appendLiveModifiedFilesCard(tc,{inner,anchor,segmentSeq:effectiveSegmentSeq,burstId})){
+    return;
+  }
   if(isTransparentStream()){
     const insertTransparentRow=(row)=>{
       const liveFooter=inner.querySelector('#liveRunStatus');
@@ -17955,6 +22805,12 @@ function appendLiveToolCard(tc){
           burstId,
         });
         replacement.dataset.liveTid=tid;
+        if(_reconcileLiveStructuredCommandCard(existing,replacement)){
+          _syncTransparentEventControls(turn);
+          _moveLiveRunStatusToTurnEnd();
+          if(typeof scrollIfPinned==='function')scrollIfPinned();
+          return;
+        }
         // Preserve the user's expand state + detail tab across tool completion:
         // the running row is rebuilt fresh on toolComplete, which would otherwise
         // snap an expanded row shut and reset its Full/Output tab. The detail-mode
@@ -17974,7 +22830,7 @@ function appendLiveToolCard(tc){
             _setTransparentCardOpen(_newCard,true);
           }
         }catch(_){ /* non-fatal: completion still renders, just collapsed */ }
-        existing.replaceWith(replacement);
+        _replaceLiveToolCardPreservingResultState(existing,replacement);
         _syncTransparentEventControls(turn);
         _moveLiveRunStatusToTurnEnd();
         if(typeof scrollIfPinned==='function') scrollIfPinned();
@@ -18012,7 +22868,9 @@ function appendLiveToolCard(tc){
     if(existing){
       const replacement=buildToolCard(tc);
       replacement.dataset.liveTid=tid;
-      existing.replaceWith(replacement);
+      if(!_reconcileLiveStructuredCommandCard(existing,replacement)){
+        _replaceLiveToolCardPreservingResultState(existing,replacement);
+      }
       _syncToolCallGroupSummary(group);
       _moveLiveRunStatusToTurnEnd();
       if(typeof scrollIfPinned==='function') scrollIfPinned();
@@ -18075,8 +22933,9 @@ function _findLiveAssistantAnchorForSegment(inner, segmentSeq){
 
 function clearLiveToolCards(){
   if(typeof _clearActivityElapsedTimer==='function') _clearActivityElapsedTimer();
+  if(typeof _resetLiveAssistantModifiedFiles==='function') _resetLiveAssistantModifiedFiles();
   const inner=_assistantTurnBlocks($('liveAssistantTurn'));
-  if(inner) inner.querySelectorAll('.live-worklog[data-live-worklog-shell],.tool-worklog-group[data-live-tool-call-group],.tool-call-group[data-live-tool-call-group],.tool-card-row[data-live-tid]:not(.transparent-event-row),[data-anchor-scene-owner="1"],[data-anchor-scene-row="1"]').forEach(el=>el.remove());
+  if(inner) inner.querySelectorAll('.assistant-live-modified-files-row[data-live-mutations="1"],.live-worklog[data-live-worklog-shell],.tool-worklog-group[data-live-tool-call-group],.tool-call-group[data-live-tool-call-group],.tool-card-row[data-live-tid]:not(.transparent-event-row),[data-anchor-scene-owner="1"],[data-anchor-scene-row="1"]').forEach(el=>el.remove());
   // Reset the per-turn user expand intent so the next turn starts at the
   // default collapsed state (#1298).
   if(typeof _clearLiveActivityUserIntent==='function') _clearLiveActivityUserIntent();
@@ -18175,35 +23034,50 @@ function ensureLiveWorklogShell(){
 
 // ── Edit + Regenerate ──
 
+function _messagePartsForUserMessage(m, fallbackText){
+  const persistedParts = _browserWorkbenchContextPartsHaveElement(m&&m.parts) ? m.parts : (m&&m.browser_context_parts);
+  if(_browserWorkbenchContextPartsHaveElement(persistedParts))return persistedParts;
+  const parsed=parseBrowserWorkbenchContext(fallbackText||msgContent(m)||'');
+  return _browserWorkbenchContextPartsHaveElement(parsed)?parsed:[];
+}
 function editMessage(btn) {
   if(S.busy) return;
   const row = btn.closest('[data-msg-idx]');
   if(!row) return;
   const msgIdx = parseInt(row.dataset.msgIdx, 10);
-  const originalText = row.dataset.rawText || '';
+  const originalMessage = S.messages&&S.messages[msgIdx];
+  const originalText = row.dataset.rawText || msgContent(originalMessage) || '';
+  const originalParts = originalMessage&&originalMessage.role==='user' ? _messagePartsForUserMessage(originalMessage, originalText) : [];
   const body = row.querySelector('.msg-body');
   if(!body || row.dataset.editing) return;
   row.dataset.editing = '1';
 
-  // Replace msg-body with an editable textarea
-  const ta = document.createElement('textarea');
-  ta.className = 'msg-edit-area';
-  ta.value = originalText;
+  // Replace msg-body with the same ordered rich-parts editor used by the composer.
+  const ta = document.createElement('div');
+  ta.className = 'msg-edit-area composer-editor';
+  ta.setAttribute('contenteditable','true');
+  ta.setAttribute('role','textbox');
+  ta.setAttribute('aria-multiline','true');
+  ta.setAttribute('aria-label','Edit message');
+  if(_browserWorkbenchContextPartsHaveElement(originalParts))_composerSetBrowserContextParts(ta, originalParts);
+  else _appendComposerPlainText(ta, originalText);
+  _installRichMessagePartsClipboard(ta,{onChange:()=>autoResizeTextarea(ta)});
   body.replaceWith(ta);
   // Resize after DOM insertion so scrollHeight is correct
-  requestAnimationFrame(() => { autoResizeTextarea(ta); ta.focus(); ta.setSelectionRange(ta.value.length, ta.value.length); });
+  requestAnimationFrame(() => { autoResizeTextarea(ta); ta.focus(); _composerSetSelectionOffset(ta,_composerEditorPlainText(ta).length,_composerEditorPlainText(ta).length); });
   ta.addEventListener('input', () => autoResizeTextarea(ta));
 
-  // Action bar below the textarea
+  // Action bar below the rich edit input
   const bar = document.createElement('div');
   bar.className = 'msg-edit-bar';
   bar.innerHTML = `<button class="msg-edit-send">Send edit</button><button class="msg-edit-cancel">Cancel</button>`;
   ta.after(bar);
 
   bar.querySelector('.msg-edit-send').onclick = async () => {
-    const newText = ta.value.trim();
-    if(!newText) return;
-    await submitEdit(msgIdx, newText);
+    const editParts = _messagePartsFromEditor(ta);
+    const newText = _composerEditorPlainText(ta).trim();
+    if(!newText&&!_browserWorkbenchContextPartsHaveElement(editParts)) return;
+    await submitEdit(msgIdx, newText, editParts);
   };
   bar.querySelector('.msg-edit-cancel').onclick = () => cancelEdit(row, originalText, body);
 
@@ -18226,7 +23100,7 @@ function autoResizeTextarea(ta) {
   ta.style.height = Math.min(ta.scrollHeight, 300) + 'px';
 }
 
-async function submitEdit(msgIdx, newText) {
+async function submitEdit(msgIdx, newText, editParts) {
   if(!S.session || S.busy) return;
   const initialSid = S.session.session_id;
   const absoluteKeepCount = _oldestIdx + msgIdx;
@@ -18239,6 +23113,8 @@ async function submitEdit(msgIdx, newText) {
     await _ensureAllMessagesLoaded();
   }
   if(!S.session || S.session.session_id !== initialSid) return;
+  // Truncate session at msgIdx (keep messages before the edited one)
+  // then re-send the edited text and ordered browser-element parts.
   try {
     await api('/api/session/truncate', {method:'POST', body:JSON.stringify({
       session_id: initialSid,
@@ -18250,14 +23126,90 @@ async function submitEdit(msgIdx, newText) {
     if(!S.session || S.session.session_id !== initialSid) return;
     S.messages = S.messages.slice(0, absoluteKeepCount);
     renderMessages();
-    $('msg').value = newText;
+    // Now send the edited message as a new chat, preserving ordered rich parts.
+    const editor=$('msg');
+    const parts=_trimBrowserContextTextPartEdges(editParts||[]);
+    if(_browserWorkbenchContextPartsHaveElement(parts)&&_composerSetBrowserContextParts(editor,parts)){
+      if(typeof _syncPendingContextItemsFromComposer==='function')_syncPendingContextItemsFromComposer();
+    }else{
+      editor.value = newText;
+    }
     // #5924 (Facet 1 + Facet 4): edit-resubmit is a recovery send. Re-arm the
-    // Re-arm the single-shot explicit-pick marker from the captured non-default
-    // pick — only if still safe at fire time (session unchanged, current model
-    // still matches, no newer onchange marker to clobber). See _reArmRecoveryPick.
+    // single-shot explicit-pick marker from the captured non-default pick — only
+    // if it is still safe at fire time. See _reArmRecoveryPick.
     _reArmRecoveryPick(initialSid, _recoveryPick);
     await send();
   } catch(e) { setStatus(t('edit_failed') + e.message); }
+}
+
+function _messageTextForRedo(m){
+  const text=msgContent(m);
+  if(text) return text;
+  const parts=Array.isArray(m&&m.parts)?m.parts:(Array.isArray(m&&m.browser_context_parts)?m.browser_context_parts:[]);
+  return parts.filter(part=>part&&part.type==='text').map(part=>String(part.content||part.text||'')).join('').trim();
+}
+
+function _setComposerForRedo(text, browserContextParts){
+  const editor=$('msg');
+  if(!editor) return;
+  const parts=Array.isArray(browserContextParts)?browserContextParts:[];
+  const restoredParts=parts.length&&typeof _composerSetBrowserContextParts==='function'
+    ? _composerSetBrowserContextParts(editor, parts)
+    : false;
+  if(!restoredParts){
+    if(typeof _composerIsRichEditor==='function'&&_composerIsRichEditor(editor)){
+      editor.innerHTML='';
+      if(typeof _appendComposerPlainText==='function') _appendComposerPlainText(editor, text);
+      else editor.textContent=text;
+    }else{
+      editor.value=text;
+    }
+  }
+  editor.dispatchEvent(new Event('input',{bubbles:true}));
+  if(typeof _syncPendingContextItemsFromComposer==='function') _syncPendingContextItemsFromComposer();
+  if(typeof autoResize==='function') autoResize();
+}
+
+async function redoFromMessage(btn) {
+  if(!S.session || S.busy) return;
+  const row = btn.closest('[data-msg-idx]');
+  if(!row) return;
+  const localMsgIdx = parseInt(row.dataset.msgIdx, 10);
+  if(!Number.isFinite(localMsgIdx)) return;
+  const originalMessage = S.messages[localMsgIdx];
+  if(!originalMessage || originalMessage.role !== 'user') return;
+  const redoText = _messageTextForRedo(originalMessage);
+  if(!redoText) return;
+  const redoParts = Array.isArray(originalMessage.parts)
+    ? originalMessage.parts
+    : (Array.isArray(originalMessage.browser_context_parts) ? originalMessage.browser_context_parts : []);
+  const initialSid = S.session.session_id;
+  const absoluteMsgIdx = (Number.isFinite(Number(_oldestIdx)) ? Math.max(0, Number(_oldestIdx)) : 0) + localMsgIdx;
+  const ok = typeof showConfirmDialog === 'function'
+    ? await showConfirmDialog({title:t('redo_from_here'),message:t('redo_from_here_confirm'),confirmLabel:t('redo_from_here'),danger:true,focusCancel:true})
+    : window.confirm(t('redo_from_here_confirm'));
+  if(!ok) return;
+  try {
+    if(typeof _ensureAllMessagesLoaded==='function') await _ensureAllMessagesLoaded();
+    if(!S.session || S.session.session_id !== initialSid) return;
+    await api('/api/session/truncate', {method:'POST', body:JSON.stringify({
+      session_id: initialSid,
+      keep_count: absoluteMsgIdx  // keep messages before the selected prompt, then resend it
+    })});
+    S.messages = S.messages.slice(0, absoluteMsgIdx);
+    if(typeof _messagesTruncated!=='undefined') _messagesTruncated=false;
+    if(typeof _oldestIdx!=='undefined') _oldestIdx=0;
+    if(S.session) S.session.message_count = S.messages.length;
+    S.toolCalls=[];
+    if(Array.isArray(S.pendingFiles)) S.pendingFiles=[];
+    if(Array.isArray(S.pendingContextItems)) S.pendingContextItems=[];
+    if(typeof _clearPendingSelections==='function') _clearPendingSelections();
+    if(typeof renderTray==='function') renderTray();
+    renderMessages();
+    _setComposerForRedo(redoText, redoParts);
+    showToast(t('redo_from_here_started'));
+    await send();
+  } catch(e) { setStatus(t('redo_from_here_failed') + e.message); }
 }
 
 async function regenerateResponse(btn) {
@@ -18342,7 +23294,8 @@ function highlightCode(container) {
   const el = container || $('msgInner');
   if(!el) return;
   // Prefer per-element highlight (avoids the full DOM walk of highlightAllUnder)
-  const blocks = el.querySelectorAll('pre code:not([data-highlighted])');
+  const blocks = Array.from(el.querySelectorAll('pre code:not([data-highlighted])'))
+    .filter(block=>!block.closest('.assistant-code-diff'));
   if(blocks.length === 0) return;
   for(let i = 0; i < blocks.length; i++){
     const block = blocks[i];
@@ -18525,6 +23478,7 @@ function addCopyButtons(container){
   if(!el) return;
   el.querySelectorAll('pre > code').forEach(codeEl=>{
     const pre=codeEl.parentElement;
+    if(pre&&pre.classList&&pre.classList.contains('assistant-code-diff')) return;
     const header=pre.previousElementSibling;
     if(pre.querySelector('.code-copy-btn')||(header&&header.classList.contains('pre-header')&&header.querySelector('.code-copy-btn'))) return;
     const btn=document.createElement('button');
@@ -20304,8 +25258,744 @@ async function promptNewFolder(targetDir = S.currentDir || '.'){
   }catch(e){setStatus(t('folder_create_failed')+e.message);}
 }
 
+const HERMES_MESSAGE_PARTS_MIME='application/x-hermes-message-parts+json';
+function _browserContextPayload(item){
+  const raw=item&&typeof item==='object'?item:{};
+  const payload=raw.payload&&typeof raw.payload==='object'?raw.payload:{};
+  return {...payload,...raw};
+}
+function _browserContextHtmlTagName(value){
+  const tag=String(value||'').replace(/\s+/g,' ').trim().toLowerCase();
+  return tag&&tag!=='unknown'?tag.slice(0,64):'';
+}
+function _browserContextDisplayLabel(component,tag,fallback){
+  const componentName=String(component||'').replace(/\s+/g,' ').trim();
+  const safeComponent=componentName&&componentName.toLowerCase()!=='unknown'?componentName:'';
+  const tagName=_browserContextHtmlTagName(tag);
+  const fallbackLabel=String(fallback||'').replace(/\s+/g,' ').trim();
+  if(safeComponent&&tagName)return `${safeComponent} • ${tagName}`.slice(0,80);
+  return (safeComponent||tagName||fallbackLabel||'Browser element').slice(0,80);
+}
+function _browserContextLabel(item){
+  const raw=item&&typeof item==='object'?item:{};
+  const data=_browserContextPayload(raw);
+  const explicit=String(raw.displayLabel||raw.display_label||data.displayLabel||data.display_label||'').replace(/\s+/g,' ').trim();
+  const tag=_browserContextHtmlTagName(data.tag||data.tagName||data.htmlTag||data.nodeName);
+  if(tag&&(!explicit||!explicit.includes(' • ')))return _browserContextDisplayLabel(data.component||data.componentName,tag,explicit||data.selector||data.url);
+  return (explicit||_browserContextDisplayLabel(data.component||data.componentName,tag,data.selector||data.url)).slice(0,80)||'Browser element';
+}
+function _browserContextMessageHtml(items){
+  const list=Array.isArray(items)?items.filter(item=>item&&typeof item==='object').slice(0,8):[];
+  if(!list.length)return'';
+  const chips=list.map(item=>{
+    const label=_browserContextLabel(item);
+    const data=_browserContextPayload(item);
+    const meta=String(data.source||data.selector||data.url||'').replace(/\s+/g,' ').trim();
+    const title=['Browser element context',meta].filter(Boolean).join(' — ');
+    return `<span class="msg-browser-context-chip" title="${esc(title)}">${typeof li==='function'?li('mouse-pointer-click',12):'⌖'} <span>${esc(label)}</span>${meta?`<small>${esc(meta.slice(0,120))}</small>`:''}</span>`;
+  }).join('');
+  return `<div class="msg-browser-context" aria-label="Browser element context">${chips}</div>`;
+}
+function _browserContextStableKey(item){
+  const data=_browserContextPayload(item);
+  return [data.url||'',data.selector||'',data.component||'',JSON.stringify(data.point||data.clickPoint||{})].join('|');
+}
+function _normalizeBrowserContextItemForComposer(item){
+  const raw=item&&typeof item==='object'?item:null;
+  if(!raw)return null;
+  const sourcePayload=raw.payload&&typeof raw.payload==='object'?raw.payload:raw;
+  const payload={
+    tab:sourcePayload.tab,
+    url:sourcePayload.url,
+    session_id:sourcePayload.session_id,
+    selector:sourcePayload.selector||sourcePayload.cssSelector||sourcePayload.path,
+    text:sourcePayload.text||sourcePayload.label,
+    component:sourcePayload.component||sourcePayload.componentName,
+    tag:_browserContextHtmlTagName(sourcePayload.tag||sourcePayload.tagName||sourcePayload.htmlTag||sourcePayload.nodeName),
+    source:sourcePayload.source||sourcePayload.file||sourcePayload.pathHint,
+    rect:sourcePayload.rect&&typeof sourcePayload.rect==='object'?sourcePayload.rect:null,
+    point:(sourcePayload.point&&typeof sourcePayload.point==='object'?sourcePayload.point:null)||(sourcePayload.clickPoint&&typeof sourcePayload.clickPoint==='object'?sourcePayload.clickPoint:null),
+  };
+  Object.keys(payload).forEach(key=>{if(payload[key]===undefined||payload[key]===null||payload[key]==='')delete payload[key];});
+  const normalized={...raw,...payload,type:'browser_element',kind:'browser-element',payload};
+  if(!normalized.displayLabel&&!normalized.display_label)normalized.displayLabel=_browserContextLabel(normalized);
+  return normalized;
+}
+function _composerIsRichEditor(editor){
+  return !!(editor&&editor.classList&&editor.classList.contains('composer-editor')&&editor.isContentEditable!==undefined);
+}
+function _composerBrowserContextPlainLabel(item){
+  return `@element(${_browserContextLabel(item)})`;
+}
+function _composerCreateBrowserContextIcon(){
+  const icon=document.createElement('span');
+  icon.className='composer-browser-context-icon';
+  icon.setAttribute('aria-hidden','true');
+  const svg=document.createElementNS('http://www.w3.org/2000/svg','svg');
+  svg.setAttribute('width','16');
+  svg.setAttribute('height','16');
+  svg.setAttribute('viewBox','0 0 24 24');
+  svg.setAttribute('fill','none');
+  svg.setAttribute('stroke','#ffffff');
+  svg.setAttribute('stroke-width','1.75');
+  svg.setAttribute('stroke-linecap','round');
+  svg.setAttribute('stroke-linejoin','round');
+  svg.setAttribute('focusable','false');
+  ['M4 7v-1a2 2 0 0 1 2 -2h2','M4 17v1a2 2 0 0 0 2 2h2','M16 4h2a2 2 0 0 1 2 2v1','M16 20h2a2 2 0 0 0 2 -2v-1','M12 17l3 -8l-8 3l3.5 1.5z'].forEach((d)=>{
+    const path=document.createElementNS('http://www.w3.org/2000/svg','path');
+    path.setAttribute('d',d);
+    svg.appendChild(path);
+  });
+  icon.appendChild(svg);
+  return icon;
+}
+function _composerCreateBrowserContextPill(item){
+  const normalized=_normalizeBrowserContextItemForComposer(item);
+  if(!normalized)return null;
+  const label=_browserContextLabel(normalized);
+  const pill=document.createElement('span');
+  pill.className='composer-browser-context-pill';
+  pill.contentEditable='false';
+  pill.setAttribute('role','button');
+  pill.setAttribute('aria-label',`Browser element: ${label}`);
+  pill.dataset.browserContext='1';
+  pill.dataset.browserContextLabel=label;
+  try{pill.dataset.browserContextPayload=JSON.stringify(normalized);}catch(_){pill.dataset.browserContextPayload='{}';}
+  const icon=_composerCreateBrowserContextIcon();
+  const labelEl=document.createElement('span');
+  labelEl.className='composer-browser-context-pill-label';
+  labelEl.textContent=label;
+  const remove=document.createElement('button');
+  remove.type='button';
+  remove.className='composer-browser-context-remove';
+  remove.title=t('remove_title');
+  remove.setAttribute('aria-label',`Remove ${label}`);
+  remove.textContent='×';
+  remove.addEventListener('mousedown',event=>event.preventDefault());
+  remove.addEventListener('click',event=>{
+    event.preventDefault();
+    event.stopPropagation();
+    const parent=pill.parentNode;
+    pill.remove();
+    if(parent&&parent.normalize)parent.normalize();
+    if(parent===$('msg')){
+      _syncPendingContextItemsFromComposer();
+      _dispatchComposerInput();
+      _saveBrowserContextDraftSoon();
+    }else if(parent){
+      parent.dispatchEvent(new Event('input',{bubbles:true}));
+    }
+  });
+  pill.addEventListener('mouseenter',()=>document.dispatchEvent(new CustomEvent('browser-workbench-context-hover',{detail:{item:normalized,visible:true}})));
+  pill.addEventListener('focusin',()=>document.dispatchEvent(new CustomEvent('browser-workbench-context-hover',{detail:{item:normalized,visible:true}})));
+  pill.addEventListener('mouseleave',()=>document.dispatchEvent(new CustomEvent('browser-workbench-context-hover',{detail:{item:normalized,visible:false}})));
+  pill.addEventListener('focusout',()=>document.dispatchEvent(new CustomEvent('browser-workbench-context-hover',{detail:{item:normalized,visible:false}})));
+  pill.append(icon,labelEl,remove);
+  return pill;
+}
+function _composerContextFromPill(pill){
+  if(!pill||!pill.dataset)return null;
+  try{
+    const parsed=JSON.parse(pill.dataset.browserContextPayload||'{}');
+    return _normalizeBrowserContextItemForComposer((parsed&&parsed.item)||parsed);
+  }catch(_){return null;}
+}
+function _syncPendingContextItemsFromComposer(){
+  const editor=$('msg');
+  if(!_composerIsRichEditor(editor))return;
+  const items=Array.from(editor.querySelectorAll('.composer-browser-context-pill')).map(_composerContextFromPill).filter(Boolean).slice(0,8);
+  S.pendingContextItems=items;
+}
+function _dispatchComposerInput(){
+  const editor=$('msg');
+  if(editor)editor.dispatchEvent(new Event('input',{bubbles:true}));
+}
+function _composerTextFromNode(node,options){
+  if(!node)return'';
+  if(node.nodeType===Node.TEXT_NODE)return String(node.nodeValue||'').replace(/\u00a0/g,' ');
+  if(node.nodeType!==Node.ELEMENT_NODE)return'';
+  const el=node;
+  if(el.classList&&(el.classList.contains('composer-browser-context-pill')||el.classList.contains('msg-browser-element-pill'))){
+    const item=_composerContextFromPill(el);
+    return options&&options.includeContextLabels?_composerBrowserContextPlainLabel(item||{displayLabel:el.dataset.browserContextLabel}):'';
+  }
+  if(el.tagName==='BR')return'\n';
+  let out='';
+  el.childNodes.forEach(child=>{out+=_composerTextFromNode(child,options);});
+  if((el.tagName==='DIV'||el.tagName==='P')&&el.nextSibling&&!out.endsWith('\n'))out+='\n';
+  return out;
+}
+function _composerEditorPlainText(editor,options){
+  if(!editor)return'';
+  if(!_composerIsRichEditor(editor)&&editor.tagName==='TEXTAREA')return String(editor.value||'');
+  let out='';
+  editor.childNodes.forEach(child=>{out+=_composerTextFromNode(child,options);});
+  return out.replace(/\n{3,}/g,'\n\n');
+}
+function _composerBrowserContextPartsFromNode(node){
+  if(!node)return[];
+  if(node.nodeType===Node.TEXT_NODE)return[{type:'text',content:String(node.nodeValue||'').replace(/\u00a0/g,' ')}];
+  if(node.nodeType!==Node.ELEMENT_NODE)return[];
+  const el=node;
+  if(el.classList&&(el.classList.contains('composer-browser-context-pill')||el.classList.contains('msg-browser-element-pill'))){
+    const item=_composerContextFromPill(el);
+    const part=_browserWorkbenchContextPartFromItem(item||{displayLabel:el.dataset.browserContextLabel},'');
+    return part?[part]:[];
+  }
+  if(el.tagName==='BR')return[{type:'text',content:'\n'}];
+  const parts=[];
+  el.childNodes.forEach(child=>{parts.push(..._composerBrowserContextPartsFromNode(child));});
+  if((el.tagName==='DIV'||el.tagName==='P')&&el.nextSibling){
+    const last=parts[parts.length-1];
+    if(!last||last.type!=='text'||!String(last.content||'').endsWith('\n'))parts.push({type:'text',content:'\n'});
+  }
+  return parts;
+}
+function _composerBrowserContextPartsForSend(){
+  const editor=$('msg');
+  if(!_composerIsRichEditor(editor))return[];
+  const parts=[];
+  editor.childNodes.forEach(child=>{parts.push(..._composerBrowserContextPartsFromNode(child));});
+  const trimmed=_trimBrowserContextTextPartEdges(parts);
+  return _browserWorkbenchContextPartsHaveElement(trimmed)?trimmed:[];
+}
+function _composerSetBrowserContextParts(editor,parts){
+  if(!_composerIsRichEditor(editor))return false;
+  const normalized=_trimBrowserContextTextPartEdges(parts);
+  if(!_browserWorkbenchContextPartsHaveElement(normalized))return false;
+  editor.innerHTML='';
+  normalized.forEach(part=>{
+    if(part.type==='browser_element'){
+      const pill=_composerCreateBrowserContextPill(part.item||part);
+      if(pill)editor.appendChild(pill);
+    }else{
+      _appendComposerPlainText(editor,part.content||'');
+    }
+  });
+  if(editor===$('msg'))_syncPendingContextItemsFromComposer();
+  else editor.dispatchEvent(new Event('input',{bubbles:true}));
+  return true;
+}
+function _appendComposerPlainText(parent,text){
+  String(text||'').split('\n').forEach((part,index)=>{
+    if(index>0)parent.appendChild(document.createElement('br'));
+    if(part)parent.appendChild(document.createTextNode(part));
+  });
+}
+function _safeJsonParseObject(text){
+  try{const value=JSON.parse(text);return value&&typeof value==='object'?value:null;}catch(_){return null;}
+}
+function _browserContextXmlText(block,tag){
+  const match=String(block||'').match(new RegExp(`<${tag}[^>]*>([\\s\\S]*?)<\\/${tag}>`,'i'));
+  if(!match)return'';
+  const box=document.createElement('textarea');
+  box.innerHTML=match[1];
+  return box.value.trim();
+}
+function _decodeBrowserContextEntities(text){
+  const box=document.createElement('textarea');
+  box.innerHTML=String(text||'');
+  return box.value;
+}
+function _parseBrowserContextBlock(block){
+  const source=String(block||'');
+  const selections=[];
+  const selectionRegex=/<selected_browser_element\b[^>]*>[\s\S]*?<\/selected_browser_element>/gi;
+  const chunks=source.match(selectionRegex)||(/<selected_browser_element\b/i.test(source)?[source]:[]);
+  chunks.forEach(chunk=>{
+    const rect=_safeJsonParseObject(_browserContextXmlText(chunk,'rect'));
+    const point=_safeJsonParseObject(_browserContextXmlText(chunk,'click_point'))||_safeJsonParseObject(_browserContextXmlText(chunk,'point'));
+    const item=_normalizeBrowserContextItemForComposer({
+      label:_browserContextXmlText(chunk,'label'),
+      displayLabel:_browserContextXmlText(chunk,'label'),
+      tab:_browserContextXmlText(chunk,'tab'),
+      url:_browserContextXmlText(chunk,'url'),
+      session_id:_browserContextXmlText(chunk,'session_id'),
+      selector:_browserContextXmlText(chunk,'selector'),
+      component:_browserContextXmlText(chunk,'component'),
+      tag:_browserContextXmlText(chunk,'tag'),
+      source:_browserContextXmlText(chunk,'source'),
+      text:_browserContextXmlText(chunk,'text'),
+      rect,
+      point,
+    });
+    if(item)selections.push(item);
+  });
+  return selections;
+}
+function _browserWorkbenchContextPartFromItem(item,rawContext){
+  const normalized=_normalizeBrowserContextItemForComposer(item);
+  if(!normalized)return null;
+  const data=_browserContextPayload(normalized);
+  const label=_browserContextLabel(normalized);
+  return {
+    type:'browser_element',
+    label,
+    displayLabel:label,
+    component:data.component||'',
+    tab:data.tab||'',
+    url:data.url||'',
+    selector:data.selector||'',
+    source:data.source||'',
+    rawContext:String(rawContext||''),
+    item:normalized,
+  };
+}
+function _parseBrowserWorkbenchContextParts(value){
+  const source=String(value||'');
+  const regex=/<browser_workbench_context\b[\s\S]*?<\/browser_workbench_context>|<selected_browser_element\b[\s\S]*?<\/selected_browser_element>/gi;
+  const parts=[];
+  let cursor=0;
+  let match;
+  while((match=regex.exec(source))){
+    if(match.index>cursor)parts.push({type:'text',content:source.slice(cursor,match.index)});
+    const rawContext=match[0];
+    const items=_parseBrowserContextBlock(rawContext);
+    if(items.length){
+      items.forEach(item=>{
+        const part=_browserWorkbenchContextPartFromItem(item,rawContext);
+        if(part)parts.push(part);
+      });
+    }else{
+      parts.push({type:'text',content:rawContext});
+    }
+    cursor=match.index+rawContext.length;
+  }
+  if(cursor<source.length)parts.push({type:'text',content:source.slice(cursor)});
+  return parts.length?parts:[{type:'text',content:source}];
+}
+function parseBrowserWorkbenchContext(content){
+  const value=String(content||'');
+  let parts=_parseBrowserWorkbenchContextParts(value);
+  if(parts.some(part=>part&&part.type==='browser_element'))return parts;
+  if(/&lt;(browser_workbench_context|selected_browser_element)\b/i.test(value)){
+    parts=_parseBrowserWorkbenchContextParts(_decodeBrowserContextEntities(value));
+    if(parts.some(part=>part&&part.type==='browser_element'))return parts;
+  }
+  return [{type:'text',content:value}];
+}
+function _browserWorkbenchContextPartsHaveElement(parts){
+  return Array.isArray(parts)&&parts.some(part=>part&&part.type==='browser_element');
+}
+function _normalizeBrowserContextPartsForDisplay(parts){
+  const normalized=[];
+  (Array.isArray(parts)?parts:[]).forEach(part=>{
+    if(!part||typeof part!=='object')return;
+    if(part.type==='browser_element'||part.type==='browser-element'){
+      const item=_normalizeBrowserContextItemForComposer((part&&part.item)||part);
+      if(!item)return;
+      const contextPart=_browserWorkbenchContextPartFromItem(item,part.rawContext||'');
+      if(contextPart)normalized.push(contextPart);
+      return;
+    }
+    if(part.type==='text'){
+      const content=String(part.content??part.text??'');
+      if(!content)return;
+      const prev=normalized[normalized.length-1];
+      if(prev&&prev.type==='text')prev.content+=content;
+      else normalized.push({type:'text',content});
+    }
+  });
+  return normalized;
+}
+function _trimBrowserContextTextPartEdges(parts){
+  const trimmed=_normalizeBrowserContextPartsForDisplay(parts);
+  const firstText=trimmed.findIndex(part=>part&&part.type==='text');
+  if(firstText>=0)trimmed[firstText].content=String(trimmed[firstText].content||'').replace(/^\s+/, '');
+  let lastText=-1;
+  trimmed.forEach((part,index)=>{if(part&&part.type==='text')lastText=index;});
+  if(lastText>=0)trimmed[lastText].content=String(trimmed[lastText].content||'').replace(/\s+$/, '');
+  return trimmed.filter(part=>part&&!(part.type==='text'&&!String(part.content||'')));
+}
+function _browserElementPillHtml(part){
+  const item=_normalizeBrowserContextItemForComposer((part&&part.item)||part);
+  if(!item)return'';
+  const label=String((part&&part.label)||_browserContextLabel(item)).replace(/\s+/g,' ').trim()||'Browser element';
+  const data=_browserContextPayload(item);
+  const meta=['Browser element',data.tab||'',data.url||data.selector||data.source||''].filter(Boolean).join(' — ');
+  let payload='{}';
+  try{payload=JSON.stringify(_browserWorkbenchContextPartFromItem(item,part&&part.rawContext)||item);}catch(_){ }
+  return `<span class="msg-browser-element-pill" data-browser-context="1" data-browser-context-label="${esc(label)}" data-browser-context-payload="${esc(payload)}" title="${esc(meta)}"><span class="msg-browser-element-pill-label">[${esc(label)} · Browser element]</span></span>`;
+}
+function _renderBrowserWorkbenchContextPartsHtml(parts,isUser){
+  return _normalizeBrowserContextPartsForDisplay(parts).map(part=>{
+    if(!part)return'';
+    if(part.type==='browser_element')return _browserElementPillHtml(part);
+    return _getCachedRender(String(part.content||''), isUser);
+  }).join('');
+}
+function _parseComposerBrowserContextText(text){
+  const value=String(text||'');
+  const regex=/<browser_workbench_context\b[\s\S]*?<\/browser_workbench_context>|<selected_browser_element\b[\s\S]*?<\/selected_browser_element>/gi;
+  const segments=[];
+  let found=false;
+  let cursor=0;
+  let match;
+  while((match=regex.exec(value))){
+    found=true;
+    if(match.index>cursor)segments.push({type:'text',text:value.slice(cursor,match.index)});
+    const items=_parseBrowserContextBlock(match[0]);
+    if(items.length)items.forEach(item=>segments.push({type:'browser_element',item}));
+    else segments.push({type:'text',text:match[0]});
+    cursor=match.index+match[0].length;
+  }
+  if(cursor<value.length)segments.push({type:'text',text:value.slice(cursor)});
+  return {found,segments};
+}
+function _composerRenderSegments(editor,segments){
+  editor.innerHTML='';
+  (segments||[]).forEach(segment=>{
+    if(!segment)return;
+    if(segment.type==='browser_element'){
+      const pill=_composerCreateBrowserContextPill(segment.item);
+      if(pill)editor.appendChild(pill);
+    }else{
+      _appendComposerPlainText(editor,segment.text||'');
+    }
+  });
+  _syncPendingContextItemsFromComposer();
+}
+function _composerSetValue(editor,text){
+  const parsed=_parseComposerBrowserContextText(text);
+  if(parsed.found)_composerRenderSegments(editor,parsed.segments);
+  else{editor.innerHTML='';_appendComposerPlainText(editor,text||'');_syncPendingContextItemsFromComposer();}
+}
+function _composerSelectionOffset(editor){
+  const selection=window.getSelection&&window.getSelection();
+  if(!selection||!selection.rangeCount)return _composerEditorPlainText(editor).length;
+  const range=selection.getRangeAt(0);
+  if(!editor.contains(range.startContainer))return _composerEditorPlainText(editor).length;
+  const pre=range.cloneRange();
+  pre.selectNodeContents(editor);
+  pre.setEnd(range.startContainer,range.startOffset);
+  const holder=document.createElement('div');
+  holder.appendChild(pre.cloneContents());
+  return _composerEditorPlainText(holder).length;
+}
+function _composerSetSelectionOffset(editor,start,end){
+  const targetStart=Math.max(0,Number(start)||0);
+  const targetEnd=Math.max(targetStart,Number(end??start)||targetStart);
+  const range=document.createRange();
+  let seen=0;
+  let startSet=false;
+  function walk(node){
+    if(startSet&&seen>=targetEnd)return true;
+    if(node.nodeType===Node.TEXT_NODE){
+      const len=String(node.nodeValue||'').length;
+      if(!startSet&&seen+len>=targetStart){range.setStart(node,Math.max(0,targetStart-seen));startSet=true;}
+      if(startSet&&seen+len>=targetEnd){range.setEnd(node,Math.max(0,targetEnd-seen));return true;}
+      seen+=len;
+      return false;
+    }
+    if(node.nodeType!==Node.ELEMENT_NODE)return false;
+    const el=node;
+    if(el.classList&&(el.classList.contains('composer-browser-context-pill')||el.classList.contains('msg-browser-element-pill')))return false;
+    if(el.tagName==='BR'){
+      if(!startSet&&seen+1>=targetStart){range.setStartBefore(el);startSet=true;}
+      if(startSet&&seen+1>=targetEnd){range.setEndAfter(el);return true;}
+      seen+=1;
+      return false;
+    }
+    for(const child of Array.from(el.childNodes)){if(walk(child))return true;}
+    return false;
+  }
+  walk(editor);
+  if(!startSet)range.setStart(editor,editor.childNodes.length);
+  if(!range.endContainer)range.setEnd(editor,editor.childNodes.length);
+  const selection=window.getSelection&&window.getSelection();
+  if(selection){selection.removeAllRanges();selection.addRange(range);}
+}
+function _composerInsertNodes(nodes, targetEditor){
+  const editor=targetEditor||$('msg');
+  if(!_composerIsRichEditor(editor))return false;
+  editor.focus();
+  const selection=window.getSelection&&window.getSelection();
+  const range=selection&&selection.rangeCount?selection.getRangeAt(0):document.createRange();
+  if(!editor.contains(range.startContainer)){
+    range.selectNodeContents(editor);
+    range.collapse(false);
+  }
+  range.deleteContents();
+  const list=Array.from(nodes||[]).filter(Boolean);
+  list.forEach(node=>{
+    range.insertNode(node);
+    range.setStartAfter(node);
+    range.collapse(true);
+  });
+  if(list.length&&selection){
+    range.setStartAfter(list[list.length-1]);
+    range.collapse(true);
+    selection.removeAllRanges();
+    selection.addRange(range);
+  }
+  if(editor===$('msg')){_syncPendingContextItemsFromComposer();_dispatchComposerInput();}
+  else editor.dispatchEvent(new Event('input',{bubbles:true}));
+  return true;
+}
+function _insertComposerBrowserContextPill(item){
+  const pill=_composerCreateBrowserContextPill(item);
+  if(!pill)return false;
+  return _composerInsertNodes([pill,document.createTextNode(' ')]);
+}
+function _composerPasteSegments(segments, targetEditor, options={}){
+  const nodes=[];
+  const addPillSpace=options.addPillSpace!==false;
+  (segments||[]).forEach(segment=>{
+    if(segment.type==='browser_element'){
+      const pill=_composerCreateBrowserContextPill(segment.item);
+      if(pill){
+        nodes.push(pill);
+        if(addPillSpace)nodes.push(document.createTextNode(' '));
+      }
+    }else{
+      const frag=document.createDocumentFragment();
+      _appendComposerPlainText(frag,segment.text||'');
+      nodes.push(...Array.from(frag.childNodes));
+    }
+  });
+  return _composerInsertNodes(nodes,targetEditor);
+}
+function _messagePartsToPlainText(parts){
+  return _normalizeBrowserContextPartsForDisplay(parts).map(part=>{
+    if(!part)return'';
+    if(part.type==='browser_element')return _composerBrowserContextPlainLabel((part&&part.item)||part);
+    return String(part.content||part.text||'');
+  }).join('');
+}
+function _messagePartsFromEditor(editor){
+  if(!editor)return[];
+  const parts=[];
+  editor.childNodes.forEach(child=>{parts.push(..._composerBrowserContextPartsFromNode(child));});
+  return _trimBrowserContextTextPartEdges(parts);
+}
+function _messagePartsToSegments(parts){
+  return _normalizeBrowserContextPartsForDisplay(parts).map(part=>part&&part.type==='browser_element'
+    ? {type:'browser_element',item:(part&&part.item)||part}
+    : {type:'text',text:String((part&&part.content)??(part&&part.text)??'')});
+}
+function _messagePartsFromHtml(html){
+  const doc=new DOMParser().parseFromString(String(html||''),'text/html');
+  const parts=[];
+  doc.body.childNodes.forEach(node=>{parts.push(..._composerBrowserContextPartsFromNode(node));});
+  return _trimBrowserContextTextPartEdges(parts);
+}
+function _messagePartsFromClipboardData(data){
+  if(!data)return[];
+  const rich=data.getData&&data.getData(HERMES_MESSAGE_PARTS_MIME);
+  if(rich){
+    try{
+      const parsed=JSON.parse(rich);
+      const parts=Array.isArray(parsed)?parsed:(Array.isArray(parsed&&parsed.parts)?parsed.parts:[]);
+      const normalized=_trimBrowserContextTextPartEdges(parts);
+      if(_browserWorkbenchContextPartsHaveElement(normalized))return normalized;
+    }catch(_){ }
+  }
+  const html=data.getData&&data.getData('text/html');
+  if(html&&(html.includes('data-browser-context-payload')||html.includes('msg-browser-element-pill')||html.includes('composer-browser-context-pill'))){
+    const parts=_messagePartsFromHtml(html);
+    if(_browserWorkbenchContextPartsHaveElement(parts))return parts;
+  }
+  const plain=data.getData&&data.getData('text/plain');
+  if(plain){
+    const parsed=parseBrowserWorkbenchContext(plain);
+    if(_browserWorkbenchContextPartsHaveElement(parsed))return _trimBrowserContextTextPartEdges(parsed);
+  }
+  return[];
+}
+function _writeMessagePartsToClipboardData(data,parts,html){
+  const normalized=_trimBrowserContextTextPartEdges(parts);
+  if(!_browserWorkbenchContextPartsHaveElement(normalized))return false;
+  data.setData(HERMES_MESSAGE_PARTS_MIME,JSON.stringify({parts:normalized}));
+  data.setData('text/plain',_messagePartsToPlainText(normalized));
+  if(html!==undefined)data.setData('text/html',html);
+  return true;
+}
+function _copyMessagePartsRich(parts){
+  const normalized=_trimBrowserContextTextPartEdges(parts);
+  if(!_browserWorkbenchContextPartsHaveElement(normalized))return Promise.reject(new Error('no rich message parts'));
+  const plain=_messagePartsToPlainText(normalized);
+  if(navigator.clipboard&&navigator.clipboard.write&&typeof ClipboardItem!=='undefined'){
+    try{
+      const item=new ClipboardItem({
+        [HERMES_MESSAGE_PARTS_MIME]:new Blob([JSON.stringify({parts:normalized})],{type:HERMES_MESSAGE_PARTS_MIME}),
+        'text/plain':new Blob([plain],{type:'text/plain'})
+      });
+      return navigator.clipboard.write([item]);
+    }catch(_){ }
+  }
+  return _copyText(plain);
+}
+function _pasteMessagePartsIntoEditor(editor,parts){
+  if(!_composerIsRichEditor(editor)||!_browserWorkbenchContextPartsHaveElement(parts))return false;
+  return _composerPasteSegments(_messagePartsToSegments(parts),editor,{addPillSpace:false});
+}
+function _installRichMessagePartsClipboard(editor,opts={}){
+  if(!_composerIsRichEditor(editor)||editor.dataset.richMessagePartsClipboard==='1')return;
+  editor.dataset.richMessagePartsClipboard='1';
+  const afterChange=()=>{try{if(typeof opts.onChange==='function')opts.onChange(editor);}catch(_){}};
+  editor.addEventListener('paste',event=>{
+    const parts=_messagePartsFromClipboardData(event.clipboardData);
+    if(!_browserWorkbenchContextPartsHaveElement(parts))return;
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    _pasteMessagePartsIntoEditor(editor,parts);
+    afterChange();
+  });
+  const copyCut=event=>{
+    const selection=window.getSelection&&window.getSelection();
+    if(!selection||!selection.rangeCount||!editor.contains(selection.anchorNode))return;
+    const holder=document.createElement('div');
+    for(let i=0;i<selection.rangeCount;i++)holder.appendChild(selection.getRangeAt(i).cloneContents());
+    const parts=_messagePartsFromEditor(holder);
+    if(!_browserWorkbenchContextPartsHaveElement(parts))return;
+    event.preventDefault();
+    _writeMessagePartsToClipboardData(event.clipboardData,parts,holder.innerHTML);
+    if(event.type==='cut'){
+      try{document.execCommand('delete');}catch(_){selection.deleteFromDocument();}
+      afterChange();
+    }
+  };
+  editor.addEventListener('copy',copyCut);
+  editor.addEventListener('cut',copyCut);
+}
+function _installChatBubbleMessagePartsClipboard(){
+  if(document.documentElement.dataset.chatBubbleMessagePartsClipboard==='1')return;
+  document.documentElement.dataset.chatBubbleMessagePartsClipboard='1';
+  document.addEventListener('copy',event=>{
+    const selection=window.getSelection&&window.getSelection();
+    if(!selection||!selection.rangeCount)return;
+    const anchor=selection.anchorNode&&selection.anchorNode.nodeType===1?selection.anchorNode:selection.anchorNode&&selection.anchorNode.parentElement;
+    const focus=selection.focusNode&&selection.focusNode.nodeType===1?selection.focusNode:selection.focusNode&&selection.focusNode.parentElement;
+    if(!((anchor&&anchor.closest&&anchor.closest('.msg-row[data-role="user"]'))||(focus&&focus.closest&&focus.closest('.msg-row[data-role="user"]'))))return;
+    const holder=document.createElement('div');
+    for(let i=0;i<selection.rangeCount;i++)holder.appendChild(selection.getRangeAt(i).cloneContents());
+    const parts=_messagePartsFromEditor(holder);
+    if(!_browserWorkbenchContextPartsHaveElement(parts))return;
+    event.preventDefault();
+    _writeMessagePartsToClipboardData(event.clipboardData,parts,holder.innerHTML);
+  });
+}
+function _syncComposerContextPillsFromState(){
+  const editor=$('msg');
+  if(!_composerIsRichEditor(editor))return;
+  const existing=new Set(Array.from(editor.querySelectorAll('.composer-browser-context-pill')).map(p=>_browserContextStableKey(_composerContextFromPill(p))).filter(Boolean));
+  (Array.isArray(S.pendingContextItems)?S.pendingContextItems:[]).forEach(item=>{
+    const normalized=_normalizeBrowserContextItemForComposer(item);
+    const key=_browserContextStableKey(normalized);
+    if(normalized&&!existing.has(key)){
+      const needsSpace=editor.textContent&&!/\s$/.test(editor.textContent);
+      if(needsSpace)editor.appendChild(document.createTextNode(' '));
+      const pill=_composerCreateBrowserContextPill(normalized);
+      if(pill)editor.appendChild(pill);
+      editor.appendChild(document.createTextNode(' '));
+      existing.add(key);
+    }
+  });
+}
+function _installComposerRichEditor(){
+  const editor=$('msg');
+  if(!_composerIsRichEditor(editor)||editor.dataset.richComposerInstalled==='1')return;
+  editor.dataset.richComposerInstalled='1';
+  _installRichMessagePartsClipboard(editor,{onChange:()=>{_syncPendingContextItemsFromComposer();_saveBrowserContextDraftSoon();}});
+  Object.defineProperty(editor,'value',{configurable:true,get(){_syncPendingContextItemsFromComposer();return _composerEditorPlainText(editor);},set(value){_composerSetValue(editor,String(value||''));}});
+  Object.defineProperty(editor,'placeholder',{configurable:true,get(){return editor.dataset.placeholder||'';},set(value){editor.dataset.placeholder=String(value||'');editor.setAttribute('aria-placeholder',String(value||''));}});
+  Object.defineProperty(editor,'disabled',{configurable:true,get(){return editor.getAttribute('aria-disabled')==='true';},set(value){const locked=!!value;editor.setAttribute('aria-disabled',locked?'true':'false');editor.contentEditable=locked?'false':'true';}});
+  Object.defineProperty(editor,'selectionStart',{configurable:true,get(){return _composerSelectionOffset(editor);},set(value){_composerSetSelectionOffset(editor,value,value);}});
+  Object.defineProperty(editor,'selectionEnd',{configurable:true,get(){return _composerSelectionOffset(editor);},set(value){_composerSetSelectionOffset(editor,editor.selectionStart,value);}});
+  editor.setSelectionRange=(start,end)=>_composerSetSelectionOffset(editor,start,end);
+  editor.addEventListener('input',()=>{
+    const parsed=_parseComposerBrowserContextText(_composerEditorPlainText(editor));
+    if(parsed.found){
+      _composerRenderSegments(editor,parsed.segments);
+      _composerSetSelectionOffset(editor,_composerEditorPlainText(editor).length,_composerEditorPlainText(editor).length);
+    }else{
+      _syncPendingContextItemsFromComposer();
+    }
+  });
+  editor.addEventListener('paste',event=>{
+    const plain=event.clipboardData&&event.clipboardData.getData('text/plain');
+    const parsed=_parseComposerBrowserContextText(plain||'');
+    if(parsed.found){
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      _composerPasteSegments(parsed.segments);
+      return;
+    }
+    const html=event.clipboardData&&event.clipboardData.getData('text/html');
+    if(html&&html.includes('composer-browser-context-pill')&&html.includes('data-browser-context-payload')){
+      const doc=new DOMParser().parseFromString(html,'text/html');
+      const segments=[];
+      doc.body.childNodes.forEach(node=>{
+        if(node.nodeType===Node.ELEMENT_NODE&&node.classList&&node.classList.contains('composer-browser-context-pill')){
+          segments.push({type:'browser_element',item:_composerContextFromPill(node)});
+        }else{
+          segments.push({type:'text',text:node.textContent||''});
+        }
+      });
+      if(segments.some(s=>s.type==='browser_element'&&s.item)){
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        _composerPasteSegments(segments);
+        return;
+      }
+    }
+    if(plain&&!(typeof _shouldAttachLargePastedText==='function'&&_shouldAttachLargePastedText(plain))){
+      event.preventDefault();
+      _composerPasteSegments([{type:'text',text:plain}]);
+      return;
+    }
+  });
+  editor.addEventListener('copy',event=>{
+    const selection=window.getSelection&&window.getSelection();
+    if(!selection||!selection.rangeCount||!editor.contains(selection.anchorNode))return;
+    const holder=document.createElement('div');
+    for(let i=0;i<selection.rangeCount;i++)holder.appendChild(selection.getRangeAt(i).cloneContents());
+    if(!holder.querySelector('.composer-browser-context-pill'))return;
+    event.preventDefault();
+    const parts=_messagePartsFromEditor(holder);
+    if(!_writeMessagePartsToClipboardData(event.clipboardData,parts,holder.innerHTML)){
+      event.clipboardData.setData('text/plain',_composerEditorPlainText(holder,{includeContextLabels:true}));
+      event.clipboardData.setData('text/html',holder.innerHTML);
+    }
+  });
+  editor.addEventListener('keydown',event=>{
+    if(event.key!=='Backspace'&&event.key!=='Delete')return;
+    requestAnimationFrame(()=>{_syncPendingContextItemsFromComposer();_saveBrowserContextDraftSoon();});
+  });
+}
+_installComposerRichEditor();
+_installChatBubbleMessagePartsClipboard();
+window._syncPendingContextItemsFromComposer=_syncPendingContextItemsFromComposer;
+window._composerBrowserContextPartsForSend=_composerBrowserContextPartsForSend;
+window._composerSetBrowserContextParts=_composerSetBrowserContextParts;
+window._messagePartsFromEditor=_messagePartsFromEditor;
+window._messagePartsFromClipboardData=_messagePartsFromClipboardData;
+window._installRichMessagePartsClipboard=_installRichMessagePartsClipboard;
+window._pasteMessagePartsIntoEditor=_pasteMessagePartsIntoEditor;
+window._copyMessagePartsRich=_copyMessagePartsRich;
+function _saveBrowserContextDraftSoon(){
+  const sid=S&&S.session&&S.session.session_id;
+  if(!sid||typeof _saveComposerDraft!=='function')return;
+  const ta=$('msg');
+  if(typeof _syncPendingContextItemsFromComposer==='function')_syncPendingContextItemsFromComposer();
+  _saveComposerDraft(sid, ta?ta.value:'', S.pendingFiles?[...S.pendingFiles]:[], S.pendingContextItems?[...S.pendingContextItems]:[], _composerBrowserContextPartsForSend());
+}
+function addBrowserContextItem(item){
+  const normalized=_normalizeBrowserContextItemForComposer(item);
+  if(!normalized)return false;
+  if(!Array.isArray(S.pendingContextItems))S.pendingContextItems=[];
+  const key=_browserContextStableKey(normalized);
+  if(!S.pendingContextItems.find(existing=>_browserContextStableKey(existing)===key)){
+    S.pendingContextItems.push(normalized);
+    if(!_insertComposerBrowserContextPill(normalized))renderTray();
+  }
+  renderTray();
+  _saveBrowserContextDraftSoon();
+  return true;
+}
 function renderTray(){ // non-media files use paperclip chip
   const tray=$('attachTray');tray.innerHTML='';
+  if(typeof _syncComposerContextPillsFromState==='function')_syncComposerContextPillsFromState();
   if(!S.pendingFiles.length){tray.classList.remove('has-files');updateSendBtn();return;}
   tray.classList.add('has-files');
   updateSendBtn();
@@ -20356,6 +26046,18 @@ const _uploadPendingFilesProgressBySession=new Map();
 function _uploadPendingFilesCurrentSession(sessionId){
   return !!(!sessionId||(S.session&&S.session.session_id===sessionId));
 }
+function attachFilesToPrompt(files){
+  const list=Array.from(files||[]).filter(Boolean);
+  if(!list.length)return false;
+  addFiles(list);
+  const msg=$('msg');
+  if(msg&&typeof msg.focus==='function')msg.focus({preventScroll:true});
+  return true;
+}
+window.addFiles=addFiles;
+window.renderTray=renderTray;
+window._showUploadTooLarge=_showUploadTooLarge;
+window.attachFilesToPrompt=attachFilesToPrompt;
 function _uploadPendingFilesHideProgressBar(){
   const bar=$('uploadBar');const barWrap=$('uploadBarWrap');
   if(!bar||!barWrap)return;

@@ -1,5 +1,6 @@
 import os
 import shutil
+import socket
 import subprocess
 import sys
 import textwrap
@@ -12,6 +13,12 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parents[1]
 CTL = REPO_ROOT / "ctl.sh"
 HEALTH_PROBE = REPO_ROOT / "scripts" / "lib" / "health_probe.sh"
+
+
+def free_tcp_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
 
 
 def _seed_ctl_repo(repo_root: Path) -> None:
@@ -41,6 +48,11 @@ def run_ctl(
         "HERMES_WEBUI_LOG_FILE",
         "HERMES_WEBUI_CTL_STATE_FILE",
         "HERMES_WEBUI_NO_DOTENV",
+        "HERMES_WEBUI_DESKTOP_SHELL",
+        "HERMES_WEBUI_DESKTOP_PID_FILE",
+        "HERMES_WEBUI_DESKTOP_LOG_FILE",
+        "HERMES_WEBUI_DESKTOP_USER_DATA_DIR",
+        "HERMES_WEBUI_DESKTOP_LAUNCH_METHOD",
     ):
         merged.pop(key, None)
     merged.update(
@@ -249,6 +261,113 @@ def test_start_uses_nohup_so_daemon_survives_launcher_exit():
     assert 'exec nohup "${python_exe}"' in ctl_text
 
 
+def test_start_reopens_missing_electron_without_duplicating_running_app(tmp_path):
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    _seed_ctl_repo(repo_root)
+    (repo_root / "bootstrap.py").write_text("# fake bootstrap target\n", encoding="utf-8")
+    sidecar = repo_root / "scripts" / "start-browser-workbench-desktop.sh"
+    sidecar.parent.mkdir(parents=True, exist_ok=True)
+    sidecar.write_text(
+        "#!/usr/bin/env bash\n"
+        "printf '%s|%s|%s\\n' \"${HERMES_WEBUI_URL:-}\" \"${HERMES_WEBUI_PID:-}\" \"${HERMES_WEBUI_DESKTOP_PID_FILE:-}\" >> \"${DESKTOP_TEST_LOG}\"\n",
+        encoding="utf-8",
+    )
+    sidecar.chmod(0o755)
+
+    fake_python = tmp_path / "fake-python"
+    fake_log = tmp_path / "fake-python.log"
+    desktop_log = tmp_path / "desktop-sidecar.log"
+    write_fake_python(fake_python)
+    port = "18995"
+    base_env = {
+        "HERMES_WEBUI_PYTHON": str(fake_python),
+        "FAKE_PYTHON_LOG": str(fake_log),
+        "DESKTOP_TEST_LOG": str(desktop_log),
+        "HERMES_WEBUI_PORT": port,
+        "HERMES_WEBUI_CTL_ALLOW_LAUNCHD_CONFLICT": "1",
+        "HERMES_WEBUI_DESKTOP_LAUNCH_METHOD": "background",
+    }
+
+    started_pid = None
+    electron = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+        **({"creationflags": subprocess.CREATE_NO_WINDOW} if sys.platform == "win32" else {}),
+    )
+    launching_helper = None
+    try:
+        first = run_ctl(
+            tmp_path,
+            "start",
+            env={**base_env, "HERMES_WEBUI_DESKTOP_SHELL": "0"},
+            repo_root=repo_root,
+        )
+        assert first.returncode == 0, first.stderr + first.stdout
+        started_pid = wait_for_pid_file(tmp_path / ".hermes" / "webui.pid")
+
+        desktop_pid_file = tmp_path / ".hermes" / "webui" / f"desktop-shell-{port}.pid.app"
+        desktop_pid_file.write_text(str(electron.pid), encoding="utf-8")
+        already_running = run_ctl(
+            tmp_path,
+            "start",
+            env={**base_env, "HERMES_WEBUI_DESKTOP_SHELL": "1"},
+            repo_root=repo_root,
+        )
+        assert already_running.returncode == 0, already_running.stderr + already_running.stdout
+        assert "Electron desktop app is already running" in already_running.stdout
+        assert not desktop_log.exists(), "start must not launch a duplicate Electron sidecar"
+
+        electron.terminate()
+        electron.wait(timeout=3)
+        launching_helper = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            **({"creationflags": subprocess.CREATE_NO_WINDOW} if sys.platform == "win32" else {}),
+        )
+        runner_pid_file = tmp_path / ".hermes" / "webui" / f"desktop-shell-{port}.pid.runner"
+        runner_pid_file.write_text(str(launching_helper.pid), encoding="utf-8")
+        in_progress = run_ctl(
+            tmp_path,
+            "start",
+            env={**base_env, "HERMES_WEBUI_DESKTOP_SHELL": "1"},
+            repo_root=repo_root,
+        )
+        assert in_progress.returncode == 0, in_progress.stderr + in_progress.stdout
+        assert "Electron desktop shell launch is already in progress" in in_progress.stdout
+        assert not desktop_log.exists(), "start must not race an existing Electron helper"
+
+        launching_helper.terminate()
+        launching_helper.wait(timeout=3)
+        reopened = run_ctl(
+            tmp_path,
+            "start",
+            env={**base_env, "HERMES_WEBUI_DESKTOP_SHELL": "1"},
+            repo_root=repo_root,
+        )
+        assert reopened.returncode == 0, reopened.stderr + reopened.stdout
+        assert "Electron desktop shell launch requested" in reopened.stdout
+        launched = wait_for_file_text(desktop_log, contains=f"http://127.0.0.1:{port}")
+        assert f"http://127.0.0.1:{port}|{started_pid}|" in launched
+        assert str(tmp_path / ".hermes" / "webui" / f"desktop-shell-{port}.pid") in launched
+    finally:
+        if started_pid:
+            stop = run_ctl(tmp_path, "stop", repo_root=repo_root)
+            assert stop.returncode == 0, stop.stderr + stop.stdout
+            _kill_tree(started_pid)
+            assert_process_exits(started_pid)
+        if electron.poll() is None:
+            electron.terminate()
+            try:
+                electron.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                electron.kill()
+        if launching_helper is not None and launching_helper.poll() is None:
+            launching_helper.terminate()
+            try:
+                launching_helper.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                launching_helper.kill()
+
+
 def test_start_can_ignore_repo_dotenv_for_authoritative_test_env(tmp_path):
     repo_root = tmp_path / "repo"
     repo_root.mkdir()
@@ -424,6 +543,76 @@ def test_stale_pid_file_is_removed_without_killing_unrelated_process(tmp_path):
             sleeper.kill()
 
 
+def test_stop_recovers_and_kills_repo_owned_listener_without_pid_file(tmp_path):
+    if sys.platform == "win32":
+        pytest.skip("lsof-based orphan listener recovery is a POSIX/macOS path")
+    if not shutil.which("lsof"):
+        pytest.skip("requires lsof to discover the orphan listener")
+
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    _seed_ctl_repo(repo_root)
+    port = free_tcp_port()
+    (repo_root / "server.py").write_text(
+        textwrap.dedent(
+            """
+            import signal
+            import socket
+            import sys
+            import time
+
+            alive = True
+            def stop(*_args):
+                global alive
+                alive = False
+            signal.signal(signal.SIGTERM, stop)
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind(('127.0.0.1', int(sys.argv[1])))
+            sock.listen(1)
+            while alive:
+                time.sleep(0.05)
+            sock.close()
+            """
+        ).lstrip(),
+        encoding="utf-8",
+    )
+    listener = subprocess.Popen(
+        [sys.executable, str(repo_root / "server.py"), str(port)],
+        **({"creationflags": subprocess.CREATE_NO_WINDOW} if sys.platform == "win32" else {}),
+    )
+    try:
+        deadline = time.time() + 3
+        while time.time() < deadline:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                if sock.connect_ex(("127.0.0.1", port)) == 0:
+                    break
+            time.sleep(0.05)
+        else:
+            raise AssertionError("fake server.py did not listen")
+
+        result = run_ctl(
+            tmp_path,
+            "stop",
+            env={"HERMES_WEBUI_PORT": str(port)},
+            repo_root=repo_root,
+            timeout=10,
+        )
+
+        combined = result.stdout + result.stderr
+        assert result.returncode == 0, combined
+        assert "Stopping Hermes WebUI orphan" in combined
+        assert str(listener.pid) in combined
+        listener.wait(timeout=3)
+    finally:
+        if listener.poll() is None:
+            listener.terminate()
+            try:
+                listener.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                listener.kill()
+
+
 def _write_fake_launchctl(fake_bin, pid):
     launchctl = fake_bin / "launchctl"
     launchctl.write_text(
@@ -532,6 +721,300 @@ def test_start_allows_alternate_port_while_launchd_job_runs_on_default(tmp_path)
             sleeper.wait(timeout=3)
         except subprocess.TimeoutExpired:
             sleeper.kill()
+
+
+def test_restart_reloads_matching_launchd_job_without_spawning_second_daemon(tmp_path):
+    if sys.platform == "win32":
+        pytest.skip("launchd lifecycle is a macOS path")
+
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    _seed_ctl_repo(repo_root)
+    (repo_root / "bootstrap.py").write_text("# test fixture\n", encoding="utf-8")
+
+    fake_python = tmp_path / "fake-python"
+    fake_python_log = tmp_path / "fake-python.log"
+    write_fake_python(fake_python)
+    port = "18993"
+    common_env = {
+        "HERMES_WEBUI_PYTHON": str(fake_python),
+        "FAKE_PYTHON_LOG": str(fake_python_log),
+        "HERMES_WEBUI_PORT": port,
+        "HERMES_WEBUI_DESKTOP_SHELL": "0",
+    }
+
+    first = run_ctl(
+        tmp_path,
+        "start",
+        env={**common_env, "HERMES_WEBUI_CTL_ALLOW_LAUNCHD_CONFLICT": "1"},
+        repo_root=repo_root,
+    )
+    assert first.returncode == 0, first.stdout + first.stderr
+    direct_pid = wait_for_pid_file(tmp_path / ".hermes" / "webui.pid")
+
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    launchctl_state = tmp_path / "launchctl.state"
+    launchctl_log = tmp_path / "launchctl.log"
+    launchctl_state.write_text("loaded\n", encoding="utf-8")
+    launchctl = fake_bin / "launchctl"
+    launchctl.write_text(
+        textwrap.dedent(
+            """
+            #!/usr/bin/env bash
+            printf '%s\n' "$*" >> "${FAKE_LAUNCHCTL_LOG}"
+            case "$1" in
+              print)
+                [[ "$(cat "${FAKE_LAUNCHCTL_STATE}" 2>/dev/null)" == "loaded" ]] || exit 1
+                printf 'environment = {\n\tHERMES_WEBUI_PORT => %s\n}\n' "${FAKE_LAUNCHCTL_PORT}"
+                ;;
+              bootout)
+                printf 'unloaded\n' > "${FAKE_LAUNCHCTL_STATE}"
+                ;;
+              bootstrap)
+                printf 'loaded\n' > "${FAKE_LAUNCHCTL_STATE}"
+                ;;
+              kickstart) ;;
+              *) exit 1 ;;
+            esac
+            """
+        ).lstrip(),
+        encoding="utf-8",
+    )
+    launchctl.chmod(0o755)
+    plist = tmp_path / "Library" / "LaunchAgents" / "com.parantoux.hermes-webui.plist"
+    plist.parent.mkdir(parents=True)
+    plist.write_text("<?xml version='1.0'?><plist><dict/></plist>\n", encoding="utf-8")
+
+    restarted = run_ctl(
+        tmp_path,
+        "restart",
+        env={
+            **common_env,
+            "PATH": f"{bash_path(fake_bin)}{os.pathsep}{os.environ.get('PATH', '')}",
+            "FAKE_LAUNCHCTL_STATE": str(launchctl_state),
+            "FAKE_LAUNCHCTL_LOG": str(launchctl_log),
+            "FAKE_LAUNCHCTL_PORT": port,
+        },
+        repo_root=repo_root,
+    )
+    combined = restarted.stdout + restarted.stderr
+    assert restarted.returncode == 0, combined
+    assert "Stopping launchd-managed Hermes WebUI" in combined
+    assert "Started launchd-managed Hermes WebUI" in combined
+    assert_process_exits(direct_pid)
+    assert not (tmp_path / ".hermes" / "webui.pid").exists()
+
+    calls = launchctl_log.read_text(encoding="utf-8")
+    assert "bootout gui/" in calls
+    assert "bootstrap gui/" in calls
+    assert "kickstart gui/" in calls
+    assert fake_python_log.read_text(encoding="utf-8").count("fake-python args:") == 1
+
+
+def test_reset_electron_uses_resolved_port_pid_file_and_clears_cache_dirs(tmp_path):
+    hermes_home = tmp_path / ".hermes"
+    state_dir = hermes_home / "webui"
+    state_dir.mkdir(parents=True)
+    user_data_dir = tmp_path / "electron-user-data"
+    for relative in ("Cache", "Code Cache", "GPUCache", "Service Worker/CacheStorage", "Service Worker/ScriptCache"):
+        target = user_data_dir / relative
+        target.mkdir(parents=True)
+        (target / "stale").write_text("old", encoding="utf-8")
+
+    sleeper = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+        **({"creationflags": subprocess.CREATE_NO_WINDOW} if sys.platform == "win32" else {}),
+    )
+    pid_file = state_dir / "desktop-shell-8788.pid"
+    pid_file.write_text(str(sleeper.pid), encoding="utf-8")
+    try:
+        result = run_ctl(
+            tmp_path,
+            "reset-electron",
+            env={
+                "HERMES_WEBUI_PORT": "8788",
+                "HERMES_WEBUI_DESKTOP_USER_DATA_DIR": str(user_data_dir),
+                "HERMES_WEBUI_DESKTOP_LAUNCH_METHOD": "background",
+            },
+        )
+
+        combined = result.stdout + result.stderr
+        assert result.returncode == 0, combined
+        assert "Resetting Electron desktop shell for 127.0.0.1:8788" in combined
+        assert not pid_file.exists()
+        sleeper.wait(timeout=3)
+        assert not (user_data_dir / "Cache").exists()
+        assert not (user_data_dir / "Code Cache").exists()
+        assert not (user_data_dir / "GPUCache").exists()
+        assert not (user_data_dir / "Service Worker" / "CacheStorage").exists()
+        assert not (user_data_dir / "Service Worker" / "ScriptCache").exists()
+    finally:
+        if sleeper.poll() is None:
+            sleeper.terminate()
+            try:
+                sleeper.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                sleeper.kill()
+
+
+def test_start_electron_requires_an_existing_webui_and_never_starts_backend(tmp_path):
+    result = run_ctl(
+        tmp_path,
+        "start-electron",
+        env={"HERMES_WEBUI_PORT": str(free_tcp_port())},
+    )
+
+    combined = result.stdout + result.stderr
+    assert result.returncode == 1, combined
+    assert "Cannot start Electron: no Hermes WebUI is listening" in combined
+    assert not (tmp_path / ".hermes" / "webui.pid").exists()
+
+
+def test_start_electron_opens_only_shell_for_existing_healthy_webui(tmp_path):
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    _seed_ctl_repo(repo_root)
+    sidecar = repo_root / "scripts" / "start-browser-workbench-desktop.sh"
+    sidecar.parent.mkdir(parents=True, exist_ok=True)
+    sidecar.write_text(
+        "#!/usr/bin/env bash\n"
+        "sleep 2 & app_pid=$!\n"
+        "printf '%s\\n' \"$app_pid\" > \"$HERMES_WEBUI_DESKTOP_PID_FILE.app\"\n"
+        "printf 'url=%s\\nhealth=%s\\nwebui_pid=%s\\n' \"$HERMES_WEBUI_URL\" \"$HERMES_WEBUI_HEALTH_URL\" \"$HERMES_WEBUI_PID\" > \"$FAKE_ELECTRON_LOG\"\n"
+        "wait \"$app_pid\"\n",
+        encoding="utf-8",
+    )
+    sidecar.chmod(0o755)
+
+    port = free_tcp_port()
+    fake_server = repo_root / "server.py"
+    fake_server.write_text(
+        "from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer\n"
+        "import sys\n"
+        "class Handler(BaseHTTPRequestHandler):\n"
+        "    def do_GET(self):\n"
+        "        self.send_response(200)\n"
+        "        self.send_header('Content-Type', 'application/json')\n"
+        "        self.end_headers()\n"
+        "        self.wfile.write(b'{\\\"status\\\":\\\"ok\\\"}')\n"
+        "    def log_message(self, *args):\n"
+        "        pass\n"
+        "ThreadingHTTPServer(('127.0.0.1', int(sys.argv[1])), Handler).serve_forever()\n",
+        encoding="utf-8",
+    )
+    server = subprocess.Popen(
+        [sys.executable, str(fake_server), str(port)],
+        **({"creationflags": subprocess.CREATE_NO_WINDOW} if sys.platform == "win32" else {}),
+    )
+    electron_log = tmp_path / "electron-start.log"
+    try:
+        deadline = time.time() + 3
+        while time.time() < deadline:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                if sock.connect_ex(("127.0.0.1", port)) == 0:
+                    break
+            time.sleep(0.05)
+        result = run_ctl(
+            tmp_path,
+            "start-electron",
+            env={
+                "HERMES_WEBUI_PORT": str(port),
+                "HERMES_WEBUI_DESKTOP_SHELL": "0",
+                "HERMES_WEBUI_DESKTOP_LAUNCH_METHOD": "background",
+                "FAKE_ELECTRON_LOG": str(electron_log),
+            },
+            repo_root=repo_root,
+        )
+        combined = result.stdout + result.stderr
+        assert result.returncode == 0, combined
+        assert "Electron desktop shell launch requested" in combined
+        assert "Electron desktop app is running" in combined
+        launched = wait_for_file_text(electron_log, contains="webui_pid=")
+        assert f"url=http://127.0.0.1:{port}" in launched
+        assert f"health=http://127.0.0.1:{port}/health" in launched
+        assert f"webui_pid={server.pid}" in launched
+        assert not (tmp_path / ".hermes" / "webui.pid").exists()
+    finally:
+        server.terminate()
+        try:
+            server.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            server.kill()
+
+
+def test_start_stops_existing_electron_shell_for_resolved_port_before_launch(tmp_path):
+    hermes_home = tmp_path / ".hermes"
+    state_dir = hermes_home / "webui"
+    state_dir.mkdir(parents=True)
+    fake_python = tmp_path / "fake-python"
+    fake_log = tmp_path / "fake-python.log"
+    write_fake_python(fake_python)
+    old_shell = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+        **({"creationflags": subprocess.CREATE_NO_WINDOW} if sys.platform == "win32" else {}),
+    )
+    (state_dir / "desktop-shell-18993.pid").write_text(str(old_shell.pid), encoding="utf-8")
+    started_pid = None
+    try:
+        result = run_ctl(
+            tmp_path,
+            "start",
+            env={
+                "HERMES_WEBUI_PYTHON": str(fake_python),
+                "FAKE_PYTHON_LOG": str(fake_log),
+                "HERMES_WEBUI_PORT": "18993",
+                "HERMES_WEBUI_CTL_ALLOW_LAUNCHD_CONFLICT": "1",
+            },
+        )
+        combined = result.stdout + result.stderr
+        assert result.returncode == 0, combined
+        assert "Stopping Electron desktop shell" in combined
+        old_shell.wait(timeout=3)
+        assert not (state_dir / "desktop-shell-18993.pid").exists()
+        started_pid = wait_for_pid_file(hermes_home / "webui.pid")
+    finally:
+        if started_pid:
+            stop = run_ctl(tmp_path, "stop")
+            assert stop.returncode == 0, stop.stderr + stop.stdout
+            _kill_tree(started_pid)
+            assert_process_exits(started_pid)
+        if old_shell.poll() is None:
+            old_shell.terminate()
+            try:
+                old_shell.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                old_shell.kill()
+
+
+def test_stop_closes_electron_app_for_dotenv_port_even_when_webui_is_stopped(tmp_path):
+    repo_root = tmp_path / "repo"
+    repo_root.mkdir()
+    _seed_ctl_repo(repo_root)
+    (repo_root / ".env").write_text("HERMES_WEBUI_PORT=18994\n", encoding="utf-8")
+    hermes_home = tmp_path / ".hermes"
+    state_dir = hermes_home / "webui"
+    state_dir.mkdir(parents=True)
+    old_app = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+        **({"creationflags": subprocess.CREATE_NO_WINDOW} if sys.platform == "win32" else {}),
+    )
+    (state_dir / "desktop-shell-18994.pid.app").write_text(str(old_app.pid), encoding="utf-8")
+    try:
+        result = run_ctl(tmp_path, "stop", repo_root=repo_root, load_dotenv=True)
+        combined = result.stdout + result.stderr
+        assert result.returncode == 0, combined
+        assert "Stopping Electron desktop app" in combined
+        assert "Hermes WebUI is stopped" in combined
+        old_app.wait(timeout=3)
+        assert not (state_dir / "desktop-shell-18994.pid.app").exists()
+    finally:
+        if old_app.poll() is None:
+            old_app.terminate()
+            try:
+                old_app.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                old_app.kill()
 
 
 def test_logs_supports_non_following_line_count(tmp_path):

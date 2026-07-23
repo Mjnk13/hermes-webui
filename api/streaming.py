@@ -3,8 +3,10 @@ Hermes Web UI -- SSE streaming engine and agent thread runner.
 Includes Sprint 10 cancel support via CANCEL_FLAGS.
 """
 import base64
+from collections import deque
 import contextlib
 import contextvars
+import difflib
 import json
 import logging
 import math
@@ -15,6 +17,7 @@ import random
 import re
 import sqlite3
 import shlex
+import shutil
 import sys
 import subprocess
 import threading
@@ -43,7 +46,11 @@ from api.config import (
     warm_models_catalog_provenance_if_cold,
     load_settings,
     parse_reasoning_effort,
+    parse_service_tier_config,
     coerce_reasoning_effort_for_model,
+    resolve_model_reasoning_efforts,
+    resolve_fast_mode_capability,
+    REASONING_EFFORT_LABELS,
     _main_model_request_overrides,
     PROCESS_SESSION_INDEX, PROCESS_SESSION_INDEX_LOCK,
 )
@@ -74,6 +81,151 @@ from api.process_event_utils import (
 )
 
 
+class _LiveToolOutputCoalescer:
+    """Batch noisy terminal chunks before they cross the SSE boundary.
+
+    Terminal readers may report hundreds of lines in one scheduling slice.
+    Sending one journal record and browser event per line starves Electron's
+    renderer event loop. This coalescer preserves per-tool/per-stream order
+    while limiting delivery to one batch per short display interval.
+    """
+
+    def __init__(
+        self,
+        put,
+        *,
+        interval_seconds: float = 0.08,
+        max_batch_chars: int = 16_384,
+    ):
+        self._put = put
+        self._interval_seconds = max(0.01, float(interval_seconds))
+        self._max_batch_chars = max(1_024, int(max_batch_chars))
+        self._lock = threading.Lock()
+        self._emit_lock = threading.Lock()
+        self._pending = {}
+        self._sequences = {}
+        self._timer = None
+        self._closed = False
+
+    def append(self, tool_call_id, name, stream, chunk):
+        text = chunk if isinstance(chunk, str) else str(chunk or '')
+        if not text:
+            return
+        stream_name = str(stream or 'stdout').strip().lower()
+        if stream_name not in {'stdout', 'stderr'}:
+            stream_name = 'stdout'
+        tool_id = str(tool_call_id or '')
+        key = (tool_id, stream_name)
+        with self._lock:
+            if self._closed:
+                return
+            pending = self._pending.get(key)
+            if pending is None:
+                pending = {
+                    'name': str(name or 'terminal'),
+                    'parts': deque(),
+                    'chars': 0,
+                    'omitted': 0,
+                }
+                self._pending[key] = pending
+            pending['parts'].append(text)
+            pending['chars'] += len(text)
+            while pending['chars'] > self._max_batch_chars and pending['parts']:
+                overflow = pending['chars'] - self._max_batch_chars
+                first = pending['parts'][0]
+                if len(first) <= overflow:
+                    pending['parts'].popleft()
+                    removed = len(first)
+                else:
+                    pending['parts'][0] = first[overflow:]
+                    removed = overflow
+                pending['chars'] -= removed
+                pending['omitted'] += removed
+            if self._pending and self._timer is None:
+                self._timer = threading.Timer(
+                    self._interval_seconds,
+                    self._flush_from_timer,
+                )
+                self._timer.daemon = True
+                self._timer.start()
+
+    def flush(self, tool_call_id=None):
+        wanted_id = None if tool_call_id is None else str(tool_call_id or '')
+        with self._emit_lock:
+            with self._lock:
+                keys = [
+                    key for key in self._pending
+                    if wanted_id is None or key[0] == wanted_id
+                ]
+                batches = self._take_locked(keys)
+                if not self._pending and self._timer is not None:
+                    self._timer.cancel()
+                    self._timer = None
+            self._emit(batches)
+
+    def close(self):
+        # Serialize teardown with timer/manual flushes. Once this returns, no
+        # request-scoped timer can emit another browser event.
+        with self._emit_lock:
+            with self._lock:
+                if self._closed:
+                    return
+                self._closed = True
+                if self._timer is not None:
+                    self._timer.cancel()
+                    self._timer = None
+                batches = self._take_locked(list(self._pending))
+            self._emit(batches)
+
+    def _flush_from_timer(self):
+        with self._emit_lock:
+            with self._lock:
+                self._timer = None
+                if self._closed:
+                    return
+                batches = self._take_locked(list(self._pending))
+                if self._pending:
+                    self._timer = threading.Timer(
+                        self._interval_seconds,
+                        self._flush_from_timer,
+                    )
+                    self._timer.daemon = True
+                    self._timer.start()
+            self._emit(batches)
+
+    def _take_locked(self, keys):
+        batches = []
+        for key in list(keys):
+            pending = self._pending.pop(key, None)
+            if pending is None:
+                continue
+            sequence = int(self._sequences.get(key, 0)) + 1
+            self._sequences[key] = sequence
+            text = ''.join(pending['parts'])
+            if pending['omitted']:
+                text = (
+                    f"[... {pending['omitted']} live output characters omitted; "
+                    "complete output follows when the command finishes ...]\n"
+                    f"{text}"
+                )
+            batches.append({
+                'event_type': 'tool.output',
+                'name': pending['name'],
+                'tid': key[0],
+                'stream': key[1],
+                'text': text,
+                'sequence': sequence,
+            })
+        return batches
+
+    def _emit(self, batches):
+        for payload in batches:
+            try:
+                self._put('tool_output', payload)
+            except Exception:
+                logger.debug('Failed to emit coalesced live tool output', exc_info=True)
+
+
 def _session_payload_with_full_messages(session, *, tool_calls=None):
     """Return compact session metadata plus the embedded full transcript.
 
@@ -91,6 +243,69 @@ def _session_payload_with_full_messages(session, *, tool_calls=None):
     if tool_calls is not None:
         raw['tool_calls'] = tool_calls
     return raw
+
+
+_TERMINAL_MESSAGE_WINDOW = 30
+
+
+def _session_payload_with_terminal_window(session, *, tool_calls=None):
+    """Return a bounded settled SSE payload with pagination metadata.
+
+    The canonical session is already persisted before ``done`` is emitted, so
+    embedding its entire transcript in the terminal event only makes Electron
+    synchronously parse and rebuild history it already has.  Long sessions can
+    otherwise turn one completion into a multi-megabyte event and tens of
+    thousands of DOM nodes.  Use the same visible-row window and tool-call index
+    rebasing as ``GET /api/session?msg_limit=...`` so older history remains
+    available through the existing load-earlier path.
+
+    Import the window helpers lazily: ``api.routes`` imports this streaming
+    module during server startup, while terminal payloads are built only after
+    route initialization is complete.
+    """
+    # Compose over the established full-payload helper so its message-count,
+    # todo-state, redaction callers, and post-save cancellation seam retain the
+    # exact same behavior. Only the transport representation is windowed below.
+    raw = _session_payload_with_full_messages(session, tool_calls=tool_calls)
+    messages = list(raw.get('messages') or [])
+    try:
+        from api.routes import (
+            _MAX_MSG_LIMIT,
+            _message_window_for_display,
+            _messages_for_limited_payload,
+            _tool_calls_for_message_window,
+        )
+
+        window, offset = _message_window_for_display(
+            messages,
+            msg_limit=_TERMINAL_MESSAGE_WINDOW,
+            expand_renderable=True,
+        )
+        if offset > 0:
+            window = _messages_for_limited_payload(window)
+            window_tool_calls = _tool_calls_for_message_window(
+                tool_calls if tool_calls is not None else raw.get('tool_calls', []),
+                offset,
+                len(window),
+            )
+        else:
+            window_tool_calls = tool_calls if tool_calls is not None else raw.get('tool_calls')
+        bounded = dict(raw)
+        bounded.update({
+            'messages': window,
+            'message_count': len(messages),
+            '_messages_truncated': offset > 0,
+            '_messages_offset': offset,
+            '_msg_limit_max': _MAX_MSG_LIMIT,
+        })
+        if window_tool_calls is not None:
+            bounded['tool_calls'] = window_tool_calls
+        return bounded
+    except Exception:
+        # Mixed-version/import edge cases must retain the proven full-payload
+        # behavior rather than losing the terminal event entirely.
+        logger.debug('Failed to build bounded terminal session payload', exc_info=True)
+        return raw
 
 
 def _compact_for_echo_compare(value: str) -> str:
@@ -295,6 +510,140 @@ _PERSISTENT_MEMORY_FILES = (
     ("user", ("memories", "USER.md")),
     ("soul", ("SOUL.md",)),
 )
+_AGENTPET_APP_BINARY = "/Applications/AgentPet.app/Contents/MacOS/agentpet"
+_AGENTPET_STATE_EVENTS = {"registered", "working", "waiting", "done", "idle"}
+_AGENTPET_HEARTBEAT_SECONDS = 60.0
+_AGENTPET_BINARY_CACHE: str | None = None
+_AGENTPET_LAST_STATE: dict[str, tuple[str, float]] = {}
+_AGENTPET_LAST_DETAILS: dict[str, tuple[str | None, str | None]] = {}
+_AGENTPET_LOCK = threading.Lock()
+
+
+def _agentpet_binary() -> str | None:
+    """Return an AgentPet helper path if installed, otherwise None."""
+    global _AGENTPET_BINARY_CACHE
+    if _AGENTPET_BINARY_CACHE is not None:
+        return _AGENTPET_BINARY_CACHE or None
+
+    path = shutil.which("agentpet")
+    if not path and os.path.exists(_AGENTPET_APP_BINARY):
+        path = _AGENTPET_APP_BINARY
+    _AGENTPET_BINARY_CACHE = path or ""
+    return path
+
+
+def _notify_agentpet(
+    event_name: str,
+    message: str | None = None,
+    *,
+    force: bool = False,
+    session_id: str | None = None,
+    project: str | None = None,
+    _heartbeat_only: bool = False,
+) -> None:
+    """Best-effort AgentPet status bridge for WebUI-originated sessions."""
+    if event_name not in _AGENTPET_STATE_EVENTS or not session_id:
+        return
+
+    now = time.monotonic()
+    with _AGENTPET_LOCK:
+        last_state, last_sent = _AGENTPET_LAST_STATE.get(session_id, ("", 0.0))
+        last_message, last_project = _AGENTPET_LAST_DETAILS.get(session_id, (None, None))
+        should_heartbeat = (
+            event_name in {"working", "waiting"}
+            and last_state == event_name
+            and now - last_sent >= _AGENTPET_HEARTBEAT_SECONDS
+        )
+        details_changed = (
+            (message is not None and message != last_message)
+            or (project is not None and project != last_project)
+        )
+        if _heartbeat_only:
+            # Do not let a heartbeat captured just before a state transition
+            # overwrite a newer working/waiting/done event.
+            if last_state != event_name or not should_heartbeat:
+                return
+            message = last_message
+            project = last_project or project
+        elif not force and last_state == event_name and not should_heartbeat and not details_changed:
+            return
+
+        binary = _agentpet_binary()
+        if not binary:
+            return
+        project = project or last_project or os.getcwd()
+        message = message if message is not None else last_message
+        _AGENTPET_LAST_STATE[session_id] = (event_name, now)
+        _AGENTPET_LAST_DETAILS[session_id] = (message, project)
+
+    cmd = [
+        binary,
+        "hook",
+        "--agent",
+        "webui",
+        "--event",
+        event_name,
+        "--session",
+        session_id,
+        "--project",
+        project,
+    ]
+    if message:
+        cmd.extend(["--message", message])
+
+    try:
+        subprocess.run(
+            cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=1,
+            check=False,
+        )
+    except Exception:
+        pass
+
+
+def _heartbeat_agentpet(*, session_id: str, project: str | None = None) -> None:
+    """Refresh the lease for the session's latest active AgentPet state."""
+    with _AGENTPET_LOCK:
+        event_name, _last_sent = _AGENTPET_LAST_STATE.get(session_id, ("", 0.0))
+    if event_name not in {"working", "waiting"}:
+        return
+    _notify_agentpet(
+        event_name,
+        session_id=session_id,
+        project=project,
+        _heartbeat_only=True,
+    )
+
+
+def _start_agentpet_heartbeat(
+    *,
+    session_id: str,
+    project: str | None = None,
+) -> tuple[threading.Event | None, threading.Thread | None]:
+    """Keep an active WebUI turn visible until its worker really exits."""
+    if not session_id or not _agentpet_binary():
+        return None, None
+
+    stop = threading.Event()
+
+    def _heartbeat_loop() -> None:
+        while not stop.wait(_AGENTPET_HEARTBEAT_SECONDS):
+            _heartbeat_agentpet(session_id=session_id, project=project)
+
+    thread = threading.Thread(
+        target=_heartbeat_loop,
+        name=f"agentpet-heartbeat-{session_id[:12]}",
+        daemon=True,
+    )
+    try:
+        thread.start()
+    except Exception:
+        logger.debug("Failed to start AgentPet heartbeat for session %s", session_id, exc_info=True)
+        return None, None
+    return stop, thread
 
 
 def _file_signature(path: Path) -> tuple[int, int] | None:
@@ -420,11 +769,20 @@ def _apply_profile_home_context_to_streaming_model(
         if not isinstance(_pp_cfg, dict):
             return model, provider_context, False
 
-        _pp = (_pp_cfg.get("model", {}).get("provider") or "").strip()
+        try:
+            from api.accounts import apply_active_account_to_model_config
+
+            _pp_model_cfg = apply_active_account_to_model_config(_pp_cfg)
+        except Exception:
+            _pp_model_cfg = _pp_cfg.get("model", {})
+        if not isinstance(_pp_model_cfg, dict):
+            return model, provider_context, False
+
+        _pp = (_pp_model_cfg.get("provider") or "").strip()
         if not _pp:
             return model, provider_context, False
 
-        _pp_default = (_pp_cfg.get("model", {}).get("default") or "").strip()
+        _pp_default = (_pp_model_cfg.get("default") or "").strip()
         return _apply_profile_provider_context_to_streaming_model(
             model,
             provider_context,
@@ -440,6 +798,7 @@ def _resolve_custom_provider_runtime_overrides(
     resolved_provider: str | None,
     resolved_api_key: str | None,
     resolved_base_url: str | None,
+    account_config: dict | None = None,
 ) -> tuple[str | None, str | None, str | None]:
     """Return provider/key/base_url overrides for ``custom:*`` endpoints.
 
@@ -449,6 +808,21 @@ def _resolve_custom_provider_runtime_overrides(
     request; pass a harmless placeholder to the SDK and let the endpoint accept
     it or return its own auth error.
     """
+    if str(resolved_provider or "").strip().lower() == "codex-lb":
+        try:
+            from api.accounts import resolve_active_account_runtime
+
+            account = resolve_active_account_runtime(account_config)
+        except Exception:
+            account = None
+        if account is not None and account.provider.strip().lower() == "codex-lb":
+            if not resolved_api_key and account.api_key:
+                resolved_api_key = account.api_key
+            if not resolved_base_url and account.base_url:
+                resolved_base_url = account.base_url
+            if resolved_base_url:
+                return "custom", resolved_api_key or _KEYLESS_CUSTOM_API_KEY, resolved_base_url
+
     if not (isinstance(resolved_provider, str) and resolved_provider.startswith("custom:")):
         return resolved_provider, resolved_api_key, resolved_base_url
 
@@ -466,6 +840,52 @@ def _resolve_custom_provider_runtime_overrides(
         if not resolved_api_key:
             resolved_api_key = _KEYLESS_CUSTOM_API_KEY
     return resolved_provider, resolved_api_key, resolved_base_url
+
+
+def _apply_active_account_runtime_overrides(
+    runtime_provider: dict | None,
+    resolved_provider: str | None,
+    account_config: dict | None,
+    *,
+    account_env_path: Path | None = None,
+) -> dict:
+    """Apply the active account's explicit runtime connection settings.
+
+    Provider runtime resolution owns OAuth/credential-pool selection. Account
+    entries with an explicit ``key_env`` or endpoint are more specific and must
+    win so switching between two accounts on the same provider changes the
+    actual token and endpoint, not only the displayed provider/model.
+    """
+    runtime = dict(runtime_provider) if isinstance(runtime_provider, dict) else {}
+    try:
+        from api.accounts import resolve_active_account_runtime
+
+        account = resolve_active_account_runtime(
+            account_config,
+            env_path=account_env_path,
+        )
+    except Exception:
+        account = None
+    if account is None:
+        return runtime
+
+    account_provider = account.provider.strip().lower()
+    selected_provider = str(resolved_provider or runtime.get("provider") or "").strip().lower()
+    if selected_provider and account_provider != selected_provider:
+        return runtime
+
+    if account.api_key:
+        runtime["api_key"] = account.api_key
+        # An explicit account key represents one selected credential, so a
+        # provider-global pool must not replace it inside AIAgent.
+        runtime["credential_pool"] = None
+    if account.base_url:
+        runtime["base_url"] = account.base_url
+    if account.api_mode:
+        runtime["api_mode"] = account.api_mode
+    if account.provider:
+        runtime.setdefault("provider", account.provider)
+    return runtime
 
 
 def _same_base_url_endpoint(url_a: str, url_b: str) -> bool:
@@ -1363,6 +1783,164 @@ def _provider_error_payload(message: str, err_type: str, hint: str = '') -> dict
     return payload
 
 
+class _TurnOutcomeState:
+    """Authoritative, once-only outcome for one provider stream.
+
+    Provider adapters do not all terminate the same way: some return a final
+    message, some only close the delta stream, and some emit a late empty
+    completion callback.  Keep usable-output evidence separate from transport
+    completion so a late close/error path can never turn an already-completed
+    response into ``no_response``.
+    """
+
+    _TERMINAL = frozenset({'completed', 'failed'})
+
+    def __init__(self, stream_id: str, session_id: str):
+        self.stream_id = str(stream_id or '')
+        self.session_id = str(session_id or '')
+        self.status = 'pending'
+        self.accumulated_text_length = 0
+        self.reasoning_event_count = 0
+        self.reasoning_text_length = 0
+        self.tool_event_count = 0
+        self.result_has_final_text = False
+        self.result_has_reasoning = False
+        self.result_has_tool_output = False
+        self.finish_reason = None
+        self.close_reason = None
+        self.abort_source = None
+        self.failure_type = None
+        self._has_non_whitespace_text = False
+        self._tool_event_keys = set()
+        self._lock = threading.Lock()
+
+    def _diagnostic(self, event_type: str, **extra) -> None:
+        if not logger.isEnabledFor(logging.DEBUG):
+            return
+        fields = {
+            'event': str(event_type or ''),
+            'stream_id': self.stream_id,
+            'session_id': self.session_id,
+            'status': self.status,
+            'text_length': self.accumulated_text_length,
+            'reasoning_events': self.reasoning_event_count,
+            'reasoning_length': self.reasoning_text_length,
+            'tool_events': self.tool_event_count,
+            'finish_reason': self.finish_reason,
+            'close_reason': self.close_reason,
+            'abort_source': self.abort_source,
+            **extra,
+        }
+        logger.debug('[turn-outcome] %s', json.dumps(fields, ensure_ascii=False, default=str))
+
+    def _mark_streaming_locked(self) -> None:
+        if self.status == 'pending':
+            self.status = 'streaming'
+
+    def mark_text(self, text, *, event_type: str = 'token') -> None:
+        value = '' if text is None else str(text)
+        with self._lock:
+            self.accumulated_text_length += len(value)
+            if value.strip():
+                self._has_non_whitespace_text = True
+                self._mark_streaming_locked()
+            self._diagnostic(event_type)
+
+    def mark_reasoning(self, text, *, event_type: str = 'reasoning') -> None:
+        value = '' if text is None else str(text)
+        with self._lock:
+            if value.strip():
+                self.reasoning_event_count += 1
+                self.reasoning_text_length += len(value)
+                self._mark_streaming_locked()
+            self._diagnostic(event_type)
+
+    def mark_tool(self, key=None, *, event_type: str = 'tool') -> None:
+        normalized_key = str(key or '').strip()
+        with self._lock:
+            if normalized_key and normalized_key in self._tool_event_keys:
+                self._diagnostic(event_type, duplicate=True)
+                return
+            if normalized_key:
+                self._tool_event_keys.add(normalized_key)
+            self.tool_event_count += 1
+            self._mark_streaming_locked()
+            self._diagnostic(event_type)
+
+    def observe_result(self, summary: dict | None, result: dict | None = None) -> None:
+        summary = summary or {}
+        result = result if isinstance(result, dict) else {}
+        with self._lock:
+            final_response = str(result.get('final_response') or '').strip()
+            self.result_has_final_text = bool(
+                summary.get('assistant_text')
+                or (final_response and final_response.lower() != '(empty)')
+            )
+            self.result_has_reasoning = bool(summary.get('reasoning'))
+            self.result_has_tool_output = bool(summary.get('tool_output'))
+            self.finish_reason = str(
+                result.get('finish_reason')
+                or result.get('stop_reason')
+                or result.get('terminal_reason')
+                or summary.get('finish_reason')
+                or ''
+            ).strip() or None
+            if self.result_has_final_text or self.result_has_reasoning or self.result_has_tool_output:
+                self._mark_streaming_locked()
+            self._diagnostic('result')
+
+    @property
+    def has_usable_output(self) -> bool:
+        with self._lock:
+            return bool(
+                self._has_non_whitespace_text
+                or self.reasoning_event_count
+                or self.tool_event_count
+                or self.result_has_final_text
+                or self.result_has_reasoning
+                or self.result_has_tool_output
+            )
+
+    def finalize(self, status: str, *, reason=None, failure_type=None, abort_source=None) -> bool:
+        target = str(status or '').strip().lower()
+        if target not in self._TERMINAL:
+            raise ValueError(f'Invalid terminal turn status: {status!r}')
+        with self._lock:
+            if self.status in self._TERMINAL:
+                self._diagnostic(
+                    'duplicate-finalize',
+                    attempted_status=target,
+                    attempted_reason=reason,
+                )
+                return False
+            self.status = target
+            self.close_reason = str(reason or '').strip() or None
+            self.failure_type = str(failure_type or '').strip() or None
+            self.abort_source = str(abort_source or '').strip() or None
+            self._diagnostic('finalize')
+            return True
+
+    def payload(self) -> dict:
+        with self._lock:
+            return {
+                'turn_status': self.status,
+                'usable_output': bool(
+                    self._has_non_whitespace_text
+                    or self.reasoning_event_count
+                    or self.tool_event_count
+                    or self.result_has_final_text
+                    or self.result_has_reasoning
+                    or self.result_has_tool_output
+                ),
+                'accumulated_text_length': self.accumulated_text_length,
+                'reasoning_event_count': self.reasoning_event_count,
+                'tool_event_count': self.tool_event_count,
+                'finish_reason': self.finish_reason,
+                'stream_close_reason': self.close_reason,
+                'abort_source': self.abort_source,
+            }
+
+
 _MAX_ITERATION_SUMMARY_REQUEST = (
     "You've reached the maximum number of tool-calling iterations allowed. "
     "Please provide a final response summarizing what you've found and accomplished "
@@ -1561,6 +2139,9 @@ def _persist_cancelled_turn(session, *, message: str = 'Task cancelled.') -> Non
     session.active_stream_id = None
     session.pending_user_message = None
     session.pending_attachments = []
+    session.pending_context_items = []
+    session.pending_browser_context_parts = []
+    session.pending_client_message_id = None
     session.pending_started_at = None
     session.pending_user_source = None
     if not _session_has_cancel_marker(session):
@@ -1580,6 +2161,9 @@ def _cleanup_ephemeral_cancelled_turn(session) -> None:
     session.active_stream_id = None
     session.pending_user_message = None
     session.pending_attachments = []
+    session.pending_context_items = []
+    session.pending_browser_context_parts = []
+    session.pending_client_message_id = None
     session.pending_started_at = None
     session.pending_user_source = None
     try:
@@ -2920,6 +3504,70 @@ def _assistant_message_has_final_visible_text(message) -> bool:
     return bool(_message_text(content).strip())
 
 
+def _current_turn_result_output_summary(result_messages, previous_context, msg_text) -> dict:
+    """Summarize usable provider output belonging to the current user turn.
+
+    This deliberately counts executed tool calls/results and reasoning as usable
+    output, while ignoring whitespace and unrelated metadata.  It shares the
+    same current-turn boundary rules as display reconciliation so an older
+    assistant answer cannot satisfy a genuinely empty new turn.
+    """
+    result_messages = list(result_messages or [])
+    previous_context = list(previous_context or [])
+    if _messages_have_prefix(result_messages, previous_context):
+        candidates = result_messages[len(previous_context):]
+    else:
+        current_user_idx = _find_current_user_turn(result_messages, msg_text)
+        candidates = result_messages[current_user_idx + 1:] if current_user_idx is not None else result_messages
+
+    assistant_text = False
+    reasoning = False
+    tool_output = False
+    tool_event_count = 0
+    finish_reason = None
+    for message in candidates:
+        if not isinstance(message, dict) or message.get('_error'):
+            continue
+        role = str(message.get('role') or '').lower()
+        if role == 'assistant':
+            if _assistant_message_has_final_visible_text(message) or str(message.get('refusal') or '').strip():
+                assistant_text = True
+            if str(
+                message.get('reasoning')
+                or message.get('reasoning_content')
+                or message.get('thinking')
+                or ''
+            ).strip() or _content_has_reasoning_only_parts(message.get('content')):
+                reasoning = True
+            message_tool_calls = message.get('tool_calls') or []
+            if isinstance(message_tool_calls, list) and message_tool_calls:
+                tool_output = True
+                tool_event_count += len(message_tool_calls)
+            content = message.get('content')
+            if isinstance(content, list):
+                content_tools = sum(1 for part in content if _assistant_content_part_is_tool_use(part))
+                if content_tools:
+                    tool_output = True
+                    tool_event_count += content_tools
+            if finish_reason is None:
+                finish_reason = str(
+                    message.get('finish_reason') or message.get('stop_reason') or ''
+                ).strip() or None
+        elif role == 'tool':
+            # A tool-role row is emitted only after a tool was actually invoked;
+            # even an empty/error result is meaningful turn output.
+            tool_output = True
+            tool_event_count += 1
+
+    return {
+        'assistant_text': assistant_text,
+        'reasoning': reasoning,
+        'tool_output': tool_output,
+        'tool_event_count': tool_event_count,
+        'finish_reason': finish_reason,
+    }
+
+
 
 _WORKSPACE_PREFIX_RE = re.compile(r'^\s*\[Workspace::v1:\s*(?:\\.|[^\]\\])+\]\s*')
 _LEGACY_WORKSPACE_PREFIX_RE = re.compile(r'^\s*\[Workspace:[^\]]+\]\s*')
@@ -4002,11 +4650,15 @@ def _preserve_pre_compression_snapshot(s, old_sid: str) -> None:
             saved_active_stream_id = getattr(s, 'active_stream_id', None)
             saved_pending_user_message = getattr(s, 'pending_user_message', None)
             saved_pending_attachments = list(getattr(s, 'pending_attachments', []) or [])
+            saved_pending_context_items = list(getattr(s, 'pending_context_items', []) or [])
+            saved_pending_browser_context_parts = list(getattr(s, 'pending_browser_context_parts', []) or [])
             saved_pending_started_at = getattr(s, 'pending_started_at', None)
             saved_pending_user_source = getattr(s, 'pending_user_source', None)
             s.active_stream_id = None
             s.pending_user_message = None
             s.pending_attachments = []
+            s.pending_context_items = []
+            s.pending_browser_context_parts = []
             s.pending_started_at = None
             s.pending_user_source = None
             try:
@@ -4026,6 +4678,8 @@ def _preserve_pre_compression_snapshot(s, old_sid: str) -> None:
                 s.active_stream_id = saved_active_stream_id
                 s.pending_user_message = saved_pending_user_message
                 s.pending_attachments = saved_pending_attachments
+                s.pending_context_items = saved_pending_context_items
+                s.pending_browser_context_parts = saved_pending_browser_context_parts
                 s.pending_started_at = saved_pending_started_at
                 s.pending_user_source = saved_pending_user_source
             return
@@ -4047,6 +4701,8 @@ def _preserve_pre_compression_snapshot(s, old_sid: str) -> None:
             snapshot.active_stream_id = None
             snapshot.pending_user_message = None
             snapshot.pending_attachments = []
+            snapshot.pending_context_items = []
+            snapshot.pending_browser_context_parts = []
             snapshot.pending_started_at = None
             snapshot.pending_user_source = None
             snapshot.save(touch_updated_at=False, skip_index=False)
@@ -5649,7 +6305,16 @@ def _advance_truncation_watermark_after_commit(session) -> None:
     session.truncation_watermark = time.time()
 
 
-def _merge_display_messages_after_agent_result(previous_display, previous_context, result_messages, msg_text, source: str = "webui"):
+def _merge_display_messages_after_agent_result(
+    previous_display,
+    previous_context,
+    result_messages,
+    msg_text,
+    current_context_items=None,
+    current_browser_context_parts=None,
+    current_client_message_id: str | None = None,
+    source: str = "webui",
+):
     """Keep UI transcript durable while allowing model context to compact.
 
     If Hermes Agent returns a normal append-only history, append that delta to
@@ -5703,6 +6368,8 @@ def _merge_display_messages_after_agent_result(previous_display, previous_contex
     # would otherwise slip into the merged transcript as a real delta. (#5334)
     previous_context = _drop_synthetic_control_messages(previous_context)
     result_messages = _drop_synthetic_control_messages(result_messages)
+    current_context_items = list(current_context_items or [])
+    current_browser_context_parts = list(current_browser_context_parts or [])
     if not result_messages:
         return previous_display
     previous_user_tail = _stale_user_tail_candidate(_last_user_row(previous_context))
@@ -5866,6 +6533,17 @@ def _merge_display_messages_after_agent_result(previous_display, previous_contex
             )
         candidates = turn_candidates
 
+    if current_client_message_id and candidates:
+        # Stamp the submitted-turn identity before any checkpoint comparison.
+        # The agent result normally echoes the user row without browser-only
+        # metadata; without this bridge, an intentional repeated prompt can be
+        # mistaken for the previous turn solely because its text is identical.
+        candidate_user_idx = _find_current_user_turn(candidates, msg_text)
+        if candidate_user_idx is not None and isinstance(candidates[candidate_user_idx], dict):
+            candidates = list(candidates)
+            candidates[candidate_user_idx] = copy.deepcopy(candidates[candidate_user_idx])
+            candidates[candidate_user_idx]['client_message_id'] = current_client_message_id
+
     merged = previous_display[:]
     seen = {_message_identity(m) for m in merged}
     current_user_key = _message_identity({'role': 'user', 'content': msg_text})
@@ -5873,13 +6551,20 @@ def _merge_display_messages_after_agent_result(previous_display, previous_contex
         _message_identity(m) == current_user_key or _looks_like_current_user_turn(m, msg_text)
         for m in candidates
     )
-    current_user_already_checkpointed = bool(
-        merged
-        and (
-            _message_identity(merged[-1]) == current_user_key
-            or _looks_like_current_user_turn(merged[-1], msg_text)
+    if current_client_message_id:
+        current_user_already_checkpointed = bool(
+            merged
+            and isinstance(merged[-1], dict)
+            and merged[-1].get('client_message_id') == current_client_message_id
         )
-    )
+    else:
+        current_user_already_checkpointed = bool(
+            merged
+            and (
+                _message_identity(merged[-1]) == current_user_key
+                or _looks_like_current_user_turn(merged[-1], msg_text)
+            )
+        )
     if (
         current_user_key is not None
         and not current_user_in_candidates
@@ -5896,8 +6581,15 @@ def _merge_display_messages_after_agent_result(previous_display, previous_contex
         # exchange and then clear the pending prompt. Materialize the current
         # turn at the transcript boundary before the assistant/tool response.
         current_user_msg = {'role': 'user', 'content': msg_text}
+        if current_client_message_id:
+            current_user_msg['client_message_id'] = current_client_message_id
         if source and source != 'webui':
             current_user_msg['_source'] = source
+        if current_context_items:
+            current_user_msg['context_items'] = current_context_items
+        if current_browser_context_parts:
+            current_user_msg['browser_context_parts'] = current_browser_context_parts
+            current_user_msg['parts'] = current_browser_context_parts
         insert_at = 0
         while insert_at < len(candidates) and _is_context_compression_marker(candidates[insert_at]):
             insert_at += 1
@@ -5911,13 +6603,26 @@ def _merge_display_messages_after_agent_result(previous_display, previous_contex
             continue
         key = _message_identity(msg)
         is_current_user_turn = _looks_like_current_user_turn(msg, msg_text)
+        checkpoint_matches_current = bool(
+            merged
+            and (
+                (
+                    current_client_message_id
+                    and isinstance(merged[-1], dict)
+                    and merged[-1].get('client_message_id') == current_client_message_id
+                )
+                or (
+                    not current_client_message_id
+                    and (
+                        _message_identity(merged[-1]) == current_user_key
+                        or _looks_like_current_user_turn(merged[-1], msg_text)
+                    )
+                )
+            )
+        )
         if (
             ((key is not None and key == current_user_key) or is_current_user_turn)
-            and merged
-            and (
-                _message_identity(merged[-1]) == current_user_key
-                or _looks_like_current_user_turn(merged[-1], msg_text)
-            )
+            and checkpoint_matches_current
         ):
             # Eager session-save mode can checkpoint the current user turn
             # before the agent runs. When the agent returns that same user turn
@@ -5935,6 +6640,13 @@ def _merge_display_messages_after_agent_result(previous_display, previous_contex
                 and merged[-1].get('id') is None
             ):
                 merged[-1]['id'] = msg['id']
+            if current_client_message_id and isinstance(merged[-1], dict):
+                merged[-1]['client_message_id'] = current_client_message_id
+            if current_context_items and isinstance(merged[-1], dict) and not merged[-1].get('context_items'):
+                merged[-1]['context_items'] = current_context_items
+            if current_browser_context_parts and isinstance(merged[-1], dict) and not merged[-1].get('browser_context_parts'):
+                merged[-1]['browser_context_parts'] = current_browser_context_parts
+                merged[-1]['parts'] = current_browser_context_parts
             continue
         if (
             key is not None
@@ -5958,8 +6670,16 @@ def _merge_display_messages_after_agent_result(previous_display, previous_contex
         ):
             display_msg = copy.deepcopy(msg)
             display_msg['content'] = msg_text
+            if current_client_message_id:
+                display_msg['client_message_id'] = current_client_message_id
             if source and source != 'webui':
                 display_msg['_source'] = source
+            if current_context_items and not display_msg.get('context_items'):
+                display_msg['context_items'] = current_context_items
+            if current_browser_context_parts and not display_msg.get('browser_context_parts'):
+                display_msg['browser_context_parts'] = current_browser_context_parts
+            if current_browser_context_parts and not display_msg.get('parts'):
+                display_msg['parts'] = current_browser_context_parts
         merged.append(copy.deepcopy(display_msg))
         if key is not None:
             seen.add(key)
@@ -6113,6 +6833,11 @@ def _agent_result_terminal_failure(result) -> bool:
 
 
 _TOOL_RESULT_SNIPPET_MAX = 4000
+_TOOL_RESULT_STRUCTURED_MAX = 100_000
+_TOOL_RESULT_PREVIEW_FIELD_HINTS = {
+    'output', 'result', 'error', 'content', 'diff', 'patch', 'stdout', 'stderr',
+    'body', 'source', 'snapshot', 'message', 'details', 'data', 'log', 'logs',
+}
 
 # Tool-arg keys whose values are card content / diff-reconstruction inputs.
 # These must not be capped to the short incidental-arg limit (#4928), or long
@@ -6208,6 +6933,67 @@ def _live_usage_session_snapshot(session_id, current_session, cache_ref, *, load
     return loaded
 
 
+def _tool_result_preview_value(value, *, max_depth: int = 3):
+    """Select a display value by shape while treating field names as hints.
+
+    Tool schemas are open-ended, so fields such as ``compiler_transcript`` or
+    ``migration_notes`` must behave like ``output`` when they contain the same
+    multiline value. This helper only traverses inert JSON-compatible values;
+    it never decodes escapes independently of the successful outer JSON parse.
+    """
+    candidates = []
+    order = 0
+
+    def add(text, field, depth, *, structured=False):
+        nonlocal order
+        source = text if isinstance(text, str) else str(text)
+        if not source:
+            return
+        line_breaks = source.count('\n') + source.count('\r')
+        score = 0
+        if line_breaks:
+            score += 100 + min(40, line_breaks)
+        if len(source) >= 240:
+            score += 20
+        stripped = source.strip()
+        if structured or (
+            len(stripped) >= 2
+            and ((stripped[0] == '{' and stripped[-1] == '}')
+                 or (stripped[0] == '[' and stripped[-1] == ']'))
+        ):
+            score += 15
+        if str(field or '').lower() in _TOOL_RESULT_PREVIEW_FIELD_HINTS:
+            score += 10
+        if score <= 0:
+            return
+        candidates.append((score - (depth * 2), -order, source))
+        order += 1
+
+    def visit(item, field='', depth=0):
+        if depth > max_depth:
+            return
+        if isinstance(item, str):
+            add(item, field, depth)
+            return
+        if isinstance(item, dict):
+            if depth and str(field or '').lower() in _TOOL_RESULT_PREVIEW_FIELD_HINTS:
+                try:
+                    add(json.dumps(item, ensure_ascii=False), field, depth, structured=True)
+                except Exception:
+                    pass
+            for child_field, child in item.items():
+                visit(child, child_field, depth + 1)
+            return
+        if isinstance(item, list) and str(field or '').lower() in _TOOL_RESULT_PREVIEW_FIELD_HINTS:
+            try:
+                add(json.dumps(item, ensure_ascii=False), field, depth, structured=True)
+            except Exception:
+                pass
+
+    visit(value)
+    return max(candidates, default=(0, 0, None), key=lambda item: (item[0], item[1]))[2]
+
+
 def _tool_result_snippet(raw, limit: int = _TOOL_RESULT_SNIPPET_MAX) -> str:
     """Extract a bounded result preview from a stored tool message payload."""
     if limit <= 0:
@@ -6215,12 +7001,50 @@ def _tool_result_snippet(raw, limit: int = _TOOL_RESULT_SNIPPET_MAX) -> str:
     text = str(raw or '')
     try:
         data = raw if isinstance(raw, dict) else json.loads(text)
-        if isinstance(data, dict):
-            preview = data.get('output') or data.get('result') or data.get('error') or text
-            text = str(preview)
+        if isinstance(data, (dict, list)):
+            # Select the semantic value before applying the persistence/live
+            # preview cap. Cutting a large JSON wrapper first can leave an
+            # invalid string such as `{"content":"108|...\\n`, which the
+            # frontend must correctly treat as raw text.
+            preview = _tool_result_preview_value(data)
+            if preview is not None:
+                text = preview
     except Exception:
         pass
     return text[:limit]
+
+
+def _tool_result_structured_payload(raw, limit: int = _TOOL_RESULT_STRUCTURED_MAX):
+    """Return a bounded structured result without rewriting its raw string.
+
+    Live and persisted cards normally carry a small display snippet. For a
+    reasonably sized JSON object/array, also retain the authoritative wrapper
+    so recursive formatting and Copy raw can use the exact serialized value.
+    Oversized or non-JSON output stays on the existing bounded-snippet path.
+    """
+    if limit <= 0 or raw is None:
+        return None
+    if isinstance(raw, str):
+        if len(raw) > limit:
+            return None
+        stripped = raw.strip()
+        if not stripped or not (
+            (stripped.startswith('{') and stripped.endswith('}'))
+            or (stripped.startswith('[') and stripped.endswith(']'))
+        ):
+            return None
+        try:
+            parsed = json.loads(stripped)
+        except Exception:
+            return None
+        return raw if isinstance(parsed, (dict, list)) else None
+    if not isinstance(raw, (dict, list)):
+        return None
+    try:
+        encoded = json.dumps(raw, ensure_ascii=False)
+    except Exception:
+        return None
+    return raw if len(encoded) <= limit else None
 
 
 def _truncate_tool_args(args, limit: int = 6) -> dict:
@@ -6259,6 +7083,19 @@ def _extract_tool_calls_from_messages(messages, live_tool_calls=None):
     pending_asst_idx = {}
     tool_msg_sequence = []
 
+    def persisted_summary(name, raw, tid, assistant_msg_idx, args, *, arg_limit=6):
+        summary = {
+            'name': name,
+            'snippet': _tool_result_snippet(raw),
+            'tid': tid,
+            'assistant_msg_idx': assistant_msg_idx,
+            'args': _truncate_tool_args(args, limit=arg_limit),
+        }
+        structured = _tool_result_structured_payload(raw)
+        if structured is not None:
+            summary['result'] = structured
+        return summary
+
     for msg_idx, m in enumerate(messages or []):
         if not isinstance(m, dict):
             continue
@@ -6294,13 +7131,13 @@ def _extract_tool_calls_from_messages(messages, live_tool_calls=None):
             if tid:
                 name = pending_names.get(tid, '')
                 if name and name != 'tool':
-                    tool_calls.append({
-                        'name': name,
-                        'snippet': _tool_result_snippet(raw),
-                        'tid': tid,
-                        'assistant_msg_idx': pending_asst_idx.get(tid, -1),
-                        'args': _truncate_tool_args(pending_args.get(tid, {})),
-                    })
+                    tool_calls.append(persisted_summary(
+                        name,
+                        raw,
+                        tid,
+                        pending_asst_idx.get(tid, -1),
+                        pending_args.get(tid, {}),
+                    ))
                     seq['resolved'] = True
             tool_msg_sequence.append(seq)
 
@@ -6312,15 +7149,476 @@ def _extract_tool_calls_from_messages(messages, live_tool_calls=None):
             if seq_idx >= len(live):
                 break
             live_tc = live[seq_idx]
-            tool_calls.append({
-                'name': live_tc.get('name', 'tool'),
-                'snippet': _tool_result_snippet(seq.get('raw', '')),
-                'tid': live_tc.get('tid', '') or '',
-                'assistant_msg_idx': _nearest_assistant_msg_idx(messages, seq.get('msg_idx', -1)),
-                'args': _truncate_tool_args(live_tc.get('args', {}), limit=4),
-            })
+            tool_calls.append(persisted_summary(
+                live_tc.get('name', 'tool'),
+                seq.get('raw', ''),
+                live_tc.get('tid', '') or '',
+                _nearest_assistant_msg_idx(messages, seq.get('msg_idx', -1)),
+                live_tc.get('args', {}),
+                arg_limit=4,
+            ))
+
+    if live_tool_calls:
+        used_preview_ids = set()
+        for tc in tool_calls:
+            if not isinstance(tc, dict):
+                continue
+            for idx, live_tc in enumerate(live_tool_calls or []):
+                if idx in used_preview_ids or not isinstance(live_tc, dict) or not live_tc.get('mutation_preview'):
+                    continue
+                same_tid = bool(tc.get('tid') and live_tc.get('tid') and tc.get('tid') == live_tc.get('tid'))
+                same_name = bool(tc.get('name') and tc.get('name') == live_tc.get('name'))
+                if same_tid or same_name:
+                    tc['mutation_preview'] = live_tc.get('mutation_preview')
+                    used_preview_ids.add(idx)
+                    break
 
     return tool_calls
+
+
+_ARTIFACT_IGNORE_RE = re.compile(r'(^|/)(?:\.git|\.hg|\.svn|node_modules|\.venv|venv|__pycache__|dist|build|\.next|\.cache)(?:/|$)')
+_ARTIFACT_MUTATION_TOOLS = {
+    'write_file',
+    'patch',
+    'edit_file',
+    'create_file',
+    'mcp_filesystem_write_file',
+    'mcp_filesystem_edit_file',
+}
+
+_LIVE_MUTATION_DIFF_MAX_CHARS = 60_000
+_LIVE_MUTATION_FILE_READ_MAX = 220_000
+
+
+def _live_mutation_text(value, *, limit: int = _LIVE_MUTATION_DIFF_MAX_CHARS) -> str:
+    if value is None:
+        return ''
+    try:
+        if isinstance(value, str):
+            text = value
+        else:
+            text = json.dumps(value, ensure_ascii=False, default=str)
+    except Exception:
+        text = str(value)
+    if limit and len(text) > limit:
+        return text[:limit] + '\n… diff clipped …'
+    return text
+
+
+def _live_mutation_workspace_file_text(workspace, path) -> str | None:
+    """Best-effort read of the pre-mutation file so write_file can show a diff."""
+    normalized = _normalize_artifact_path_for_journal(path)
+    if not workspace or not normalized:
+        return None
+    try:
+        root = Path(str(workspace)).expanduser().resolve()
+        target = Path(normalized).expanduser()
+        if not target.is_absolute():
+            target = root / normalized
+        target = target.resolve()
+        target.relative_to(root)
+        if not target.is_file() or target.stat().st_size > _LIVE_MUTATION_FILE_READ_MAX:
+            return None
+        return target.read_text(encoding='utf-8', errors='replace')
+    except Exception:
+        return None
+
+
+def _live_mutation_unified_diff(path, old_text: str, new_text: str) -> str:
+    label = _normalize_artifact_path_for_journal(path) or str(path or 'file') or 'file'
+    # difflib preserves the missing newline on a final source line. Joining its
+    # output directly therefore turns a one-line replacement into
+    # ``-old+new`` when both snippets omit their trailing newline. Normalize
+    # only the record separators here; the leading diff marker and code text
+    # remain untouched.
+    records = difflib.unified_diff(
+        str(old_text or '').splitlines(True),
+        str(new_text or '').splitlines(True),
+        fromfile=label,
+        tofile=label,
+        lineterm='',
+        n=3,
+    )
+    diff = '\n'.join(str(record).rstrip('\r\n') for record in records)
+    if diff:
+        diff += '\n'
+    return _live_mutation_text(diff)
+
+
+def _live_mutation_positionless_diff(path, old_text: str, new_text: str) -> str:
+    """Render a replacement without inventing a file position.
+
+    A snippet-vs-snippet unified diff always reports line 1, which is only the
+    snippet's coordinate and is misleading in a file diff card. A bare hunk
+    marker intentionally leaves gutters blank until a real file/result baseline
+    supplies authoritative coordinates.
+    """
+    label = _normalize_artifact_path_for_journal(path) or str(path or 'file') or 'file'
+    old_lines = str(old_text or '').replace('\r\n', '\n').split('\n')
+    new_lines = str(new_text or '').replace('\r\n', '\n').split('\n')
+    if old_lines and old_lines[-1] == '':
+        old_lines.pop()
+    if new_lines and new_lines[-1] == '':
+        new_lines.pop()
+    body = [*(f'-{line}' for line in old_lines), *(f'+{line}' for line in new_lines)]
+    return _live_mutation_text('\n'.join([f'--- {label}', f'+++ {label}', '@@', *body]) + '\n')
+
+
+def _live_mutation_replace_diff(path, old_text: str, new_text: str, workspace=None) -> str:
+    """Build an accurately positioned replace diff when the file is available."""
+    old_value = str(old_text or '')
+    new_value = str(new_text or '')
+    current = _live_mutation_workspace_file_text(workspace, path)
+    if current is not None and old_value and current.count(old_value) == 1:
+        updated = current.replace(old_value, new_value, 1)
+        return _live_mutation_unified_diff(path, current, updated)
+    # Tool-complete callbacks run after the write. If the old text is gone and
+    # the replacement is unique, reconstruct the pre-edit baseline backwards.
+    if current is not None and new_value and current.count(new_value) == 1 and (not old_value or old_value not in current):
+        previous = current.replace(new_value, old_value, 1)
+        return _live_mutation_unified_diff(path, previous, current)
+    return _live_mutation_positionless_diff(path, old_value, new_value)
+
+
+def _live_mutation_diff_stats(diff_text: str) -> dict:
+    stats = {'added': 0, 'removed': 0}
+    for line in str(diff_text or '').replace('\r\n', '\n').split('\n'):
+        if line.startswith('+++') or line.startswith('---'):
+            continue
+        if line.startswith('+'):
+            stats['added'] += 1
+        elif line.startswith('-'):
+            stats['removed'] += 1
+    return stats
+
+
+def _live_mutation_result_diff_text(result) -> str:
+    if isinstance(result, dict):
+        for key in ('diff', 'patch'):
+            candidate = result.get(key)
+            if candidate:
+                extracted = _live_mutation_result_diff_text(candidate)
+                if extracted:
+                    return extracted
+        for key in ('result', 'data', 'output'):
+            nested = result.get(key)
+            if isinstance(nested, (dict, list)):
+                extracted = _live_mutation_result_diff_text(nested)
+                if extracted:
+                    return extracted
+        return ''
+    if isinstance(result, list):
+        for item in result:
+            extracted = _live_mutation_result_diff_text(item)
+            if extracted:
+                return extracted
+        return ''
+    if isinstance(result, str):
+        stripped = result.strip()
+        if stripped.startswith(('{', '[')):
+            try:
+                parsed = json.loads(stripped)
+            except Exception:
+                parsed = None
+            if isinstance(parsed, (dict, list)):
+                extracted = _live_mutation_result_diff_text(parsed)
+                if extracted:
+                    return extracted
+    text = _live_mutation_text(result, limit=_LIVE_MUTATION_DIFF_MAX_CHARS)
+    if re.search(r'(^|\n)(diff --git |@@ |\+\+\+ |--- |\*\*\* (?:Begin Patch|Update File|Add File|Delete File)|[-+][^\n])', text):
+        return text
+    return ''
+
+
+def _live_mutation_result_failure_details(result) -> str:
+    """Return a bounded mutation failure explanation, or ``''`` on success.
+
+    Patch tools commonly return a JSON object whose arguments still contain a
+    syntactically valid patch even though validation rejected it.  Treating the
+    arguments as a completed diff makes the UI claim that lines changed when no
+    file was modified.  Explicit result failure is authoritative over any
+    args-derived preview.
+    """
+    if isinstance(result, dict):
+        status = str(result.get('status') or '').strip().lower()
+        failed = (
+            result.get('success') is False
+            or result.get('ok') is False
+            or status in {'error', 'failed', 'failure', 'invalid'}
+            or bool(result.get('error'))
+        )
+        if failed:
+            details = (
+                result.get('error')
+                or result.get('message')
+                or result.get('detail')
+                or result.get('details')
+                or 'The patch tool reported a failure.'
+            )
+            return _live_mutation_text(details, limit=20_000).strip()
+        for key in ('result', 'data', 'output'):
+            nested = result.get(key)
+            if isinstance(nested, (dict, list)):
+                details = _live_mutation_result_failure_details(nested)
+                if details:
+                    return details
+        return ''
+    if isinstance(result, list):
+        for item in result:
+            details = _live_mutation_result_failure_details(item)
+            if details:
+                return details
+        return ''
+    if not isinstance(result, str):
+        return ''
+    text = result.strip()
+    if not text:
+        return ''
+    if text.startswith(('{', '[')):
+        try:
+            parsed = json.loads(text)
+        except Exception:
+            parsed = None
+        if isinstance(parsed, (dict, list)):
+            details = _live_mutation_result_failure_details(parsed)
+            if details:
+                return details
+    if re.search(
+        r'(?:patch validation failed|patch (?:could not|couldn.t) be applied|failed to apply (?:the )?patch|invalid context)',
+        text,
+        flags=re.IGNORECASE,
+    ):
+        return _live_mutation_text(text, limit=20_000).strip()
+    return ''
+
+
+def _live_mutation_preview_from_tool(name, args, *, result=None, workspace=None) -> dict | None:
+    """Return a bounded, UI-ready live file-diff preview for mutation tools."""
+    tool_name = str(name or '').replace('functions.', '', 1)
+    if tool_name not in _ARTIFACT_MUTATION_TOOLS:
+        return None
+    if not isinstance(args, dict):
+        return None
+
+    path = args.get('path') or args.get('file_path') or args.get('filename') or args.get('destination')
+    normalized_path = _normalize_artifact_path_for_journal(path)
+    if not normalized_path:
+        candidates = mutation_path_events_from_tool_calls([{'name': tool_name, 'args': args, 'result': result or ''}])
+        path = candidates[0].get('path') if candidates else ''
+        normalized_path = _normalize_artifact_path_for_journal(path)
+    if not normalized_path:
+        return None
+    # On tool start, write/create calls often have only the target path and
+    # prospective content. Surface the Modified Files card immediately as a
+    # pending write, then replace it with the real diff when tool_complete
+    # supplies the result. Patch/edit calls can still show an args-derived diff
+    # up front because old_string/new_string are already a compact diff source.
+    if result is None and ('write' in tool_name or 'create' in tool_name):
+        return {
+            'files': [{
+                'path': normalized_path,
+                'source': tool_name,
+                'pending': True,
+                'status': 'Writing file…',
+            }],
+            'source': tool_name,
+        }
+    failure_details = _live_mutation_result_failure_details(result) if result is not None else ''
+    if failure_details:
+        return {
+            'files': [{
+                'path': normalized_path,
+                'source': tool_name,
+                'failed': True,
+                'status': 'Patch could not be applied',
+                'failure_details': failure_details,
+            }],
+            'source': tool_name,
+            'failed': True,
+        }
+    # A completed mutation result is authoritative: patch tools commonly return
+    # the real full-file hunk coordinates there. The start preview may only have
+    # old_string/new_string snippets and must not overwrite that better diff.
+    diff_text = _live_mutation_result_diff_text(result) if result is not None else ''
+    if not diff_text:
+        for key in ('diff', 'patch'):
+            if args.get(key):
+                diff_text = _live_mutation_text(args.get(key))
+                break
+    if not diff_text:
+        old_value = args.get('old_string', args.get('oldContent', args.get('old_content')))
+        new_value = args.get('new_string', args.get('newContent', args.get('new_content')))
+        if old_value is not None or new_value is not None:
+            diff_text = _live_mutation_replace_diff(path, str(old_value or ''), str(new_value or ''), workspace)
+    if not diff_text and ('write' in tool_name or 'create' in tool_name):
+        new_value = args.get('content')
+        if new_value is None:
+            new_value = args.get('newContent', args.get('new_content'))
+        if new_value is not None:
+            old_value = None if 'create' in tool_name else _live_mutation_workspace_file_text(workspace, path)
+            diff_text = _live_mutation_unified_diff(path, old_value or '', str(new_value))
+    stats = _live_mutation_diff_stats(diff_text)
+    return {'files': [{'path': normalized_path, 'source': tool_name, 'diff': diff_text, 'stats': stats}], 'source': tool_name}
+
+
+def _normalize_artifact_path_for_journal(path) -> str:
+    """Normalize a tool-reported artifact path using the frontend's rules."""
+    if not path:
+        return ''
+    text = str(path).strip()
+    text = re.sub(r'[\`"\'<>),.;:]+$', '', text)
+    text = re.sub(r'^[\`"\'(<]+', '', text)
+    if not text or len(text) > 240 or '://' in text:
+        return ''
+    text = re.sub(r'^~/', '', text)
+    text = re.sub(r'^(?:\./)+', '', text)
+    if not text or _ARTIFACT_IGNORE_RE.search(text):
+        return ''
+    if not re.search(r'[./]', text):
+        return ''
+    return text
+
+
+def _artifact_candidates_from_text_for_journal(text) -> list[dict]:
+    """Extract narrow diff/patch-fence paths for journal-backed mutation metadata."""
+    if not isinstance(text, str) or not text:
+        return []
+    out = []
+    seen = set()
+
+    def add(path):
+        normalized = _normalize_artifact_path_for_journal(path)
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            out.append({'path': normalized, 'kind': 'diff'})
+
+    for match in re.finditer(r'```(?:diff|patch)\s*\n[\s\S]*?```', text, flags=re.IGNORECASE):
+        block = match.group(0)
+        fm = re.search(r'(?:^|\n)(?:\+\+\+|---)\s+(?:[ab]/)?([^\n\t]+)', block)
+        if fm:
+            add(fm.group(1).strip())
+    return out
+
+
+def _coerce_artifact_tool_call_for_journal(tool_call) -> dict | None:
+    """Return a normalized tool-call dict matching workspace.js extraction inputs."""
+    if not isinstance(tool_call, dict):
+        return None
+    fn_obj = tool_call.get('function')
+    fn = fn_obj if isinstance(fn_obj, dict) else tool_call
+    name = str(fn.get('name') or tool_call.get('name') or '').replace('functions.', '', 1)
+    args = fn.get('arguments') or tool_call.get('arguments') or tool_call.get('args') or tool_call.get('input') or {}
+    if isinstance(args, str):
+        try:
+            args = json.loads(args)
+        except Exception:
+            pass
+    result = tool_call.get('result') or tool_call.get('output') or tool_call.get('snippet') or ''
+    return {'name': name, 'args': args, 'result': result}
+
+
+def mutation_path_events_from_tool_calls(tool_calls) -> list[dict]:
+    """Build stable path/source entries for a turn-journal ``mutation_paths`` event."""
+    out = []
+    seen = set()
+
+    def add(path, source):
+        normalized = _normalize_artifact_path_for_journal(path)
+        if not normalized or normalized in seen:
+            return
+        seen.add(normalized)
+        out.append({'path': normalized, 'source': source or 'tool'})
+
+    for raw in tool_calls or []:
+        tc = _coerce_artifact_tool_call_for_journal(raw)
+        if not tc:
+            continue
+        name = str(tc.get('name') or '').replace('functions.', '', 1)
+        args = tc.get('args') or {}
+        start_count = len(out)
+        if name in _ARTIFACT_MUTATION_TOOLS and isinstance(args, dict):
+            for key in ('path', 'file_path', 'source', 'destination'):
+                add(args.get(key), name or 'tool')
+            paths = args.get('paths')
+            if isinstance(paths, list):
+                for path in paths:
+                    add(path, name or 'tool')
+            edits = args.get('edits')
+            if isinstance(edits, list):
+                for edit in edits:
+                    add(edit.get('path') if isinstance(edit, dict) else None, name or 'tool')
+
+        result = tc.get('result')
+        result_text = result if isinstance(result, str) else (json.dumps(result, ensure_ascii=False, default=str) if result else '')
+        for candidate in _artifact_candidates_from_text_for_journal(result_text):
+            add(candidate.get('path'), candidate.get('kind') or name or 'tool')
+
+        if len(out) == start_count and name in _ARTIFACT_MUTATION_TOOLS:
+            args_text = args if isinstance(args, str) else json.dumps(args or {}, ensure_ascii=False, default=str)
+            for candidate in _artifact_candidates_from_text_for_journal(args_text):
+                add(candidate.get('path'), candidate.get('kind') or name or 'tool')
+
+    return out[:24]
+
+
+def _append_mutation_paths_turn_journal_event(session_id: str, stream_id: str, tool_calls, *, assistant_message_index=None) -> None:
+    """Persist current-turn mutation paths in the turn journal for settled reloads."""
+    paths = mutation_path_events_from_tool_calls(tool_calls)
+    if not paths:
+        return
+    event = {
+        'event': 'mutation_paths',
+        'created_at': time.time(),
+        'paths': paths,
+    }
+    if assistant_message_index is not None:
+        event['assistant_message_index'] = assistant_message_index
+    append_turn_journal_event_for_stream(session_id, stream_id, event)
+
+
+def _checkpoint_ids_for_turn_journal(workspace) -> set[str]:
+    """Return known rollback checkpoint ids for a workspace, best-effort."""
+    if not workspace:
+        return set()
+    try:
+        from api.rollback import list_checkpoints
+
+        payload = list_checkpoints(str(workspace))
+    except Exception:
+        logger.debug("Failed to list rollback checkpoints for turn journal", exc_info=True)
+        return set()
+    ids = set()
+    for item in payload.get('checkpoints') or []:
+        if not isinstance(item, dict):
+            continue
+        cid = str(item.get('id') or '').strip()
+        if cid:
+            ids.add(cid)
+    return ids
+
+
+def checkpoint_events_from_turn_boundary(start_ids, end_ids) -> list[dict]:
+    """Build stable checkpoint association entries from before/after ids."""
+    before = {str(cid).strip() for cid in (start_ids or []) if str(cid).strip()}
+    after = {str(cid).strip() for cid in (end_ids or []) if str(cid).strip()}
+    return [{'checkpoint_id': cid} for cid in sorted(after - before)[:24]]
+
+
+def _append_checkpoint_paths_turn_journal_event(session_id: str, stream_id: str, workspace, start_ids, *, assistant_message_index=None) -> None:
+    """Persist checkpoint ids created during the current turn, if detectable."""
+    checkpoints = checkpoint_events_from_turn_boundary(start_ids, _checkpoint_ids_for_turn_journal(workspace))
+    if not checkpoints:
+        return
+    event = {
+        'event': 'checkpoint_paths',
+        'created_at': time.time(),
+        'checkpoints': checkpoints,
+    }
+    if len(checkpoints) == 1:
+        event['checkpoint_id'] = checkpoints[0]['checkpoint_id']
+    if assistant_message_index is not None:
+        event['assistant_message_index'] = assistant_message_index
+    append_turn_journal_event_for_stream(session_id, stream_id, event)
 
 
 def _partial_message_signature(message: dict) -> tuple:
@@ -6448,6 +7746,7 @@ def _materialize_pending_user_turn_before_error(session) -> bool:
         recovered_ts = int(pending_started_at)
     pending_source = getattr(session, 'pending_user_source', None) or 'webui'
     pending_attachments = list(getattr(session, 'pending_attachments', None) or [])
+    pending_client_message_id = getattr(session, 'pending_client_message_id', None)
 
     def is_exact_checkpoint(messages):
         if not isinstance(messages, list) or not messages:
@@ -6456,6 +7755,8 @@ def _materialize_pending_user_turn_before_error(session) -> bool:
         if not isinstance(existing, dict) or existing.get('role') != 'user':
             return False
         existing_source = existing.get('_source') or 'webui'
+        if pending_client_message_id and existing.get('client_message_id') == pending_client_message_id:
+            return True
         try:
             existing_ts = int(existing.get('timestamp'))
         except (TypeError, ValueError):
@@ -6478,7 +7779,16 @@ def _materialize_pending_user_turn_before_error(session) -> bool:
     if pending_source != 'webui':
         recovered['_source'] = pending_source
     if pending_attachments:
-        recovered['attachments'] = pending_attachments
+        recovered['attachments'] = list(pending_attachments)
+    pending_context_items = getattr(session, 'pending_context_items', None)
+    if pending_context_items:
+        recovered['context_items'] = list(pending_context_items)
+    pending_browser_context_parts = getattr(session, 'pending_browser_context_parts', None)
+    if pending_browser_context_parts:
+        recovered['browser_context_parts'] = list(pending_browser_context_parts)
+        recovered['parts'] = list(pending_browser_context_parts)
+    if pending_client_message_id:
+        recovered['client_message_id'] = pending_client_message_id
     session.messages.append(recovered)
     # Mirror to context_messages so the _recovered flag survives the state.db
     # round-trip (#4283).  state.db has no _recovered column, so without this
@@ -6555,11 +7865,8 @@ def _build_partial_message(content_text, reasoning_text, tool_calls) -> dict | N
     return _msg
 
 
-def _snapshot_and_append_partial_on_error(session, stream_id) -> dict | None:
-    """Snapshot streaming buffers under STREAMS_LOCK and append a _partial message.
-
-    Uses _build_partial_message() for the shared thinking-strip + dict-build logic.
-    """
+def _snapshot_stream_buffers(stream_id) -> tuple[str, str, list]:
+    """Read the current visible/reasoning/tool buffers without mutating them."""
     from api import config as _live_config
 
     streams_lock = STREAMS_LOCK
@@ -6574,9 +7881,9 @@ def _snapshot_and_append_partial_on_error(session, stream_id) -> dict | None:
         reasoning_texts = getattr(_live_config, 'STREAM_REASONING_TEXT', reasoning_texts)
         live_tool_calls = getattr(_live_config, 'STREAM_LIVE_TOOL_CALLS', live_tool_calls)
 
-    _snap_partial_text = None
-    _snap_reasoning = None
-    _snap_tool_calls = None
+    _snap_partial_text = ''
+    _snap_reasoning = ''
+    _snap_tool_calls = []
 
     # The streaming thread mirrors these three buffers lock-free (GIL-atomic; see
     # the STREAMS_LOCK contract note at on_token in the streaming loop). We take
@@ -6603,6 +7910,32 @@ def _snapshot_and_append_partial_on_error(session, stream_id) -> dict | None:
             _live_tools = getattr(_live_config, 'STREAM_LIVE_TOOL_CALLS', live_tool_calls)
             if _live_tools is not live_tool_calls:
                 _snap_tool_calls = list(_live_tools.get(stream_id, []) or [])
+
+    return _snap_partial_text, _snap_reasoning, _snap_tool_calls
+
+
+def _snapshot_and_append_streamed_text(session, stream_id) -> dict | None:
+    """Persist only user-visible streamed text as an honest partial assistant row."""
+    _snap_partial_text, _, _ = _snapshot_stream_buffers(stream_id)
+    _partial_msg = _build_partial_message(_snap_partial_text, '', [])
+    if _partial_msg is None:
+        return None
+    if not isinstance(session.messages, list):
+        session.messages = []
+    if not _partial_marker_already_present(session.messages, _partial_msg):
+        session.messages.append(_partial_msg)
+        return _partial_msg
+    return None
+
+
+def _snapshot_and_append_partial_on_error(session, stream_id) -> dict | None:
+    """Snapshot streaming buffers under STREAMS_LOCK and append a _partial message.
+
+    Uses _build_partial_message() for the shared thinking-strip + dict-build logic.
+    """
+    _snap_partial_text, _snap_reasoning, _snap_tool_calls = _snapshot_stream_buffers(
+        stream_id
+    )
 
     # Seal projected live tool rows so the durable scene cannot disagree with
     # the settled terminal state (#6309). Any tool call that was still running
@@ -7048,6 +8381,26 @@ def _cached_agent_matches_session(agent, session_id: str) -> bool:
     return identity is None or identity == str(session_id)
 
 
+def _bind_agent_terminal_input_callback(agent) -> bool:
+    """Keep managed terminal input on the current WebUI request bridge.
+
+    ``AIAgent`` forwards ``terminal_input_callback`` to the terminal tool, but
+    WebUI historically refreshed only ``clarify_callback`` on cached agents.
+    The terminal tool then treated foreground commands as non-interactive and
+    spawned them with stdin closed, so a detected prompt could only time out.
+
+    Assign on every provider attempt (including credential self-heal) because
+    the clarify bridge closes over request-scoped cancellation and SSE state.
+    Assigning ``None`` is intentional: it cannot leave a callback from an old,
+    already-finished request attached to a reused agent.
+    """
+    if agent is None:
+        return False
+    callback = getattr(agent, 'clarify_callback', None)
+    agent.terminal_input_callback = callback
+    return callable(callback)
+
+
 def _refresh_cached_agent_primary_runtime_snapshot(agent) -> None:
     """Keep AIAgent's primary-runtime snapshot aligned with refreshed creds.
 
@@ -7132,6 +8485,15 @@ def _run_agent_streaming(
         model=model,
         provider=model_provider,
         ephemeral=bool(ephemeral),
+    )
+    _agentpet_heartbeat_stop = None
+    _agentpet_heartbeat_thread = None
+    _agentpet_project = str(workspace) if workspace else None
+    _notify_agentpet(
+        "working",
+        "Running Hermes WebUI turn",
+        session_id=session_id,
+        project=_agentpet_project,
     )
     try:
         run_journal = RunJournalWriter(session_id, stream_id)
@@ -7249,6 +8611,7 @@ def _run_agent_streaming(
             'context_length': 0,
             'threshold_tokens': 0,
             'last_prompt_tokens': 0,
+            'compression_count': 0,
             'post_compression_context_tokens_estimate': None,
         }
         _session_obj = _current_live_usage_session()
@@ -7412,6 +8775,7 @@ def _run_agent_streaming(
                         _usage['context_length'] = _cc_cl_u
                         _usage['threshold_tokens'] = getattr(_cc, 'threshold_tokens', 0) or 0
                         _usage['last_prompt_tokens'] = getattr(_cc, 'last_prompt_tokens', 0) or 0
+                    _usage['compression_count'] = getattr(_cc, 'compression_count', 0) or 0
             except Exception:
                 pass
 
@@ -7427,6 +8791,13 @@ def _run_agent_streaming(
             )
             if isinstance(_post_compression_estimate, int) and _post_compression_estimate > 0:
                 _usage['post_compression_context_tokens_estimate'] = _post_compression_estimate
+            try:
+                _usage['compression_count'] = max(
+                    int(_usage.get('compression_count') or 0),
+                    int(getattr(_session_obj, 'compression_count', 0) or 0),
+                )
+            except (TypeError, ValueError):
+                pass
 
         _real_prompt_tokens = int(_usage.get('last_prompt_tokens') or 0)
         _usage['cache_hit_percent'] = prompt_cache_hit_percent(
@@ -7471,11 +8842,76 @@ def _run_agent_streaming(
     _metering_thread = threading.Thread(target=_metering_ticker, daemon=True)
 
     _success_writeback_committed = False
+    _turn_outcome = _TurnOutcomeState(stream_id, session_id)
 
     def put(event, data):
-        # If cancelled, drop all further events except the cancel event itself
+        # If cancelled, drop all further events except the established terminal
+        # cancel/error signals. Do this before outcome mutation so a discarded
+        # late apperror cannot consume the once-only terminal transition and
+        # prevent the real cancel event from being delivered.
         if cancel_event.is_set() and not _success_writeback_committed and event not in ('cancel', 'error'):
             return
+        # Record usable provider output at the single event boundary shared by
+        # every adapter callback. Empty/whitespace chunks remain non-usable.
+        if event in ('token', 'interim_assistant') and isinstance(data, dict):
+            _turn_outcome.mark_text(data.get('text'), event_type=event)
+        elif event == 'reasoning' and isinstance(data, dict):
+            _turn_outcome.mark_reasoning(data.get('text'), event_type=event)
+        elif event in ('tool', 'tool_output', 'tool_complete') and isinstance(data, dict):
+            _tool_key = data.get('tid') or data.get('tool_call_id') or data.get('call_id')
+            if not _tool_key:
+                _tool_key = f"{data.get('name') or 'tool'}:{data.get('activitySegmentSeq') or ''}"
+            _turn_outcome.mark_tool(_tool_key, event_type=event)
+
+        # Terminal events are once-only. A late close/error callback after done
+        # is ignored before it can enter the run journal or reach the browser.
+        if event == 'done':
+            if not _turn_outcome.finalize('completed', reason='done'):
+                return
+            data = dict(data or {})
+            data.update(_turn_outcome.payload())
+            data['status'] = 'completed'
+        elif event in ('apperror', 'error'):
+            _error_data = dict(data or {}) if isinstance(data, dict) else {'message': str(data or '')}
+            _error_type = str(_error_data.get('type') or 'error').strip().lower()
+            if _turn_outcome.status == 'completed':
+                _turn_outcome._diagnostic(
+                    'late-error-dropped',
+                    error_type=_error_type,
+                    code_path='put-terminal-guard',
+                )
+                return
+            if _error_type in {'no_response', 'silent_failure'} and _turn_outcome.has_usable_output:
+                _error_type = 'interrupted'
+                _error_data['type'] = 'interrupted'
+                _error_data['message'] = (
+                    _error_data.get('message')
+                    or 'The provider stream ended after returning partial output.'
+                )
+                _error_data['hint'] = (
+                    'The partial response was preserved. Retry if you need the remainder.'
+                )
+            if not _turn_outcome.finalize(
+                'failed',
+                reason=_error_data.get('stream_close_reason') or event,
+                failure_type=_error_type,
+                abort_source=_error_data.get('abort_source'),
+            ):
+                return
+            _error_data.update(_turn_outcome.payload())
+            _error_data['status'] = 'failed'
+            data = _error_data
+        elif event == 'cancel':
+            if not _turn_outcome.finalize(
+                'failed',
+                reason='cancelled',
+                failure_type='cancelled',
+                abort_source='user',
+            ):
+                return
+            data = dict(data or {})
+            data.update(_turn_outcome.payload())
+            data['status'] = 'failed'
         event_id = None
         if run_journal is not None:
             try:
@@ -7535,6 +8971,20 @@ def _run_agent_streaming(
             and 'http' in _lower
         ):
             _captured_terminal_error[0] = _message
+        if "waiting" in _lower or "approval" in _lower or "input required" in _lower:
+            _notify_agentpet(
+                "waiting",
+                _message,
+                session_id=session_id,
+                project=str(workspace) if workspace else None,
+            )
+        elif _kind == "lifecycle" and ("running" in _lower or "resuming" in _lower):
+            _notify_agentpet(
+                "working",
+                _message,
+                session_id=session_id,
+                project=str(workspace) if workspace else None,
+            )
         if _is_agent_compression_start_status(_kind, _message):
             put('compressing', {
                 'session_id': session_id,
@@ -7564,12 +9014,17 @@ def _run_agent_streaming(
     _checkpoint_stop = None
     _ckpt_thread = None
     _agent_lock = None
+    _live_tool_output_coalescer = None
     try:
         # Register this stream with the global streaming meter and start the 1 Hz
         # metering ticker. Kept INSIDE the outer try so the outer `finally`'s
         # end_session()/_metering_stop.set() teardown is always paired (#4633/#2476).
         meter().begin_session(stream_id)
         _metering_thread.start()
+        _agentpet_heartbeat_stop, _agentpet_heartbeat_thread = _start_agentpet_heartbeat(
+            session_id=session_id,
+            project=_agentpet_project,
+        )
         # Bind THIS turn's session identity to the worker thread/context BEFORE
         # any agent work (so every mid-turn notify_on_complete background spawn
         # captures THIS session, not a concurrent turn's process-global env).
@@ -7851,18 +9306,23 @@ def _run_agent_streaming(
         except ImportError:
             logger.debug("Clarify module not available, falling back to polling")
 
-        def _clarify_callback_impl(question, choices, sid, cancel_evt, put_event):
+        def _clarify_callback_impl(question, choices, sid, cancel_evt, put_event, metadata=None):
             """Bridge Hermes clarify prompts to the WebUI."""
             timeout = _clarify_timeout_seconds()
             choices_list = [str(choice) for choice in (choices or [])]
+            metadata = metadata if isinstance(metadata, dict) else {}
+            sensitive = bool(metadata.get('sensitive', False))
             data = {
                 'question': str(question or ''),
                 'choices_offered': choices_list,
                 'session_id': sid,
-                'kind': 'clarify',
+                'kind': 'terminal_input' if metadata.get('process_id') else 'clarify',
+                'sensitive': sensitive,
                 'requested_at': time.time(),
                 'timeout_seconds': timeout,
             }
+            if metadata.get('process_id'):
+                data['process_id'] = str(metadata.get('process_id'))
             try:
                 from api.clarify import submit_pending as _submit_clarify_pending, clear_pending as _clear_clarify_pending
             except ImportError:
@@ -7905,6 +9365,7 @@ def _run_agent_streaming(
             _current_reasoning_idx = 0
             _tool_boundary_advanced = False
             _live_tool_calls = []  # tool progress fallback when final messages omit tool IDs
+            _checkpoint_ids_at_turn_start = _checkpoint_ids_for_turn_journal(s.workspace)
 
             # Throttle: emit metering events at most every 100 ms so the per-message
             # TPS label feels live during fast token streams without flooding SSE.
@@ -8102,6 +9563,7 @@ def _run_agent_streaming(
             _checkpoint_activity = [0]
             _live_tool_event_start_ids = set()
             _live_tool_event_complete_ids = set()
+            _live_tool_output_coalescer = _LiveToolOutputCoalescer(put)
 
             def _tool_args_snapshot(args):
                 args_snap = {}
@@ -8197,33 +9659,52 @@ def _run_agent_streaming(
                     _tool_boundary_advanced = True
 
                 args_snap = _tool_args_snapshot(args)
+                mutation_preview = _live_mutation_preview_from_tool(
+                    name,
+                    args if isinstance(args, dict) else {},
+                    result=cb_kwargs.get('result') if cb_kwargs.get('result') is not None else preview,
+                    workspace=s.workspace,
+                )
 
                 # Modern Hermes Agent builds can call both tool_progress_callback
                 # and the structured tool_start/tool_complete callbacks for the
-                # same tool. Prefer the structured path when it is supported so
-                # the browser receives one tid-tagged tool card per real call.
-                if event_type in (None, 'tool.started') and 'tool_start_callback' in _agent_params:
+                # same tool. Prefer the structured path for ordinary tools, but
+                # do not suppress mutation previews: some runtimes/providers
+                # declare tool_start_callback yet only deliver the legacy progress
+                # start before the file tool runs. Those progress starts are the
+                # only chance to show the live Modified Files card immediately.
+                if event_type in (None, 'tool.started') and 'tool_start_callback' in _agent_params and not mutation_preview:
                     return
 
                 if event_type in (None, 'tool.started'):
-                    _live_tool_calls.append({
+                    live_entry = {
                         'name': name,
                         'args': args if isinstance(args, dict) else {},
-                    })
+                    }
+                    if mutation_preview:
+                        live_entry['mutation_preview'] = mutation_preview
+                    _live_tool_calls.append(live_entry)
                     # Mirror to shared dict so cancel_stream() can persist it (#1361 §B)
                     # Lock-free GIL-atomic mirror — see STREAMS_LOCK contract in on_token.
                     if stream_id in STREAM_LIVE_TOOL_CALLS:
-                        STREAM_LIVE_TOOL_CALLS[stream_id].append({
+                        shared_entry = {
                             'name': name,
                             'args': args if isinstance(args, dict) else {},
                             'done': False,
-                        })
-                    put('tool', {
+                        }
+                        if mutation_preview:
+                            shared_entry['mutation_preview'] = mutation_preview
+                        STREAM_LIVE_TOOL_CALLS[stream_id].append(shared_entry)
+                    payload = {
                         'event_type': event_type or 'tool.started',
                         'name': name,
                         'preview': preview,
                         'args': args_snap,
-                    })
+                        'done': False,
+                    }
+                    if mutation_preview:
+                        payload['mutation_preview'] = mutation_preview
+                    put('tool', payload)
                     _tool_stats = meter().get_stats(stream_id)
                     _tool_stats['session_id'] = session_id
                     _tool_stats['usage'] = _live_usage_snapshot()
@@ -8265,13 +9746,36 @@ def _run_agent_streaming(
                     return
 
                 if event_type == 'tool.completed':
+                    completion_result = cb_kwargs.get('result') if cb_kwargs.get('result') is not None else preview
+                    structured_result = _tool_result_structured_payload(completion_result)
+                    mutation_preview = _live_mutation_preview_from_tool(
+                        name,
+                        args if isinstance(args, dict) else {},
+                        result=completion_result,
+                        workspace=s.workspace,
+                    )
+                    mutation_failed = bool(
+                        mutation_preview
+                        and (
+                            mutation_preview.get('failed')
+                            or any(
+                                isinstance(file, dict) and file.get('failed')
+                                for file in (mutation_preview.get('files') or [])
+                            )
+                        )
+                    )
+                    tool_failed = bool(cb_kwargs.get('is_error', False) or mutation_failed)
                     for live_tc in reversed(_live_tool_calls):
                         if live_tc.get('done'):
                             continue
                         if not name or live_tc.get('name') == name:
                             live_tc['done'] = True
                             live_tc['duration'] = cb_kwargs.get('duration')
-                            live_tc['is_error'] = bool(cb_kwargs.get('is_error', False))
+                            live_tc['is_error'] = tool_failed
+                            if structured_result is not None:
+                                live_tc['result'] = structured_result
+                            if mutation_preview:
+                                live_tc['mutation_preview'] = mutation_preview
                             break
                     # Mirror done state to shared dict (#1361 §B)
                     if stream_id in STREAM_LIVE_TOOL_CALLS:
@@ -8281,19 +9785,28 @@ def _run_agent_streaming(
                             if not name or shared_tc.get('name') == name:
                                 shared_tc['done'] = True
                                 shared_tc['duration'] = cb_kwargs.get('duration')
-                                shared_tc['is_error'] = bool(cb_kwargs.get('is_error', False))
+                                shared_tc['is_error'] = tool_failed
+                                if structured_result is not None:
+                                    shared_tc['result'] = structured_result
+                                if mutation_preview:
+                                    shared_tc['mutation_preview'] = mutation_preview
                                 break
                     # Signal the checkpoint thread that new work has completed (Issue #765).
                     # Each completed tool call is a meaningful unit of progress worth persisting.
                     _checkpoint_activity[0] += 1
-                    put('tool_complete', {
+                    payload = {
                         'event_type': event_type,
                         'name': name,
                         'preview': preview,
                         'args': args_snap,
                         'duration': cb_kwargs.get('duration'),
-                        'is_error': bool(cb_kwargs.get('is_error', False)),
-                    })
+                        'is_error': tool_failed,
+                    }
+                    if mutation_preview:
+                        payload['mutation_preview'] = mutation_preview
+                    if structured_result is not None:
+                        payload['result'] = structured_result
+                    put('tool_complete', payload)
                     # Mirror the todo tool's in-memory state into a
                     # dedicated SSE event so the Todos panel can update
                     # in real-time without waiting for the turn to
@@ -8334,27 +9847,43 @@ def _run_agent_streaming(
                     _record_live_tool_start(tool_call_id, name, args)
                     if tool_call_id and tool_call_id not in _live_tool_event_start_ids:
                         _live_tool_event_start_ids.add(tool_call_id)
-                        _live_tool_calls.append({
+                        mutation_preview = _live_mutation_preview_from_tool(
+                            name,
+                            args if isinstance(args, dict) else {},
+                            workspace=s.workspace,
+                        )
+                        live_entry = {
                             'name': name,
                             'args': args if isinstance(args, dict) else {},
                             'tid': tool_call_id,
-                        })
+                            'done': False,
+                        }
+                        if mutation_preview:
+                            live_entry['mutation_preview'] = mutation_preview
+                        _live_tool_calls.append(live_entry)
                         # Mirror to shared dict so cancel_stream() can persist it (#1361 §B)
                         # Lock-free GIL-atomic mirror — see STREAMS_LOCK contract in on_token.
                         if stream_id in STREAM_LIVE_TOOL_CALLS:
-                            STREAM_LIVE_TOOL_CALLS[stream_id].append({
+                            shared_entry = {
                                 'name': name,
                                 'args': args if isinstance(args, dict) else {},
                                 'done': False,
                                 'tid': tool_call_id,
-                            })
-                        put('tool', {
+                            }
+                            if mutation_preview:
+                                shared_entry['mutation_preview'] = mutation_preview
+                            STREAM_LIVE_TOOL_CALLS[stream_id].append(shared_entry)
+                        payload = {
                             'event_type': 'tool.started',
                             'name': name,
                             'preview': None,
                             'args': _tool_args_snapshot(args),
                             'tid': tool_call_id,
-                        })
+                            'done': False,
+                        }
+                        if mutation_preview:
+                            payload['mutation_preview'] = mutation_preview
+                        put('tool', payload)
                     _tool_stats = meter().get_stats(stream_id)
                     _tool_stats['session_id'] = session_id
                     _tool_stats['usage'] = _live_usage_snapshot()
@@ -8364,16 +9893,41 @@ def _run_agent_streaming(
 
             def on_tool_complete(tool_call_id, name, args, function_result):
                 try:
+                    # Preserve event order: any buffered live output for this
+                    # command must reach the browser before its completion.
+                    _live_tool_output_coalescer.flush(tool_call_id)
                     _record_live_tool_complete(tool_call_id, name, function_result)
                     if tool_call_id and tool_call_id not in _live_tool_event_complete_ids:
                         _live_tool_event_complete_ids.add(tool_call_id)
                         result_snippet = _tool_result_snippet(function_result)
+                        structured_result = _tool_result_structured_payload(function_result)
+                        mutation_preview = _live_mutation_preview_from_tool(
+                            name,
+                            args if isinstance(args, dict) else {},
+                            result=function_result,
+                            workspace=s.workspace,
+                        )
+                        mutation_failed = bool(
+                            mutation_preview
+                            and (
+                                mutation_preview.get('failed')
+                                or any(
+                                    isinstance(file, dict) and file.get('failed')
+                                    for file in (mutation_preview.get('files') or [])
+                                )
+                            )
+                        )
                         for live_tc in reversed(_live_tool_calls):
                             if live_tc.get('done'):
                                 continue
                             if live_tc.get('tid') == tool_call_id or (not live_tc.get('tid') and live_tc.get('name') == name):
                                 live_tc['done'] = True
                                 live_tc['snippet'] = result_snippet
+                                live_tc['is_error'] = mutation_failed
+                                if structured_result is not None:
+                                    live_tc['result'] = structured_result
+                                if mutation_preview:
+                                    live_tc['mutation_preview'] = mutation_preview
                                 break
                         if stream_id in STREAM_LIVE_TOOL_CALLS:
                             for shared_tc in reversed(STREAM_LIVE_TOOL_CALLS[stream_id]):
@@ -8382,16 +9936,26 @@ def _run_agent_streaming(
                                 if shared_tc.get('tid') == tool_call_id or (not shared_tc.get('tid') and shared_tc.get('name') == name):
                                     shared_tc['done'] = True
                                     shared_tc['snippet'] = result_snippet
+                                    shared_tc['is_error'] = mutation_failed
+                                    if structured_result is not None:
+                                        shared_tc['result'] = structured_result
+                                    if mutation_preview:
+                                        shared_tc['mutation_preview'] = mutation_preview
                                     break
                         _checkpoint_activity[0] += 1
-                        put('tool_complete', {
+                        payload = {
                             'event_type': 'tool.completed',
                             'name': name,
                             'preview': result_snippet,
                             'args': _tool_args_snapshot(args),
                             'tid': tool_call_id,
-                            'is_error': False,
-                        })
+                            'is_error': mutation_failed,
+                        }
+                        if mutation_preview:
+                            payload['mutation_preview'] = mutation_preview
+                        if structured_result is not None:
+                            payload['result'] = structured_result
+                        put('tool_complete', payload)
                         # Mirror the todo tool's in-memory state into
                         # a dedicated SSE event so the Todos panel can
                         # update in real-time without waiting for the
@@ -8412,6 +9976,18 @@ def _run_agent_streaming(
                     put('metering', _tool_stats)
                 except Exception:
                     logger.debug('Failed to update live prompt estimate on tool completion', exc_info=True)
+
+            def on_tool_output(tool_call_id, name, stream, chunk):
+                """Forward an append-only terminal chunk without rebuilding its card."""
+                try:
+                    _live_tool_output_coalescer.append(
+                        tool_call_id,
+                        name,
+                        stream,
+                        chunk,
+                    )
+                except Exception:
+                    logger.debug('Failed to stream live tool output', exc_info=True)
 
             _AIAgent = _get_ai_agent()
             if _AIAgent is None:
@@ -8465,6 +10041,7 @@ def _run_agent_streaming(
             # Resolve API key via Hermes runtime provider (matches gateway behaviour).
             # Pass the resolved provider so non-default providers get their own credentials.
             resolved_api_key = None
+            _rt = {}
             try:
                 from api.oauth import resolve_runtime_provider_with_anthropic_env_lock
                 from hermes_cli.runtime_provider import resolve_runtime_provider
@@ -8482,13 +10059,6 @@ def _run_agent_streaming(
             except Exception as _e:
                 print(f"[webui] WARNING: resolve_runtime_provider failed: {_e}", flush=True)
 
-            # Named custom providers (custom:slug) may not be resolvable by
-            # hermes_cli.runtime_provider directly. Fall back to config.yaml
-            # custom_providers[] so WebUI can pass explicit creds/base_url.
-            resolved_provider, resolved_api_key, resolved_base_url = _resolve_custom_provider_runtime_overrides(
-                resolved_provider, resolved_api_key, resolved_base_url
-            )
-
             # Read per-profile config at call time (not module-level snapshot).
             # The streaming worker is a detached thread that does NOT inherit the
             # per-request thread-local profile context, so the ambient
@@ -8503,18 +10073,62 @@ def _run_agent_streaming(
             except Exception:
                 from api.config import get_config as _get_config
                 _cfg = _get_config()
+            _account_env_path = (Path(_profile_home) / ".env") if _profile_home else None
+            _rt = _apply_active_account_runtime_overrides(
+                _rt,
+                resolved_provider,
+                _cfg,
+                account_env_path=_account_env_path,
+            )
+            resolved_api_key = _rt.get("api_key") or resolved_api_key
+            resolved_base_url = _runtime_preferred_base_url(
+                _rt, resolved_provider, configured_base_url
+            )
             _prefill_context = _load_webui_prefill_context(_cfg)
             _prefill_messages = _prefill_messages_with_webui_context(_prefill_context, _cfg)
             _prefill_messages = _normalize_prefill_messages_before_user_turn(_prefill_messages)
+            _agent_cfg = (_cfg.get('agent') or {}) if isinstance(_cfg, dict) else {}
+            put('context_status', {
+                'session_id': session_id,
+                'prefill': _public_prefill_context_status(_prefill_context),
+            })
+
+            # Named custom providers (custom:slug) and account providers such as
+            # codex-lb may not be resolvable by older hermes_cli builds. Fall
+            # back to the session profile's config so WebUI can pass explicit
+            # creds/base_url without leaking the process-default profile.
+            resolved_provider, resolved_api_key, resolved_base_url = _resolve_custom_provider_runtime_overrides(
+                resolved_provider,
+                resolved_api_key,
+                resolved_base_url,
+                account_config=_cfg,
+            )
             _main_request_overrides = _main_model_request_overrides(
                 _cfg,
                 effective_model=resolved_model,
                 effective_provider=resolved_provider,
             )
-            put('context_status', {
-                'session_id': session_id,
-                'prefill': _public_prefill_context_status(_prefill_context),
-            })
+            _configured_service_tier = parse_service_tier_config(
+                _agent_cfg.get('service_tier') if isinstance(_agent_cfg, dict) else None
+            )
+            _fast_capability = resolve_fast_mode_capability(
+                resolved_model,
+                resolved_provider,
+                resolved_base_url,
+                _cfg,
+            )
+            _service_tier = (
+                _configured_service_tier
+                if _configured_service_tier == 'priority' and _fast_capability.get('supported')
+                else None
+            )
+            if _configured_service_tier == 'priority' and _service_tier is None:
+                logger.warning(
+                    '[webui-capability] Fast Mode suppressed model=%s provider=%s reason=%s',
+                    resolved_model,
+                    resolved_provider,
+                    _fast_capability.get('reason') or 'unsupported',
+                )
 
             # Per-profile toolsets — use _resolve_cli_toolsets() so MCP
             # server toolsets are included, matching native CLI behaviour.
@@ -8649,7 +10263,41 @@ def _run_agent_streaming(
                 )
                 _reasoning_config = parse_reasoning_effort(_effort)
             except Exception:
+                _effort = ""
                 _reasoning_config = None
+
+            try:
+                _supported_reasoning = resolve_model_reasoning_efforts(
+                    resolved_model,
+                    provider_id=resolved_provider,
+                    base_url=resolved_base_url,
+                )
+            except Exception:
+                _supported_reasoning = []
+            _provider_reasoning_payload = (
+                "max"
+                if _effort == "ultra" and "gpt-5.6" in str(resolved_model or "").lower()
+                else _effort
+            )
+            logger.info(
+                '[webui-capability] request model=%s provider=%s '
+                'reasoning_supported=%s reasoning_ui_label=%s '
+                'reasoning_backend_payload=%s reasoning_provider_payload=%s '
+                'fast_supported=%s fast_parameter=%s final_fast_override=%s',
+                resolved_model,
+                resolved_provider,
+                _supported_reasoning,
+                REASONING_EFFORT_LABELS.get(_effort, 'Default' if not _effort else _effort),
+                _effort,
+                _provider_reasoning_payload,
+                bool(_fast_capability.get('supported')),
+                _fast_capability.get('parameter') or '',
+                {
+                    key: _main_request_overrides[key]
+                    for key in ('service_tier', 'speed')
+                    if key in _main_request_overrides
+                },
+            )
 
             _agent_kwargs = dict(
                 model=resolved_model,
@@ -8669,8 +10317,8 @@ def _run_agent_streaming(
                 reasoning_callback=on_reasoning,
                 tool_progress_callback=on_tool,
                 clarify_callback=(
-                    lambda question, choices: _clarify_callback_impl(
-                        question, choices, session_id, cancel_event, put
+                    lambda question, choices, **metadata: _clarify_callback_impl(
+                        question, choices, session_id, cancel_event, put, metadata
                     )
                 ),
             )
@@ -8678,12 +10326,16 @@ def _run_agent_streaming(
             # but guard defensively to avoid TypeError on an older agent build.
             if 'reasoning_config' in _agent_params and _reasoning_config is not None:
                 _agent_kwargs['reasoning_config'] = _reasoning_config
+            if 'service_tier' in _agent_params and _service_tier is not None:
+                _agent_kwargs['service_tier'] = _service_tier
             if 'prefill_messages' not in _agent_params:
                 _agent_kwargs.pop('prefill_messages', None)
             if 'interim_assistant_callback' in _agent_params:
                 _agent_kwargs['interim_assistant_callback'] = on_interim_assistant
             if 'tool_start_callback' in _agent_params:
                 _agent_kwargs['tool_start_callback'] = on_tool_start
+            if 'tool_output_callback' in _agent_params:
+                _agent_kwargs['tool_output_callback'] = on_tool_output
             if 'tool_complete_callback' in _agent_params:
                 _agent_kwargs['tool_complete_callback'] = on_tool_complete
             if 'status_callback' in _agent_params:
@@ -8804,6 +10456,8 @@ def _run_agent_streaming(
                     agent.tool_progress_callback = _agent_kwargs.get('tool_progress_callback')
                     if hasattr(agent, 'tool_start_callback'):
                         agent.tool_start_callback = _agent_kwargs.get('tool_start_callback')
+                    if hasattr(agent, 'tool_output_callback'):
+                        agent.tool_output_callback = _agent_kwargs.get('tool_output_callback')
                     if hasattr(agent, 'tool_complete_callback'):
                         agent.tool_complete_callback = _agent_kwargs.get('tool_complete_callback')
                     if hasattr(agent, 'status_callback'):
@@ -9085,7 +10739,37 @@ def _run_agent_streaming(
                     cfg=_cfg,
                 )
                 _run_conversation_kwargs["user_message"] = user_message
-            result = agent.run_conversation(**_run_conversation_kwargs)
+
+            def _run_conversation_once(_run_agent, _kwargs):
+                """Run one provider attempt without leaking host handoff state."""
+                # Foreground terminal supervision is enabled only when Hermes
+                # receives an owning-session input callback. Bind the current
+                # request bridge here so normal, cached, and self-healed agents
+                # all keep writable process stdin and return prompt handoffs
+                # instead of waiting for the command timeout.
+                _bind_agent_terminal_input_callback(_run_agent)
+                try:
+                    return _run_agent.run_conversation(**_kwargs)
+                finally:
+                    # Credential self-heal can create another agent and retry
+                    # this same WebUI turn. Clear each attempt independently so
+                    # neither cached nor replaced instances carry text-only
+                    # closing state beyond their own run_conversation call.
+                    _clear_turn_handoff = getattr(
+                        _run_agent, "_clear_turn_handoff", None
+                    )
+                    if callable(_clear_turn_handoff):
+                        _clear_turn_handoff()
+
+            result = _run_conversation_once(agent, _run_conversation_kwargs)
+            _turn_outcome.observe_result(
+                _current_turn_result_output_summary(
+                    result.get('messages') or [],
+                    _previous_context_messages,
+                    msg_text,
+                ),
+                result,
+            )
             # #4729: the run is done — flush any reasoning tail still in the coalescing
             # buffer (the agent never calls reasoning_callback(None), and a turn can end on
             # reasoning with no trailing token/tool boundary to trigger a flush) so the last
@@ -9178,6 +10862,30 @@ def _run_agent_streaming(
                 with _stream_writeback_stage(_writeback_timings, "merge_result"):
                     _tool_limit_reached = _agent_result_tool_limit_reached(result)
                     _result_messages = result.get('messages') or _previous_context_messages
+                    _standalone_final_response = str(result.get('final_response') or '').strip()
+                    if (
+                        _standalone_final_response
+                        and _standalone_final_response.lower() != '(empty)'
+                        and not result.get('error')
+                        and not result.get('failed')
+                        and not result.get('compression_exhausted')
+                        and str(result.get('status') or result.get('state') or '').strip().lower()
+                            not in {'failed', 'error', 'compression_exhausted'}
+                        and not _assistant_reply_added_after_current_turn(
+                            _result_messages,
+                            _previous_context_messages,
+                            msg_text,
+                        )
+                    ):
+                        # Some provider adapters return the final answer only in
+                        # result.final_response after streaming it. Materialize
+                        # that answer before reconciliation so the terminal done
+                        # render and later refresh cannot lose visible content.
+                        _result_messages = list(_result_messages) + [{
+                            'role': 'assistant',
+                            'content': _standalone_final_response,
+                        }]
+                        result = {**result, 'messages': _result_messages}
                     _result_messages = _drop_synthetic_max_iteration_summary_requests(
                         _result_messages,
                         enabled=_tool_limit_reached,
@@ -9241,6 +10949,9 @@ def _run_agent_streaming(
                         _previous_context_messages,
                         _restore_display_reasoning_metadata(_previous_messages, _result_messages),
                         msg_text,
+                        current_context_items=getattr(s, 'pending_context_items', None),
+                        current_browser_context_parts=getattr(s, 'pending_browser_context_parts', None),
+                        current_client_message_id=getattr(s, 'pending_client_message_id', None),
                         source=getattr(s, 'pending_user_source', None) or 'webui',
                     )
                     _compact_session_image_parts_for_persistence(s)
@@ -9399,6 +11110,12 @@ def _run_agent_streaming(
                     _previous_context_messages,
                     msg_text,
                 )
+                _result_output_summary = _current_turn_result_output_summary(
+                    _all_result_messages,
+                    _previous_context_messages,
+                    msg_text,
+                )
+                _turn_outcome.observe_result(_result_output_summary, result)
                 _last_err = getattr(agent, '_last_error', None) or result.get('error') or ''
                 # #5940: if the Agent aborted on a non-retryable provider error
                 # (captured from its lifecycle status_callback) but left no error on
@@ -9413,6 +11130,12 @@ def _run_agent_streaming(
                     _last_err,
                     silent_failure=not bool(_last_err),
                 )
+                if _turn_outcome.has_usable_output and _classification['type'] == 'error':
+                    _classification = {
+                        'label': 'Response interrupted',
+                        'type': 'interrupted',
+                        'hint': 'The provider stream ended after returning partial output. The partial response was preserved; retry if you need the remainder.',
+                    }
                 _is_quota = _classification['type'] == 'quota_exhausted'
                 _is_auth = _classification['type'] == 'auth_mismatch'
                 _drop_replayed_assistant = (
@@ -9429,6 +11152,53 @@ def _run_agent_streaming(
                     source=getattr(s, 'pending_user_source', None) or 'webui',
                     drop_replayed_assistant=_drop_replayed_assistant,
                 )
+                _streamed_tool_limit_closure = False
+                if (
+                    _tool_limit_reached
+                    and _saved_transcript_lacks_final_answer
+                    and _turn_outcome.has_usable_output
+                    and not _captured_terminal_failure
+                    and not _last_err
+                ):
+                    # Some Hermes/provider combinations deliver the graceful
+                    # max-iteration summary through stream_delta_callback but
+                    # omit it from result.messages/final_response. Preserve the
+                    # exact visible stream before the terminal classifier can
+                    # replace it with an apperror. Keep it display-only and
+                    # explicitly partial: the provider result did not confirm a
+                    # normal final assistant row, but the user-visible closure is
+                    # still real output and must survive settlement/reload.
+                    try:
+                        _streamed_closure_msg = _snapshot_and_append_streamed_text(
+                            s, stream_id
+                        )
+                    except Exception:
+                        _streamed_closure_msg = None
+                        logger.debug(
+                            "Failed to preserve streamed tool-limit closure for %s",
+                            stream_id,
+                            exc_info=True,
+                        )
+                    if (
+                        isinstance(_streamed_closure_msg, dict)
+                        and str(_streamed_closure_msg.get('content') or '').strip()
+                    ):
+                        _streamed_closure_msg['_streamed_tool_limit_closure'] = True
+                        _mark_latest_assistant_tool_limit_status(s.messages)
+                        _streamed_tool_limit_closure = True
+                if _drop_replayed_assistant and _saved_transcript_lacks_final_answer:
+                    # The provider/result payload may replay an older assistant
+                    # row after the current request. Remove that result-side
+                    # evidence before empty-response classification; only live
+                    # callbacks (if any) should keep this turn non-empty.
+                    _result_output_summary = {
+                        'assistant_text': False,
+                        'reasoning': False,
+                        'tool_output': False,
+                        'tool_event_count': 0,
+                        'finish_reason': None,
+                    }
+                    _turn_outcome.observe_result(_result_output_summary, {})
                 _is_agent_result_terminal = _agent_result_terminal_failure(result)
                 _terminal_failure = (
                     _captured_terminal_failure
@@ -9438,6 +11208,8 @@ def _run_agent_streaming(
                         and _classification['type'] not in {'cancelled', 'interrupted'}
                     )
                 )
+                if _streamed_tool_limit_closure:
+                    _terminal_failure = False
                 _result_status = str(result.get('status') or result.get('state') or '').strip().lower()
                 _soft_partial_terminal_failure = (
                     _is_agent_result_terminal
@@ -9448,19 +11220,49 @@ def _run_agent_streaming(
                     and not _tool_limit_reached
                     and not _last_err
                 )
+                # A transcript-boundary mismatch may say "no final answer" even
+                # though this exact turn produced valid output. Do not let that
+                # inferred condition override direct callback/result evidence.
+                if (
+                    _terminal_failure
+                    and (
+                        _turn_outcome.result_has_final_text
+                        or _result_output_summary.get('reasoning')
+                        or _result_output_summary.get('tool_output')
+                    )
+                    and not _captured_terminal_failure
+                    and not _is_agent_result_terminal
+                    and not _drop_replayed_assistant
+                ):
+                    _terminal_failure = False
                 if (
                     _terminal_failure
                     and (_soft_partial_terminal_failure or _tool_limit_reached)
                     and _classification['type'] == 'no_response'
-                    and not _saved_transcript_lacks_final_answer
+                    and _turn_outcome.result_has_final_text
                 ):
                     _terminal_failure = False
+                # If an explicit terminal result really did follow partial
+                # text/reasoning/tool output, preserve it as an interrupted run.
+                # It is not a provider-empty response.
+                if (
+                    _terminal_failure
+                    and _classification['type'] == 'no_response'
+                    and _turn_outcome.has_usable_output
+                ):
+                    _classification = {
+                        'label': 'Response interrupted',
+                        'type': 'interrupted',
+                        'hint': 'The provider stream ended after returning partial output. The partial response was preserved; retry if you need the remainder.',
+                    }
                 if _terminal_failure:
                     _assistant_added = False
                 elif _tool_limit_reached and not _session_lacks_final_assistant_answer(s.messages):
                     _mark_latest_assistant_tool_limit_status(s.messages)
-                # _token_sent tracks whether on_token() was called (any streamed text)
-                if _terminal_failure or (not _assistant_added and not _token_sent):
+                # The authoritative outcome counts visible text, reasoning, and
+                # actual tool activity; an empty/whitespace token callback alone
+                # does not make the response usable.
+                if _terminal_failure or not _turn_outcome.has_usable_output:
                     if cancel_event.is_set():
                         _finalize_cancelled_turn(s, ephemeral=ephemeral)
                         if not ephemeral:
@@ -9496,14 +11298,24 @@ def _run_agent_streaming(
                             logger.info('[webui] self-heal: retrying stream after credential refresh')
                             # Rebuild runtime variables from the refreshed resolve
                             _rt = _heal_rt
+                            _rt = _apply_active_account_runtime_overrides(
+                                _rt,
+                                resolved_provider,
+                                _cfg,
+                                account_env_path=_account_env_path,
+                            )
                             resolved_api_key = _heal_rt.get('api_key')
+                            resolved_api_key = _rt.get('api_key') or resolved_api_key
                             if not resolved_provider:
                                 resolved_provider = _heal_rt.get('provider')
                             resolved_base_url = _runtime_preferred_base_url(
-                                _heal_rt, resolved_provider, configured_base_url
+                                _rt, resolved_provider, configured_base_url
                             )
                             resolved_provider, resolved_api_key, resolved_base_url = _resolve_custom_provider_runtime_overrides(
-                                resolved_provider, resolved_api_key, resolved_base_url
+                                resolved_provider,
+                                resolved_api_key,
+                                resolved_base_url,
+                                account_config=_cfg,
                             )
                             # Rebuild agent kwargs and create a fresh agent
                             _agent_kwargs['api_key'] = resolved_api_key
@@ -9512,7 +11324,7 @@ def _run_agent_streaming(
                             _agent_kwargs['provider'] = resolved_provider
                             _replace_session_db_in_kwargs(_agent_kwargs, _state_db_path)
                             if 'credential_pool' in _agent_params:
-                                _agent_kwargs['credential_pool'] = _heal_rt.get('credential_pool')
+                                _agent_kwargs['credential_pool'] = _rt.get('credential_pool')
                             agent = _AIAgent(**_agent_kwargs)
                             with STREAMS_LOCK:
                                 AGENT_INSTANCES[stream_id] = agent
@@ -9539,7 +11351,7 @@ def _run_agent_streaming(
                                 )
                                 if moa_config is not None:
                                     _heal_kwargs["moa_config"] = moa_config
-                                _heal_result = agent.run_conversation(**_heal_kwargs)
+                                _heal_result = _run_conversation_once(agent, _heal_kwargs)
                                 _heal_all_msgs = _heal_result.get('messages') or []
                                 _heal_ok = _has_new_assistant_reply(_heal_all_msgs, _prev_len) or _token_sent
                             except Exception as _retry_exc:
@@ -9586,6 +11398,9 @@ def _run_agent_streaming(
                                     _previous_context_messages,
                                     _restore_reasoning_metadata(_previous_messages, _result_messages),
                                     msg_text,
+                                    current_context_items=getattr(s, 'pending_context_items', None),
+                                    current_browser_context_parts=getattr(s, 'pending_browser_context_parts', None),
+                                    current_client_message_id=getattr(s, 'pending_client_message_id', None),
                                     source=getattr(s, 'pending_user_source', None) or 'webui',
                                 )
                                 _compact_session_image_parts_for_persistence(s)
@@ -9637,6 +11452,16 @@ def _run_agent_streaming(
                             _err_type,
                             _err_hint,
                         )
+                        _error_payload['stream_close_reason'] = (
+                            'provider-empty'
+                            if _err_type == 'no_response'
+                            else 'provider-terminal-failure'
+                        )
+                        _turn_outcome._diagnostic(
+                            'create-provider-error',
+                            error_type=_err_type,
+                            code_path='silent-failure-finalizer',
+                        )
                         if _turn_pending_source == 'process_wakeup':
                             _recorded_pause = record_process_wakeup_provider_unavailable_pause(
                                 s,
@@ -9662,6 +11487,8 @@ def _run_agent_streaming(
                         s.active_stream_id = None
                         s.pending_user_message = None
                         s.pending_attachments = []
+                        s.pending_context_items = []
+                        s.pending_browser_context_parts = []
                         s.pending_started_at = None
                         s.pending_user_source = None
                         try:
@@ -9860,15 +11687,22 @@ def _run_agent_streaming(
                     live_tool_calls=_live_tool_calls,
                 )
                 s.tool_calls = tool_calls
+                _turn_context_items = list(getattr(s, 'pending_context_items', []) or [])
+                _turn_browser_context_parts = list(getattr(s, 'pending_browser_context_parts', []) or [])
+                _turn_client_message_id = getattr(s, 'pending_client_message_id', None)
                 s.active_stream_id = None
                 s.pending_user_message = None
                 s.pending_attachments = []
+                s.pending_context_items = []
+                s.pending_browser_context_parts = []
+                s.pending_client_message_id = None
                 s.pending_started_at = None
                 s.pending_user_source = None
-                # Tag the matching user message with attachment filenames for display on reload
+                # Tag the matching user message with attachment filenames and Browser Workbench
+                # context items for display on reload.
                 # Only tag a user message whose content relates to this turn's text
                 # (msg_text is the full message including the [Attached files: ...] suffix)
-                if attachments:
+                if attachments or _turn_context_items or _turn_browser_context_parts or _turn_client_message_id:
                     display_attachments = [_attachment_name(a) for a in attachments if _attachment_name(a)]
                     for m in reversed(s.messages):
                         if m.get('role') == 'user':
@@ -9876,7 +11710,15 @@ def _run_agent_streaming(
                             # Match if content is part of the sent message or vice-versa
                             base_text = msg_text.split('\n\n[Attached files:')[0].strip() if '\n\n[Attached files:' in msg_text else msg_text
                             if base_text[:60] in content or content[:60] in msg_text:
-                                m['attachments'] = display_attachments
+                                if display_attachments:
+                                    m['attachments'] = display_attachments
+                                if _turn_context_items:
+                                    m['context_items'] = _turn_context_items
+                                if _turn_browser_context_parts:
+                                    m['browser_context_parts'] = _turn_browser_context_parts
+                                    m['parts'] = _turn_browser_context_parts
+                                if _turn_client_message_id:
+                                    m['client_message_id'] = _turn_client_message_id
                                 break
                 # Persist reasoning trace in the session so it survives reload.
                 # Must run BEFORE s.save() — otherwise the mutation lives only in
@@ -10019,6 +11861,10 @@ def _run_agent_streaming(
                         s.context_length = _cc_cl
                     s.threshold_tokens = getattr(_cc_for_save, 'threshold_tokens', 0) or 0
                     s.last_prompt_tokens = getattr(_cc_for_save, 'last_prompt_tokens', 0) or 0
+                    s.compression_count = max(
+                        int(getattr(s, 'compression_count', 0) or 0),
+                        int(getattr(_cc_for_save, 'compression_count', 0) or 0),
+                    )
                 # Fallback: if the compressor didn't report a context_length
                 # (fresh agent, interrupted stream, or compressor missing the
                 # attribute), resolve it from the model's static metadata so
@@ -10103,26 +11949,25 @@ def _run_agent_streaming(
                         s.threshold_tokens = int(_orig_thresh * _real_cap / _orig_cap)
                     else:
                         s.threshold_tokens = 0
-                if not ephemeral and s.messages:
-                    _latest_assistant_idx = next(
-                        (idx for idx in range(len(s.messages) - 1, -1, -1)
-                         if isinstance(s.messages[idx], dict) and s.messages[idx].get('role') == 'assistant'),
-                        None,
-                    )
-                    if _latest_assistant_idx is not None:
-                        _latest_assistant = s.messages[_latest_assistant_idx]
-                        try:
-                            append_turn_journal_event_for_stream(
-                                s.session_id,
-                                stream_id,
-                                {
-                                    "event": "assistant_started",
-                                    "created_at": float(_latest_assistant.get('timestamp') or time.time()),
-                                    "assistant_message_index": _latest_assistant_idx,
-                                },
-                            )
-                        except Exception:
-                            logger.debug("Failed to append assistant_started turn journal event", exc_info=True)
+                _latest_assistant_idx = next(
+                    (idx for idx in range(len(s.messages) - 1, -1, -1)
+                     if isinstance(s.messages[idx], dict) and s.messages[idx].get('role') == 'assistant'),
+                    None,
+                ) if s.messages else None
+                if not ephemeral and _latest_assistant_idx is not None:
+                    _latest_assistant = s.messages[_latest_assistant_idx]
+                    try:
+                        append_turn_journal_event_for_stream(
+                            s.session_id,
+                            stream_id,
+                            {
+                                "event": "assistant_started",
+                                "created_at": float(_latest_assistant.get('timestamp') or time.time()),
+                                "assistant_message_index": _latest_assistant_idx,
+                            },
+                        )
+                    except Exception:
+                        logger.debug("Failed to append assistant_started turn journal event", exc_info=True)
                 if cancel_event.is_set():
                     _finalize_cancelled_turn(s, ephemeral=False)
                     try:
@@ -10159,17 +12004,33 @@ def _run_agent_streaming(
                     return
                 if not ephemeral:
                     try:
+                        _append_mutation_paths_turn_journal_event(
+                            s.session_id,
+                            stream_id,
+                            _live_tool_calls,
+                            assistant_message_index=_latest_assistant_idx,
+                        )
+                    except Exception:
+                        logger.debug("Failed to append mutation_paths turn journal event", exc_info=True)
+                    try:
+                        _append_checkpoint_paths_turn_journal_event(
+                            s.session_id,
+                            stream_id,
+                            s.workspace,
+                            _checkpoint_ids_at_turn_start,
+                            assistant_message_index=_latest_assistant_idx,
+                        )
+                    except Exception:
+                        logger.debug("Failed to append checkpoint_paths turn journal event", exc_info=True)
+                if not ephemeral:
+                    try:
                         append_turn_journal_event_for_stream(
                             s.session_id,
                             stream_id,
                             {
                                 "event": "completed",
                                 "created_at": time.time(),
-                                "assistant_message_index": next(
-                                    (idx for idx in range(len(s.messages) - 1, -1, -1)
-                                     if isinstance(s.messages[idx], dict) and s.messages[idx].get('role') == 'assistant'),
-                                    None,
-                                ),
+                                "assistant_message_index": _latest_assistant_idx,
                             },
                         )
                     except Exception:
@@ -10395,6 +12256,7 @@ def _run_agent_streaming(
                     usage['context_length'] = _cc_cl_sse
                 usage['threshold_tokens'] = getattr(_cc, 'threshold_tokens', 0) or 0
                 usage['last_prompt_tokens'] = getattr(_cc, 'last_prompt_tokens', 0) or 0
+                usage['compression_count'] = getattr(_cc, 'compression_count', 0) or 0
             # Fallback: when the compressor is absent or reports context_length=0,
             # resolve the model's context window from metadata so the UI indicator
             # shows the correct percentage rather than overflowing against the 128K
@@ -10461,6 +12323,8 @@ def _run_agent_streaming(
                 if isinstance(_post_compression_estimate, int) and _post_compression_estimate > 0
                 else None
             )
+            if not usage.get('compression_count'):
+                usage['compression_count'] = getattr(s, 'compression_count', 0) or 0
             # (reasoning trace already attached + saved above, before s.save())
             # Leftover-steer delivery: if a /steer was queued (via
             # api/chat/steer) but the agent finished its turn before
@@ -10548,7 +12412,7 @@ def _run_agent_streaming(
             except Exception as _goal_exc:
                 logger.debug("Goal continuation hook failed for session %s: %s", session_id, _goal_exc)
             with _stream_writeback_stage(_writeback_timings, "done_payload"):
-                raw_session = _session_payload_with_full_messages(s, tool_calls=tool_calls)
+                raw_session = _session_payload_with_terminal_window(s, tool_calls=tool_calls)
                 _done_payload = {'session': redact_session_data(raw_session), 'usage': usage}
                 if _tool_limit_reached:
                     _done_payload['terminal_state'] = 'tool_limit_reached'
@@ -10598,6 +12462,14 @@ def _run_agent_streaming(
                 _flush_reasoning_buffer()
             except Exception:
                 pass
+            # A tool normally flushes immediately before tool.completed. This
+            # guaranteed close also covers cancellation/provider exceptions so
+            # no timer can emit request-scoped output after stream teardown.
+            if _live_tool_output_coalescer is not None:
+                try:
+                    _live_tool_output_coalescer.close()
+                except Exception:
+                    logger.debug('Failed to close live tool output coalescer', exc_info=True)
             # Stop the live metering ticker
             _metering_stop.set()
             # Unregister the gateway approval callback and unblock any threads
@@ -10638,6 +12510,17 @@ def _run_agent_streaming(
 
     except Exception as e:
         print('[webui] stream error:\n' + traceback.format_exc(), flush=True)
+        # ``done`` is authoritative. Cleanup/title/metering code can still raise
+        # after the completed payload was queued; never persist or emit a second
+        # terminal error for that already-successful turn.
+        if _turn_outcome.status == 'completed':
+            _turn_outcome._diagnostic(
+                'post-completion-exception-dropped',
+                exception_type=type(e).__name__,
+                code_path='outer-exception-guard',
+            )
+            put('stream_end', {'session_id': session_id, 'turn_status': 'completed'})
+            return
         err_str = str(e)
         # Sanitize HTML from provider error responses — some providers return
         # full HTML pages (e.g. nginx "404 page not found") instead of JSON errors.
@@ -10648,6 +12531,12 @@ def _run_agent_streaming(
             err_str = _stripped
         _exc_lower = err_str.lower()
         _classification = _classify_provider_error(err_str, e)
+        if _turn_outcome.has_usable_output and _classification['type'] == 'error':
+            _classification = {
+                'label': 'Response interrupted',
+                'type': 'interrupted',
+                'hint': 'The provider stream ended after returning partial output. The partial response was preserved; retry if you need the remainder.',
+            }
         _exc_is_credential_pool_empty = _classification['type'] == 'credential_pool_empty'
         if cancel_event.is_set():
             if s is not None:
@@ -10719,14 +12608,24 @@ def _run_agent_streaming(
                     _self_healed = True
                     # Rebuild runtime variables
                     _rt = _heal_rt
+                    _rt = _apply_active_account_runtime_overrides(
+                        _rt,
+                        resolved_provider,
+                        _cfg,
+                        account_env_path=_account_env_path,
+                    )
                     resolved_api_key = _heal_rt.get('api_key')
+                    resolved_api_key = _rt.get('api_key') or resolved_api_key
                     if not resolved_provider:
                         resolved_provider = _heal_rt.get('provider')
                     resolved_base_url = _runtime_preferred_base_url(
-                        _heal_rt, resolved_provider, configured_base_url
+                        _rt, resolved_provider, configured_base_url
                     )
                     resolved_provider, resolved_api_key, resolved_base_url = _resolve_custom_provider_runtime_overrides(
-                        resolved_provider, resolved_api_key, resolved_base_url
+                        resolved_provider,
+                        resolved_api_key,
+                        resolved_base_url,
+                        account_config=_cfg,
                     )
                     # Build a fresh agent with the new credentials
                     _heal_kwargs = dict(_agent_kwargs) if '_agent_kwargs' in dir() else {}
@@ -10736,7 +12635,7 @@ def _run_agent_streaming(
                     _heal_kwargs['provider'] = resolved_provider
                     _replace_session_db_in_kwargs(_heal_kwargs, _state_db_path)
                     if 'credential_pool' in _agent_params:
-                        _heal_kwargs['credential_pool'] = _heal_rt.get('credential_pool')
+                        _heal_kwargs['credential_pool'] = _rt.get('credential_pool')
                     _heal_agent = _AIAgent(**_heal_kwargs)
                     with STREAMS_LOCK:
                         AGENT_INSTANCES[stream_id] = _heal_agent
@@ -10762,7 +12661,9 @@ def _run_agent_streaming(
                         )
                         if moa_config is not None:
                             _heal_kwargs2["moa_config"] = moa_config
-                        _heal_result = _heal_agent.run_conversation(**_heal_kwargs2)
+                        _heal_result = _run_conversation_once(
+                            _heal_agent, _heal_kwargs2
+                        )
                         # Retry succeeded — persist the result normally
                         if s is not None:
                             if _checkpoint_stop is not None:
@@ -10800,6 +12701,9 @@ def _run_agent_streaming(
                                     _previous_context_messages,
                                     _restore_reasoning_metadata(_previous_messages, _result_messages),
                                     msg_text,
+                                    current_context_items=getattr(s, 'pending_context_items', None),
+                                    current_browser_context_parts=getattr(s, 'pending_browser_context_parts', None),
+                                    current_client_message_id=getattr(s, 'pending_client_message_id', None),
                                     source=getattr(s, 'pending_user_source', None) or 'webui',
                                 )
                                 _compact_session_image_parts_for_persistence(s)
@@ -10832,6 +12736,16 @@ def _run_agent_streaming(
             _exc_label, _exc_type, _exc_hint = 'Error', 'error', ''
 
         _error_payload = _provider_error_payload(err_str, _exc_type, _exc_hint)
+        _error_payload['stream_close_reason'] = 'provider-exception'
+        if 'timeout' in _exc_lower or 'timed out' in _exc_lower:
+            _error_payload['abort_source'] = 'provider-timeout'
+        elif 'abort' in _exc_lower or 'interrupt' in _exc_lower:
+            _error_payload['abort_source'] = 'provider-abort'
+        _turn_outcome._diagnostic(
+            'create-provider-error',
+            error_type=_exc_type,
+            code_path='outer-exception-finalizer',
+        )
         if s is not None:
             if _checkpoint_stop is not None:
                 _checkpoint_stop.set()
@@ -10889,6 +12803,8 @@ def _run_agent_streaming(
                 s.active_stream_id = None
                 s.pending_user_message = None
                 s.pending_attachments = []
+                s.pending_context_items = []
+                s.pending_browser_context_parts = []
                 s.pending_started_at = None
                 s.pending_user_source = None
                 try:
@@ -10957,6 +12873,10 @@ def _run_agent_streaming(
         except Exception:
             logger.debug("Failed to end metering session for stream %s", stream_id, exc_info=True)
         _metering_stop.set()
+        if _agentpet_heartbeat_stop is not None:
+            _agentpet_heartbeat_stop.set()
+        if _agentpet_heartbeat_thread is not None:
+            _agentpet_heartbeat_thread.join(timeout=1.5)
         # Stop the periodic checkpoint thread before the final recovery path.
         # The checkpoint thread also uses the per-session lock; joining it first
         # avoids contending with checkpoint writes during stale-pending repair.
@@ -11001,6 +12921,13 @@ def _run_agent_streaming(
             STREAM_GOAL_RELATED.pop(stream_id, None)  # Clean up goal-related flag (#1932)
             STREAM_LAST_EVENT_ID.pop(stream_id, None)  # Clean up event_id pointer (stage-364)
             unregister_active_run(stream_id)
+            _notify_agentpet(
+                "done",
+                "Hermes WebUI turn ended",
+                force=True,
+                session_id=session_id,
+                project=_agentpet_project,
+            )
             # NOTE: do NOT discard PENDING_GOAL_CONTINUATION here. The marker
             # is set by goal_continue (line ~3328) inside the SAME function
             # call and consumed atomically by `_start_chat_stream_for_session`
@@ -11056,6 +12983,7 @@ def _handle_chat_steer(handler, body: dict) -> bool:
       - Look up the cached AIAgent for the session (PR #1051's
         SESSION_AGENT_CACHE).
       - Verify a stream is currently active for this session.
+      - Append normalized Browser Workbench context when supplied.
       - Call agent.steer(text) — thread-safe, stashes text in
         _pending_steer for application at the next tool-result boundary.
 
@@ -11083,6 +13011,21 @@ def _handle_chat_steer(handler, body: dict) -> bool:
         return bad(handler, "session_id required")
     if not text:
         return bad(handler, "text required")
+
+    steer_text = text
+    if "context_items" in (body or {}):
+        try:
+            from api.browser_workbench import (
+                _format_browser_context_items_for_prompt,
+                _normalize_browser_context_items,
+            )
+
+            context_items = _normalize_browser_context_items(body.get("context_items"))
+            context_block = _format_browser_context_items_for_prompt(context_items)
+            if context_block:
+                steer_text = f"{text}\n\n{context_block}"
+        except Exception:
+            logger.debug("Failed to normalize browser context for steer session=%s", sid, exc_info=True)
 
     evicted_cached_entry = None
     with _cfg.SESSION_AGENT_CACHE_LOCK:
@@ -11155,7 +13098,7 @@ def _handle_chat_steer(handler, body: dict) -> bool:
                            "stream_id": None})
 
     try:
-        accepted = bool(agent.steer(text))
+        accepted = bool(agent.steer(steer_text))
     except Exception as exc:
         logger.debug("agent.steer() raised for session=%s: %s", sid, exc)
         return j(handler, {"accepted": False, "fallback": "steer_error",
@@ -11404,6 +13347,11 @@ def cancel_stream(stream_id: str) -> bool:
                     _pending_source = getattr(_cs, 'pending_user_source', None)
                     _pending_atts_raw = getattr(_cs, 'pending_attachments', None)
                     _pending_atts = list(_pending_atts_raw) if isinstance(_pending_atts_raw, (list, tuple)) else []
+                    _pending_context_raw = getattr(_cs, 'pending_context_items', None)
+                    _pending_context_items = list(_pending_context_raw) if isinstance(_pending_context_raw, (list, tuple)) else []
+                    _pending_browser_parts_raw = getattr(_cs, 'pending_browser_context_parts', None)
+                    _pending_browser_context_parts = list(_pending_browser_parts_raw) if isinstance(_pending_browser_parts_raw, (list, tuple)) else []
+                    _pending_client_message_id = getattr(_cs, 'pending_client_message_id', None)
                     _pending_started = getattr(_cs, 'pending_started_at', None) or 0
                     _msgs_for_recovery = _cs.messages if isinstance(_cs.messages, list) else None
                     if _pending_user and _msgs_for_recovery is not None:
@@ -11439,6 +13387,13 @@ def cancel_stream(stream_id: str) -> bool:
                                 _user_turn['_source'] = _pending_source
                             if _pending_atts:
                                 _user_turn['attachments'] = _pending_atts
+                            if _pending_context_items:
+                                _user_turn['context_items'] = _pending_context_items
+                            if _pending_browser_context_parts:
+                                _user_turn['browser_context_parts'] = _pending_browser_context_parts
+                                _user_turn['parts'] = _pending_browser_context_parts
+                            if _pending_client_message_id:
+                                _user_turn['client_message_id'] = _pending_client_message_id
                             _msgs_for_recovery.append(_user_turn)
                 except Exception:
                     logger.debug(
@@ -11448,6 +13403,9 @@ def cancel_stream(stream_id: str) -> bool:
                 _cs.active_stream_id = None
                 _cs.pending_user_message = None
                 _cs.pending_attachments = []
+                _cs.pending_context_items = []
+                _cs.pending_browser_context_parts = []
+                _cs.pending_client_message_id = None
                 _cs.pending_started_at = None
                 _cs.pending_user_source = None
                 # Persist any partial assistant text that was streamed before cancel (#893).
