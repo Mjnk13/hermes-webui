@@ -6,7 +6,10 @@ const fs = require('node:fs');
 const http = require('node:http');
 const path = require('node:path');
 const { browserWorkbenchPartition } = require('./browser-session-policy.cjs');
-const { createShellWebPreferences } = require('./browser-window-policy.cjs');
+const {
+  createBrowserPageWebPreferences,
+  createShellWebPreferences,
+} = require('./browser-window-policy.cjs');
 
 const DEFAULT_WEBUI_URL = 'http://127.0.0.1:8789';
 const NATIVE_SELECTION_CONSOLE_PREFIX = '__HERMES_BROWSER_WORKBENCH_SELECTION__';
@@ -454,12 +457,29 @@ function resizeUrlSuggestionOverlayToContent(overlay, bounds) {
   }).catch(() => {});
 }
 
+function inlineRendererSecurityPolicy() {
+  const nonce = crypto.randomBytes(18).toString('base64url');
+  const policy = [
+    "default-src 'none'",
+    `script-src 'nonce-${nonce}'`,
+    `style-src 'nonce-${nonce}'`,
+    "img-src data:",
+    "font-src 'none'",
+    "connect-src 'none'",
+    "object-src 'none'",
+    "base-uri 'none'",
+    "form-action 'none'",
+  ].join('; ');
+  return { nonce, policy };
+}
+
 function urlSuggestionOverlayHtml(payload) {
   const items = sanitizeUrlSuggestionItems(payload && payload.items);
   const requestedActiveIndex = Math.round(Number(payload && payload.activeIndex));
   const activeIndex = Number.isFinite(requestedActiveIndex) && requestedActiveIndex >= 0 && requestedActiveIndex < items.length ? requestedActiveIndex : -1;
   const prefix = URL_SUGGESTION_CONSOLE_PREFIX;
-  return `<!doctype html><html><head><meta charset="utf-8"><style>
+  const security = inlineRendererSecurityPolicy();
+  return `<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="${security.policy}"><style nonce="${security.nonce}">
     :root{color-scheme:dark;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;}
     html,body{margin:0;padding:0;background:transparent;overflow:hidden;}
     #box{box-sizing:border-box;width:100vw;max-height:100vh;overflow:auto;padding:6px;background:#211a2c;border:1px solid rgba(255,255,255,.10);border-radius:12px;box-shadow:0 18px 52px rgba(0,0,0,.46);color:#f5f0ff;font-size:13px;}
@@ -467,7 +487,7 @@ function urlSuggestionOverlayHtml(payload) {
     button:hover,button.active{background:rgba(255,255,255,.09);}
     .primary{font-weight:650;line-height:1.25;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
     .secondary{color:rgba(245,240,255,.68);font-size:12px;line-height:1.35;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
-  </style></head><body><div id="box" role="listbox"></div><script>
+  </style></head><body><div id="box" role="listbox"></div><script nonce="${security.nonce}">
     const prefix=${JSON.stringify(prefix)};
     let items=${JSON.stringify(items)};
     let activeIndex=${JSON.stringify(activeIndex)};
@@ -572,7 +592,8 @@ function normalizeActionsMenuBounds(raw) {
 function actionsMenuOverlayHtml(payload) {
   const zoom = Math.max(25, Math.min(300, Math.round(Number(payload && payload.zoom) || 100)));
   const prefix = ACTIONS_MENU_CONSOLE_PREFIX;
-  return `<!doctype html><html><head><meta charset="utf-8"><style>
+  const security = inlineRendererSecurityPolicy();
+  return `<!doctype html><html><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="${security.policy}"><style nonce="${security.nonce}">
     :root{color-scheme:dark;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;}
     html,body{margin:0;padding:0;background:transparent;overflow:hidden;}
     #box{box-sizing:border-box;width:100vw;max-height:100vh;overflow:auto;padding:7px;background:linear-gradient(180deg,rgba(54,38,64,.98),rgba(34,26,44,.98));border:1px solid rgba(255,255,255,.11);border-radius:13px;box-shadow:0 20px 54px rgba(0,0,0,.48),0 0 0 1px rgba(255,255,255,.03) inset;color:#f5f0ff;font-size:13px;backdrop-filter:blur(18px);}
@@ -585,7 +606,7 @@ function actionsMenuOverlayHtml(payload) {
     <div class="section" role="none"><div class="label">Page</div><button class="item" type="button" role="menuitem" data-action="hard-reload"><span class="icon">↻</span><span>Hard Reload</span></button><button class="item" type="button" role="menuitem" data-action="copy-url"><span class="icon">⛓</span><span>Copy Current URL</span></button><button class="item" type="button" role="menuitem" data-action="open-devtools-panel"><span class="icon">◧</span><span>Open DevTools Panel</span></button><button class="item" type="button" role="menuitem" data-action="open-devtools-popout"><span class="icon">↗</span><span>Pop Out DevTools</span></button></div>
     <div class="section" role="group" aria-label="Browser zoom controls"><div class="label">Zoom</div><div class="zoom-row" role="none"><button class="zoom-btn" type="button" role="menuitem" data-action="zoom-out" aria-label="Zoom out"><span>−</span></button><label class="zoom-value" aria-label="Browser zoom percentage in menu"><input id="zoom" type="text" inputmode="decimal" value="${zoom}" aria-label="Browser zoom percentage value in menu"><span aria-hidden="true">%</span></label><button class="zoom-btn" type="button" role="menuitem" data-action="zoom-in" aria-label="Zoom in"><span>+</span></button></div></div>
     <div class="section" role="none"><div class="label">Data</div><button class="item" type="button" role="menuitem" data-action="clear-history"><span class="icon">◷</span><span>Clear Browsing History</span></button><button class="item" type="button" role="menuitem" data-action="clear-cookies"><span class="icon">●</span><span>Clear Cookies</span></button><button class="item" type="button" role="menuitem" data-action="clear-cache"><span class="icon">◇</span><span>Clear Cache</span></button></div>
-  </div><script>
+  </div><script nonce="${security.nonce}">
     const prefix=${JSON.stringify(prefix)};
     const zoomInput=document.getElementById('zoom');
     const emit=(action,value)=>console.log(prefix+JSON.stringify({action,value:value===undefined?'':String(value)}));
@@ -747,12 +768,10 @@ function ensureTab(payload) {
     tabs.delete(sessionId);
   }
   const view = new WebContentsView({
-    webPreferences: {
-      contextIsolation: true,
-      nodeIntegration: false,
-      sandbox: true,
+    webPreferences: createBrowserPageWebPreferences({
+      preloadPath: path.join(__dirname, '../preload/browser-page-security.js'),
       partition: browserWorkbenchPartition(sessionId),
-    },
+    }),
   });
   // This is the visited page's backing surface, not part of the Hermes UI.
   // Keep it opaque and browser-neutral so transparent pages render exactly as

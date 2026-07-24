@@ -4,6 +4,7 @@ const assert = require('node:assert/strict');
 const test = require('node:test');
 
 const {
+  createBrowserPageWebPreferences,
   createShellWebPreferences,
 } = require('../src/main/browser-window-policy.cjs');
 
@@ -29,4 +30,17 @@ test('desktop shell rendering policy preserves renderer isolation settings', () 
   assert.equal(preferences.contextIsolation, true);
   assert.equal(preferences.nodeIntegration, false);
   assert.equal(preferences.sandbox, false);
+});
+
+test('Browser Workbench pages use an isolated security-warning preload', () => {
+  const preferences = createBrowserPageWebPreferences({
+    preloadPath: '/tmp/hermes-browser-page-security.cjs',
+    partition: 'persist:hermes-browser-workbench',
+  });
+
+  assert.equal(preferences.contextIsolation, true);
+  assert.equal(preferences.nodeIntegration, false);
+  assert.equal(preferences.sandbox, true);
+  assert.equal(preferences.partition, 'persist:hermes-browser-workbench');
+  assert.equal(preferences.preload, '/tmp/hermes-browser-page-security.cjs');
 });

@@ -16,7 +16,10 @@ export default defineConfig({
   preload: {
     build: {
       lib: {
-        entry: resolve('src/preload/index.cjs'),
+        entry: {
+          index: resolve('src/preload/index.cjs'),
+          'browser-page-security': resolve('src/preload/browser-page-security.cjs'),
+        },
         formats: ['cjs'],
       },
       rollupOptions: {

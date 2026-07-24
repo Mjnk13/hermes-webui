@@ -14,4 +14,17 @@ function createShellWebPreferences({ preloadPath, bridgePayload }) {
   };
 }
 
-module.exports = { createShellWebPreferences };
+function createBrowserPageWebPreferences({ preloadPath, partition }) {
+  return {
+    preload: preloadPath,
+    contextIsolation: true,
+    nodeIntegration: false,
+    sandbox: true,
+    partition,
+  };
+}
+
+module.exports = {
+  createBrowserPageWebPreferences,
+  createShellWebPreferences,
+};
